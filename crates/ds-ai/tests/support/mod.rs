@@ -1,8 +1,12 @@
 use serde_json::Value;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::oneshot,
+    sync::{Notify, oneshot},
 };
 
 pub struct Reply {
@@ -53,9 +57,21 @@ impl Reply {
 pub struct Server {
     pub base_url: String,
     requests: oneshot::Receiver<Vec<String>>,
+    request_count: Arc<AtomicUsize>,
+    request_notify: Arc<Notify>,
 }
 
 impl Server {
+    pub fn request_count(&self) -> usize {
+        self.request_count.load(Ordering::SeqCst)
+    }
+
+    pub async fn wait_for_requests(&self, count: usize) {
+        while self.request_count() < count {
+            self.request_notify.notified().await;
+        }
+    }
+
     pub async fn requests(self) -> Vec<String> {
         self.requests.await.unwrap()
     }
@@ -66,12 +82,18 @@ pub async fn serve(replies: impl IntoIterator<Item = Reply>) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (request_sender, request_receiver) = oneshot::channel();
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_notify = Arc::new(Notify::new());
+    let task_request_count = request_count.clone();
+    let task_request_notify = request_notify.clone();
 
     tokio::spawn(async move {
         let mut requests = Vec::with_capacity(replies.len());
         for reply in replies {
             let (mut socket, _) = listener.accept().await.unwrap();
             requests.push(read_request(&mut socket).await);
+            task_request_count.fetch_add(1, Ordering::SeqCst);
+            task_request_notify.notify_waiters();
             write_reply(&mut socket, reply).await;
         }
         request_sender.send(requests).unwrap();
@@ -80,6 +102,8 @@ pub async fn serve(replies: impl IntoIterator<Item = Reply>) -> Server {
     Server {
         base_url: format!("http://{address}"),
         requests: request_receiver,
+        request_count,
+        request_notify,
     }
 }
 

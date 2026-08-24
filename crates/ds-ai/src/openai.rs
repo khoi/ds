@@ -2,7 +2,7 @@ use crate::{Content, Context, Error, Event, Message, Response, ResponseStream, U
 use async_stream::stream;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -176,6 +176,16 @@ pub async fn stream(
         }
         if retries < options.max_retries && matches!(status.as_u16(), 408 | 409 | 429 | 500..=599) {
             retries += 1;
+            let delay = response
+                .headers()
+                .get("retry-after-ms")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_millis)
+                .unwrap_or_default();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             continue;
         }
         let body = response.text().await.unwrap_or_default();
