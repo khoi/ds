@@ -1,8 +1,11 @@
+use crate::support::{Reply, serve};
 use ds_ai::{
     Api, AssistantContent, AssistantMessage, AssistantMessageEvent, AssistantMessageFrame,
-    AssistantToolCall, ProviderId, StopReason, TextContent, ThinkingContent,
-    assistant_message_event_to_frame, reduce_assistant_message_frames,
+    AssistantToolCall, Context, Message, OpenAiResponsesOptions, ProviderId, StopReason,
+    StreamOptions, TextContent, ThinkingContent, assistant_message_event_to_frame, builtin_model,
+    reduce_assistant_message_frames,
 };
+use futures_util::StreamExt;
 
 fn seed() -> AssistantMessage {
     AssistantMessage {
@@ -186,6 +189,44 @@ fn parses_unfinished_tool_json_and_uses_final_arguments() {
     );
 }
 
+#[tokio::test]
+async fn round_trips_provider_content_from_authoritative_end_events() {
+    let server = serve([Reply::sse(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"response\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg\",\"content\":[]}}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg\",\"content\":[{\"type\":\"output_text\",\"text\":\"final text\"}]}}\n\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc\",\"call_id\":\"call\",\"name\":\"lookup\",\"arguments\":\"\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc\",\"call_id\":\"call\",\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\\\"pi\\\"}\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"response\",\"status\":\"completed\",\"output\":[]}}\n\n",
+    )])
+    .await;
+    let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    model.base_url = server.base_url.clone();
+    let mut stream = ds_ai::openai::stream(
+        &model,
+        &Context::new([Message::user("Hello")]),
+        &OpenAiResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let mut frames = Vec::new();
+
+    while let Some(event) = stream.next().await {
+        if let Some(frame) = assistant_message_event_to_frame(&event).unwrap() {
+            frames.push(frame);
+        }
+    }
+
+    let message = stream.result().await.unwrap();
+    assert_eq!(
+        reduce_assistant_message_frames(frames)
+            .unwrap()
+            .unwrap()
+            .content,
+        message.content
+    );
+    server.requests().await;
+}
+
 #[test]
 fn treats_absent_end_metadata_as_authoritative() {
     let frames = [
@@ -342,6 +383,7 @@ fn snapshots_events_and_reduces_without_mutating_frames() {
     let mut reduced = reduce_assistant_message_frames([start, tool_start.clone()])
         .unwrap()
         .unwrap();
+    assert_eq!(reduced.usage.cost.total, 0.0);
     reduced.content[0] = text("changed");
 
     let AssistantMessageFrame::ToolCallStart { tool_call, .. } = tool_start else {

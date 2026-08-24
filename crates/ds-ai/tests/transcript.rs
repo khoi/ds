@@ -1,6 +1,8 @@
 use ds_ai::{
+    Api, AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantToolCall,
     ConstrainedSampling, ConstrainedSamplingStrictness, Context, GrammarVariants, InputContent,
-    Message, Tool, ToolResultMessage, UserContent, UserMessage, UserRole,
+    Message, ProviderId, StopReason, TextContent, ThinkingContent, Tool, ToolResultMessage, Usage,
+    UsageCost, UserContent, UserMessage, UserRole,
 };
 
 #[test]
@@ -83,6 +85,120 @@ fn serializes_tool_results_with_optional_execution_data() {
             "isError": false,
             "timestamp": 44
         })
+    );
+}
+
+#[test]
+fn serializes_complete_assistant_messages_with_pi_fields() {
+    let message = AssistantMessage {
+        content: vec![
+            AssistantContent::Text(TextContent {
+                text: "Answer".into(),
+                text_signature: Some("text-signature".into()),
+            }),
+            AssistantContent::Thinking(ThinkingContent {
+                thinking: "Reason".into(),
+                thinking_signature: Some("thinking-signature".into()),
+                redacted: Some(false),
+            }),
+            AssistantContent::ToolCall(AssistantToolCall {
+                id: "call_1".into(),
+                name: "lookup".into(),
+                arguments: serde_json::json!({"query": "pi"}),
+                thought_signature: Some("tool-signature".into()),
+                namespace: Some("tools".into()),
+            }),
+        ],
+        api: Api::OpenAiResponses,
+        provider: ProviderId::new("openai"),
+        model: "gpt-requested".into(),
+        response_model: Some("gpt-actual".into()),
+        response_id: Some("resp_1".into()),
+        diagnostics: Some(vec![AssistantMessageDiagnostic {
+            r#type: "transport".into(),
+            timestamp: 45,
+            error: None,
+            details: Some(std::collections::BTreeMap::from([(
+                "mode".into(),
+                serde_json::json!("sse"),
+            )])),
+        }]),
+        usage: Usage {
+            input: 1,
+            output: 2,
+            cache_read: 3,
+            cache_write: 4,
+            cache_write_1h: Some(5),
+            reasoning: Some(6),
+            total_tokens: 15,
+            cost: UsageCost {
+                input: 0.1,
+                output: 0.2,
+                cache_read: 0.3,
+                cache_write: 0.4,
+                total: 1.0,
+            },
+        },
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        raw_stop_reason: Some("tool_use".into()),
+        end_turn: Some(false),
+        timestamp: 46,
+    };
+    let value = serde_json::to_value(&message).unwrap();
+
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Answer", "textSignature": "text-signature"},
+                {
+                    "type": "thinking",
+                    "thinking": "Reason",
+                    "thinkingSignature": "thinking-signature",
+                    "redacted": false
+                },
+                {
+                    "type": "toolCall",
+                    "id": "call_1",
+                    "name": "lookup",
+                    "arguments": {"query": "pi"},
+                    "thoughtSignature": "tool-signature",
+                    "namespace": "tools"
+                }
+            ],
+            "api": "openai-responses",
+            "provider": "openai",
+            "model": "gpt-requested",
+            "responseModel": "gpt-actual",
+            "responseId": "resp_1",
+            "diagnostics": [{"type": "transport", "timestamp": 45, "details": {"mode": "sse"}}],
+            "usage": {
+                "input": 1,
+                "output": 2,
+                "cacheRead": 3,
+                "cacheWrite": 4,
+                "cacheWrite1h": 5,
+                "reasoning": 6,
+                "totalTokens": 15,
+                "cost": {
+                    "input": 0.1,
+                    "output": 0.2,
+                    "cacheRead": 0.3,
+                    "cacheWrite": 0.4,
+                    "total": 1.0
+                }
+            },
+            "stopReason": "toolUse",
+            "rawStopReason": "tool_use",
+            "endTurn": false,
+            "timestamp": 46
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<AssistantMessage>(value).unwrap(),
+        message
     );
 }
 
