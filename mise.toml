@@ -5,7 +5,7 @@ locked = true
 lockfile_platforms = ["linux-x64", "macos-arm64"]
 
 [tools]
-rust = "1.95.0"
+rust = { version = "1.95.0", components = ["rustfmt", "clippy"] }
 hk = "1.56.1"
 actionlint = "1.7.12"
 shellcheck = "0.11.0"
