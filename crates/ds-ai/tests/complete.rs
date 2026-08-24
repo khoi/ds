@@ -1,8 +1,11 @@
 use crate::support::{Reply, serve};
-use ds_ai::{Content, Context, Message, StopReason, complete, openai};
+use ds_ai::{
+    AssistantContent, Context, Message, OpenAiResponsesOptions, StopReason, StreamOptions,
+    TextContent, builtin_model,
+};
 
 #[tokio::test]
-async fn completes_a_provider_stream() {
+async fn completes_a_provider_stream_from_its_result() {
     let server = serve([Reply::sse(
         [
             "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_complete\",\"type\":\"message\",\"content\":[]}}\n\n",
@@ -12,18 +15,30 @@ async fn completes_a_provider_stream() {
         .concat(),
     )])
     .await;
-    let stream = openai::raw_stream(
-        &openai::Model::new("gpt-test").with_base_url(&server.base_url),
+    let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    model.base_url = server.base_url.clone();
+    let mut stream = ds_ai::openai::stream(
+        &model,
         &Context::new([Message::user("Complete")]),
-        &openai::Options::new("test-key"),
-    )
-    .await
-    .unwrap();
+        &OpenAiResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
 
-    let response = complete(stream).await.unwrap();
+    let response = stream.result().await.unwrap();
 
-    assert_eq!(response.id.as_deref(), Some("resp_complete"));
-    assert_eq!(response.content, [Content::Text("Done".into())]);
+    assert_eq!(response.response_id.as_deref(), Some("resp_complete"));
+    assert_eq!(
+        response.content,
+        [AssistantContent::Text(TextContent {
+            text: "Done".into(),
+            text_signature: None,
+        })]
+    );
     assert_eq!(response.stop_reason, StopReason::Stop);
     server.requests().await;
 }

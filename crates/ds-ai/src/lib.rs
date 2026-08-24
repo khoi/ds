@@ -72,16 +72,3 @@ pub use types::{
 };
 pub use uuid::{UuidV7Error, uuid_v7, uuid_v7_at};
 pub use validation::{ToolValidationError, validate_tool_arguments, validate_tool_call};
-
-pub async fn complete(mut stream: ResponseStream) -> Result<Response, Error> {
-    use futures_util::StreamExt;
-
-    while let Some(event) = stream.next().await {
-        if let Event::Done(response) = event? {
-            return Ok(*response);
-        }
-    }
-    Err(Error::IncompleteStream {
-        partial: Response::default(),
-    })
-}
