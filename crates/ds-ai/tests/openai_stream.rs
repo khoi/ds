@@ -26,25 +26,26 @@ async fn streams_openai_text_until_the_provider_completes() {
         .collect::<Vec<_>>()
         .await;
 
+    assert_eq!(events.len(), 2);
     assert_eq!(
-        events,
-        vec![
-            Ok(Event::TextDelta {
-                content_index: 0,
-                delta: "Hello".into(),
-            }),
-            Ok(Event::Done(ds_ai::Response {
-                id: Some("resp_1".into()),
-                content: vec![ds_ai::Content::Text("Hello".into())],
-                usage: ds_ai::Usage {
-                    input: 4,
-                    output: 1,
-                    cache_read: 0,
-                    cache_write: 0,
-                    reasoning: 0,
-                },
-            })),
-        ]
+        events.first(),
+        Some(&Ok(Event::TextDelta {
+            content_index: 0,
+            delta: "Hello".into(),
+        }))
+    );
+    let response = done(&events);
+    assert_eq!(response.id.as_deref(), Some("resp_1"));
+    assert_eq!(response.content, [ds_ai::Content::Text("Hello".into())]);
+    assert_eq!(
+        response.usage,
+        ds_ai::Usage {
+            input: 4,
+            output: 1,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        }
     );
 
     let request = server.requests().await.pop().unwrap();
@@ -84,22 +85,18 @@ async fn rejects_an_openai_stream_that_ends_without_a_terminal_event() {
         .collect::<Vec<_>>()
         .await;
 
+    assert_eq!(events.len(), 2);
     assert_eq!(
-        events,
-        vec![
-            Ok(Event::TextDelta {
-                content_index: 0,
-                delta: "Hel".into(),
-            }),
-            Err(ds_ai::Error::IncompleteStream {
-                partial: ds_ai::Response {
-                    id: Some("resp_partial".into()),
-                    content: vec![ds_ai::Content::Text("Hel".into())],
-                    usage: ds_ai::Usage::default(),
-                },
-            }),
-        ]
+        events.first(),
+        Some(&Ok(Event::TextDelta {
+            content_index: 0,
+            delta: "Hel".into(),
+        }))
     );
+    let partial = incomplete(&events);
+    assert_eq!(partial.id.as_deref(), Some("resp_partial"));
+    assert_eq!(partial.content, [ds_ai::Content::Text("Hel".into())]);
+    assert_eq!(partial.usage, ds_ai::Usage::default());
     server.requests().await;
 }
 
@@ -134,25 +131,26 @@ async fn decodes_openai_sse_across_arbitrary_chunks() {
         .collect::<Vec<_>>()
         .await;
 
+    assert_eq!(events.len(), 2);
     assert_eq!(
-        events,
-        vec![
-            Ok(Event::TextDelta {
-                content_index: 0,
-                delta: "Hé".into(),
-            }),
-            Ok(Event::Done(ds_ai::Response {
-                id: Some("resp_chunks".into()),
-                content: vec![ds_ai::Content::Text("Hé".into())],
-                usage: ds_ai::Usage {
-                    input: 3,
-                    output: 1,
-                    cache_read: 0,
-                    cache_write: 0,
-                    reasoning: 0,
-                },
-            })),
-        ]
+        events.first(),
+        Some(&Ok(Event::TextDelta {
+            content_index: 0,
+            delta: "Hé".into(),
+        }))
+    );
+    let response = done(&events);
+    assert_eq!(response.id.as_deref(), Some("resp_chunks"));
+    assert_eq!(response.content, [ds_ai::Content::Text("Hé".into())]);
+    assert_eq!(
+        response.usage,
+        ds_ai::Usage {
+            input: 3,
+            output: 1,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        }
     );
     server.requests().await;
 }
@@ -179,14 +177,11 @@ async fn retries_openai_before_streaming_starts() {
         .collect::<Vec<_>>()
         .await;
 
-    assert_eq!(
-        events,
-        vec![Ok(Event::Done(ds_ai::Response {
-            id: Some("resp_retry".into()),
-            content: Vec::new(),
-            usage: ds_ai::Usage::default(),
-        }))]
-    );
+    assert_eq!(events.len(), 1);
+    let response = done(&events);
+    assert_eq!(response.id.as_deref(), Some("resp_retry"));
+    assert!(response.content.is_empty());
+    assert_eq!(response.usage, ds_ai::Usage::default());
     assert_eq!(server.requests().await.len(), 2);
 }
 
@@ -504,31 +499,52 @@ async fn streams_openai_reasoning_and_text_in_content_order() {
         .collect::<Vec<_>>()
         .await;
 
+    assert_eq!(events.len(), 3);
     assert_eq!(
-        events,
-        vec![
-            Ok(Event::ReasoningDelta {
-                content_index: 0,
-                delta: "Need answer.".into(),
-            }),
-            Ok(Event::TextDelta {
-                content_index: 1,
-                delta: "Hello".into(),
-            }),
-            Ok(Event::Done(ds_ai::Response {
-                id: Some("resp_reasoning".into()),
-                content: vec![
-                    ds_ai::Content::Reasoning("Need answer.".into()),
-                    ds_ai::Content::Text("Hello".into()),
-                ],
-                usage: ds_ai::Usage {
-                    input: 5,
-                    output: 4,
-                    cache_read: 0,
-                    cache_write: 0,
-                    reasoning: 3,
-                },
-            })),
+        events.first(),
+        Some(&Ok(Event::ReasoningDelta {
+            content_index: 0,
+            delta: "Need answer.".into(),
+        }))
+    );
+    assert_eq!(
+        events.get(1),
+        Some(&Ok(Event::TextDelta {
+            content_index: 1,
+            delta: "Hello".into(),
+        }))
+    );
+    let response = done(&events);
+    assert_eq!(response.id.as_deref(), Some("resp_reasoning"));
+    assert_eq!(
+        response.content,
+        [
+            ds_ai::Content::Reasoning("Need answer.".into()),
+            ds_ai::Content::Text("Hello".into()),
         ]
     );
+    assert_eq!(
+        response.usage,
+        ds_ai::Usage {
+            input: 5,
+            output: 4,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 3,
+        }
+    );
+}
+
+fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {
+    match events.last() {
+        Some(Ok(Event::Done(response))) => response,
+        _ => panic!("stream did not complete"),
+    }
+}
+
+fn incomplete(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {
+    match events.last() {
+        Some(Err(ds_ai::Error::IncompleteStream { partial })) => partial,
+        _ => panic!("stream was not incomplete"),
+    }
 }
