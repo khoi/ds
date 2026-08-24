@@ -187,6 +187,166 @@ async fn logs_in_through_the_codex_browser_callback() {
     assert!(body.contains("code=callback_code"));
 }
 
+#[tokio::test]
+async fn logs_in_with_the_codex_device_flow() {
+    let server = serve([
+        Reply::json(
+            200,
+            json!({
+                "device_auth_id": "device_1",
+                "user_code": "ABCD-EFGH",
+                "interval": "0"
+            }),
+        ),
+        Reply::json(403, json!({"error": "authorization_pending"})),
+        Reply::json(404, json!({"error": "not_found"})),
+        Reply::json(
+            400,
+            json!({"error": {"code": "deviceauth_authorization_pending"}}),
+        ),
+        Reply::json(429, json!({"error": "slow_down", "interval": 0})),
+        Reply::json(
+            200,
+            json!({
+                "authorization_code": "device_code",
+                "code_verifier": "device_verifier"
+            }),
+        ),
+        Reply::json(
+            200,
+            json!({
+                "access_token": token("acc_device"),
+                "refresh_token": "refresh_device",
+                "expires_in": 3600
+            }),
+        ),
+    ])
+    .await;
+    let interaction = DeviceInteraction::default();
+    let client = Client::new().with_base_url(&server.base_url);
+
+    let credentials = client
+        .login_device(&interaction, &CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(credentials.account_id().unwrap(), "acc_device");
+    assert_eq!(
+        interaction.notification.lock().unwrap().clone(),
+        Some(Notification::DeviceCode {
+            user_code: "ABCD-EFGH".into(),
+            verification_uri: format!("{}/codex/device", server.base_url),
+            interval: Duration::ZERO,
+            expires_in: Duration::from_secs(15 * 60),
+        })
+    );
+    let device_redirect = format!("{}/deviceauth/callback", server.base_url);
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 7);
+    assert!(requests[0].starts_with("POST /api/accounts/deviceauth/usercode HTTP/1.1\r\n"));
+    assert!(requests[1].starts_with("POST /api/accounts/deviceauth/token HTTP/1.1\r\n"));
+    assert!(requests[6].starts_with("POST /oauth/token HTTP/1.1\r\n"));
+    let exchange = requests[6].split("\r\n\r\n").nth(1).unwrap();
+    assert!(exchange.contains("code=device_code"));
+    assert!(exchange.contains("code_verifier=device_verifier"));
+    assert!(exchange.contains(
+        &url::form_urlencoded::byte_serialize(device_redirect.as_bytes()).collect::<String>()
+    ));
+}
+
+#[tokio::test]
+async fn cancels_the_codex_device_poll_wait() {
+    let server = serve([
+        Reply::json(
+            200,
+            json!({
+                "device_auth_id": "device_wait",
+                "user_code": "WAIT",
+                "interval": 60
+            }),
+        ),
+        Reply::json(403, json!({"error": "authorization_pending"})),
+    ])
+    .await;
+    let client = Client::new().with_base_url(&server.base_url);
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let login = tokio::spawn(async move {
+        client
+            .login_device(&DeviceInteraction::default(), &task_cancellation)
+            .await
+    });
+    server.wait_for_requests(2).await;
+
+    cancellation.cancel();
+
+    assert!(matches!(
+        login.await.unwrap(),
+        Err(ds_ai::codex::auth::Error::Cancelled)
+    ));
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn times_out_the_codex_device_flow() {
+    let server = serve([
+        Reply::json(
+            200,
+            json!({
+                "device_auth_id": "device_timeout",
+                "user_code": "TIME",
+                "interval": 60
+            }),
+        ),
+        Reply::json(403, json!({"error": "authorization_pending"})),
+    ])
+    .await;
+    let client = Client::new()
+        .with_base_url(&server.base_url)
+        .with_device_timeout(Duration::from_millis(10));
+
+    let result = client
+        .login_device(&DeviceInteraction::default(), &CancellationToken::new())
+        .await;
+
+    assert!(matches!(result, Err(ds_ai::codex::auth::Error::Timeout)));
+    assert_eq!(server.requests().await.len(), 2);
+}
+
+#[tokio::test]
+async fn preserves_codex_device_poll_failure_details() {
+    let server = serve([
+        Reply::json(
+            200,
+            json!({
+                "device_auth_id": "device_fail",
+                "user_code": "FAIL",
+                "interval": 0
+            }),
+        ),
+        Reply::json(
+            500,
+            json!({"error": {"code": "server_error", "message": "broken"}}),
+        ),
+    ])
+    .await;
+    let client = Client::new().with_base_url(&server.base_url);
+
+    let result = client
+        .login_device(&DeviceInteraction::default(), &CancellationToken::new())
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(ds_ai::codex::auth::Error::Server {
+            operation: "device poll",
+            status: 500,
+            body,
+        }) if body.contains("server_error") && body.contains("broken")
+    ));
+    server.requests().await;
+}
+
 #[derive(Default)]
 struct ManualInteraction {
     authorization_url: Arc<Mutex<Option<String>>>,
@@ -201,8 +361,12 @@ impl ManualInteraction {
 #[async_trait]
 impl Interaction for ManualInteraction {
     fn notify(&self, notification: Notification) {
-        let Notification::AuthorizationUrl { url } = notification;
-        *self.authorization_url.lock().unwrap() = Some(url);
+        match notification {
+            Notification::AuthorizationUrl { url } => {
+                *self.authorization_url.lock().unwrap() = Some(url);
+            }
+            Notification::DeviceCode { .. } => panic!("unexpected device notification"),
+        }
     }
 
     async fn manual_authorization(
@@ -223,7 +387,9 @@ struct CallbackInteraction;
 #[async_trait]
 impl Interaction for CallbackInteraction {
     fn notify(&self, notification: Notification) {
-        let Notification::AuthorizationUrl { url } = notification;
+        let Notification::AuthorizationUrl { url } = notification else {
+            panic!("unexpected device notification");
+        };
         let authorization_url = url::Url::parse(&url).unwrap();
         let callback = format!(
             "{}?code=callback_code&state={}",
@@ -245,6 +411,25 @@ impl Interaction for CallbackInteraction {
     ) -> Result<String, ds_ai::codex::auth::Error> {
         cancellation.cancelled().await;
         Err(ds_ai::codex::auth::Error::Cancelled)
+    }
+}
+
+#[derive(Default)]
+struct DeviceInteraction {
+    notification: Arc<Mutex<Option<Notification>>>,
+}
+
+#[async_trait]
+impl Interaction for DeviceInteraction {
+    fn notify(&self, notification: Notification) {
+        *self.notification.lock().unwrap() = Some(notification);
+    }
+
+    async fn manual_authorization(
+        &self,
+        _cancellation: CancellationToken,
+    ) -> Result<String, ds_ai::codex::auth::Error> {
+        panic!("device login requested manual authorization")
     }
 }
 

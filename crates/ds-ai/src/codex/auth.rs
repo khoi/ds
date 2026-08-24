@@ -12,6 +12,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Mutex,
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -19,10 +20,19 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_BASE_URL: &str = "https://auth.openai.com";
 const MINIMUM_VALIDITY: Duration = Duration::from_secs(5 * 60);
 const SCOPE: &str = "openid profile email offline_access";
+const DEVICE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Notification {
-    AuthorizationUrl { url: String },
+    AuthorizationUrl {
+        url: String,
+    },
+    DeviceCode {
+        user_code: String,
+        verification_uri: String,
+        interval: Duration,
+        expires_in: Duration,
+    },
 }
 
 #[async_trait]
@@ -51,6 +61,7 @@ pub struct Client {
     base_url: String,
     callback_address: SocketAddr,
     callback_host: String,
+    device_timeout: Duration,
 }
 
 impl Default for Client {
@@ -66,6 +77,7 @@ impl Client {
             base_url: DEFAULT_BASE_URL.into(),
             callback_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1455),
             callback_host: "localhost".into(),
+            device_timeout: DEVICE_TIMEOUT,
         }
     }
 
@@ -77,6 +89,11 @@ impl Client {
     pub fn with_callback_address(mut self, address: SocketAddr) -> Self {
         self.callback_address = address;
         self.callback_host = address.ip().to_string();
+        self
+    }
+
+    pub fn with_device_timeout(mut self, timeout: Duration) -> Self {
+        self.device_timeout = timeout;
         self
     }
 
@@ -121,6 +138,70 @@ impl Client {
         flow_cancellation.cancel();
         self.exchange(&code?, &verifier, &redirect_uri, cancellation)
             .await
+    }
+
+    pub async fn login_device(
+        &self,
+        interaction: &dyn Interaction,
+        cancellation: &CancellationToken,
+    ) -> Result<Credentials, Error> {
+        let deadline = Instant::now() + self.device_timeout;
+        let response = self
+            .device_request(
+                "/api/accounts/deviceauth/usercode",
+                serde_json::json!({"client_id": CLIENT_ID}),
+                cancellation,
+                deadline,
+            )
+            .await?;
+        let status = response.status();
+        let body = read_body(response, cancellation, deadline).await?;
+        if !status.is_success() {
+            return Err(Error::Server {
+                operation: "device start",
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let device = parse_device(&body)?;
+        interaction.notify(Notification::DeviceCode {
+            user_code: device.user_code.clone(),
+            verification_uri: format!("{}/codex/device", self.base_url),
+            interval: device.interval,
+            expires_in: self.device_timeout,
+        });
+        let mut interval = device.interval;
+        let authorization = loop {
+            let response = self
+                .device_request(
+                    "/api/accounts/deviceauth/token",
+                    serde_json::json!({
+                        "device_auth_id": device.id,
+                        "user_code": device.user_code,
+                    }),
+                    cancellation,
+                    deadline,
+                )
+                .await?;
+            let status = response.status();
+            let body = read_body(response, cancellation, deadline).await?;
+            match parse_device_poll(status.as_u16(), &body)? {
+                DevicePoll::Complete(authorization) => break authorization,
+                DevicePoll::Pending => {}
+                DevicePoll::SlowDown(server_interval) => {
+                    interval = server_interval
+                        .unwrap_or_else(|| interval.saturating_add(Duration::from_secs(5)));
+                }
+            }
+            wait_for_device_poll(interval, cancellation, deadline).await?;
+        };
+        self.exchange(
+            &authorization.code,
+            &authorization.verifier,
+            &format!("{}/deviceauth/callback", self.base_url),
+            cancellation,
+        )
+        .await
     }
 
     pub async fn refresh(
@@ -194,6 +275,25 @@ impl Client {
             .append_pair("originator", "ds");
         Ok(url.into())
     }
+
+    async fn device_request(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<reqwest::Response, Error> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(Error::Cancelled),
+            _ = tokio::time::sleep_until(deadline) => Err(Error::Timeout),
+            response = self
+                .http
+                .post(format!("{}{path}", self.base_url))
+                .json(&body)
+                .send() => response.map_err(|error| Error::Http(error.to_string())),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -251,6 +351,8 @@ pub enum Error {
     MissingCode,
     #[error("OAuth callback failed: {0}")]
     Callback(String),
+    #[error("OAuth device login timed out")]
+    Timeout,
 }
 
 struct Authorization {
@@ -263,6 +365,23 @@ struct TokenResponse {
     access_token: Option<String>,
     refresh_token: Option<String>,
     expires_in: Option<u64>,
+}
+
+struct Device {
+    id: String,
+    user_code: String,
+    interval: Duration,
+}
+
+struct DeviceAuthorization {
+    code: String,
+    verifier: String,
+}
+
+enum DevicePoll {
+    Complete(DeviceAuthorization),
+    Pending,
+    SlowDown(Option<Duration>),
 }
 
 async fn read_credentials(
@@ -301,6 +420,19 @@ async fn read_credentials(
     Ok(credentials)
 }
 
+async fn read_body(
+    response: reqwest::Response,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<String, Error> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(Error::Cancelled),
+        _ = tokio::time::sleep_until(deadline) => Err(Error::Timeout),
+        body = response.text() => body.map_err(|error| Error::Http(error.to_string())),
+    }
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -312,6 +444,100 @@ fn now_millis() -> u64 {
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn parse_device(body: &str) -> Result<Device, Error> {
+    let response: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| Error::InvalidResponse(error.to_string()))?;
+    let id = response
+        .get("device_auth_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::InvalidResponse("missing device_auth_id".into()))?;
+    let user_code = response
+        .get("user_code")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::InvalidResponse("missing user_code".into()))?;
+    let interval = response
+        .get("interval")
+        .and_then(parse_seconds)
+        .ok_or_else(|| Error::InvalidResponse("invalid device interval".into()))?;
+    Ok(Device {
+        id: id.into(),
+        user_code: user_code.into(),
+        interval,
+    })
+}
+
+fn parse_device_poll(status: u16, body: &str) -> Result<DevicePoll, Error> {
+    let response = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+    if (200..300).contains(&status) {
+        let code = response
+            .get("authorization_code")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Error::InvalidResponse("missing authorization_code".into()))?;
+        let verifier = response
+            .get("code_verifier")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Error::InvalidResponse("missing code_verifier".into()))?;
+        return Ok(DevicePoll::Complete(DeviceAuthorization {
+            code: code.into(),
+            verifier: verifier.into(),
+        }));
+    }
+    if matches!(status, 403 | 404) {
+        return Ok(DevicePoll::Pending);
+    }
+    let error = response.get("error").and_then(|error| {
+        error
+            .as_str()
+            .or_else(|| error.get("code").and_then(serde_json::Value::as_str))
+    });
+    match error {
+        Some("authorization_pending" | "deviceauth_authorization_pending") => {
+            Ok(DevicePoll::Pending)
+        }
+        Some("slow_down") => Ok(DevicePoll::SlowDown(
+            response.get("interval").and_then(parse_seconds),
+        )),
+        _ => Err(Error::Server {
+            operation: "device poll",
+            status,
+            body: body.into(),
+        }),
+    }
+}
+
+fn parse_seconds(value: &serde_json::Value) -> Option<Duration> {
+    let seconds = value
+        .as_f64()
+        .or_else(|| value.as_str()?.trim().parse::<f64>().ok())?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(seconds))
+}
+
+async fn wait_for_device_poll(
+    interval: Duration,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<(), Error> {
+    let next_poll = Instant::now().checked_add(interval).unwrap_or(deadline);
+    let wake = next_poll.min(deadline);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(Error::Cancelled),
+        _ = tokio::time::sleep_until(wake) => {}
+    }
+    if Instant::now() >= deadline {
+        Err(Error::Timeout)
+    } else {
+        Ok(())
+    }
 }
 
 fn pkce() -> (String, String) {
