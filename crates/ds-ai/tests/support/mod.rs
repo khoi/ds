@@ -16,6 +16,8 @@ pub struct Reply {
     headers: Vec<(&'static str, String)>,
     chunks: Vec<Vec<u8>>,
     disconnect: bool,
+    wait_before_headers: bool,
+    finish: bool,
 }
 
 impl Reply {
@@ -31,6 +33,8 @@ impl Reply {
             headers: Vec::new(),
             chunks: chunks.into_iter().collect(),
             disconnect: false,
+            wait_before_headers: false,
+            finish: true,
         }
     }
 
@@ -48,6 +52,8 @@ impl Reply {
             headers: Vec::new(),
             chunks: vec![serde_json::to_vec(&body).unwrap()],
             disconnect: false,
+            wait_before_headers: false,
+            finish: true,
         }
     }
 
@@ -59,6 +65,28 @@ impl Reply {
             headers: Vec::new(),
             chunks: Vec::new(),
             disconnect: true,
+            wait_before_headers: false,
+            finish: true,
+        }
+    }
+
+    pub fn pending() -> Self {
+        Self {
+            status: 0,
+            reason: "",
+            content_type: "",
+            headers: Vec::new(),
+            chunks: Vec::new(),
+            disconnect: false,
+            wait_before_headers: true,
+            finish: false,
+        }
+    }
+
+    pub fn open_sse(body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            finish: false,
+            ..Self::sse(body)
         }
     }
 
@@ -152,6 +180,11 @@ async fn write_reply(socket: &mut TcpStream, reply: Reply) {
     if reply.disconnect {
         return;
     }
+    if reply.wait_before_headers {
+        let mut byte = [0];
+        let _ = socket.read(&mut byte).await;
+        return;
+    }
     let headers = reply
         .headers
         .iter()
@@ -174,6 +207,11 @@ async fn write_reply(socket: &mut TcpStream, reply: Reply) {
             .unwrap();
         socket.write_all(&chunk).await.unwrap();
         socket.write_all(b"\r\n").await.unwrap();
+    }
+    if !reply.finish {
+        let mut byte = [0];
+        let _ = socket.read(&mut byte).await;
+        return;
     }
     socket.write_all(b"0\r\n\r\n").await.unwrap();
 }

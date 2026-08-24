@@ -551,13 +551,27 @@ pub async fn stream(
     }
 
     let response_model = model.id.clone();
+    let stream_cancellation = options.cancellation.clone();
     let output = stream! {
         let mut chunks = response.bytes_stream();
         let mut decoder = sse::Decoder::default();
         let mut result = Response::openai(response_model);
         let mut slots = HashMap::new();
 
-        while let Some(chunk) = chunks.next().await {
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = stream_cancellation.cancelled() => {
+                    result.stop_reason = StopReason::Aborted;
+                    result.raw_stop_reason = Some("cancelled".into());
+                    yield Err(Error::Cancelled { partial: Some(result) });
+                    return;
+                }
+                chunk = chunks.next() => chunk,
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {

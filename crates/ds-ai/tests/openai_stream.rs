@@ -290,7 +290,7 @@ async fn cancels_an_openai_retry_wait() {
         Err(error) => error,
     };
 
-    assert_eq!(error, ds_ai::Error::Cancelled);
+    assert_eq!(error, ds_ai::Error::Cancelled { partial: None });
     assert_eq!(server.request_count(), 1);
 }
 
@@ -995,6 +995,60 @@ async fn encodes_openai_multimodal_context_and_generation_options() {
             "tool_choice": "required"
         })
     );
+}
+
+#[tokio::test]
+async fn cancels_an_openai_request_before_response_headers() {
+    let server = serve([Reply::pending()]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let options = openai::Options::new("test-key").with_cancellation(cancellation.clone());
+    let request = tokio::spawn(async move { openai::stream(&model, &context, &options).await });
+
+    server.wait_for_requests(1).await;
+    cancellation.cancel();
+
+    match request.await.unwrap() {
+        Err(ds_ai::Error::Cancelled { partial }) => assert_eq!(partial, None),
+        _ => panic!("request was not cancelled"),
+    }
+}
+
+#[tokio::test]
+async fn cancels_an_active_openai_stream_with_partial_content() {
+    let sse = [
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cancel\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_cancel\",\"type\":\"message\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Visible\"}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::open_sse(sse)]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let options = openai::Options::new("test-key").with_cancellation(cancellation.clone());
+    let mut response = openai::stream(&model, &context, &options).await.unwrap();
+
+    assert_eq!(
+        response.next().await,
+        Some(Ok(Event::TextDelta {
+            content_index: 0,
+            delta: "Visible".into(),
+        }))
+    );
+    cancellation.cancel();
+
+    match response.next().await {
+        Some(Err(ds_ai::Error::Cancelled {
+            partial: Some(partial),
+        })) => {
+            assert_eq!(partial.stop_reason, StopReason::Aborted);
+            assert_eq!(partial.raw_stop_reason.as_deref(), Some("cancelled"));
+            assert_eq!(partial.content, [ds_ai::Content::Text("Visible".into())]);
+        }
+        event => panic!("unexpected cancellation event: {event:?}"),
+    }
 }
 
 fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {

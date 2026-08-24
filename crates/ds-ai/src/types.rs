@@ -177,6 +177,7 @@ pub enum StopReason {
     Length,
     ToolUse,
     Error,
+    Aborted,
 }
 
 impl Response {
@@ -261,7 +262,7 @@ pub enum Error {
         partial: Response,
     },
     #[error("request cancelled")]
-    Cancelled,
+    Cancelled { partial: Option<Response> },
     #[error("provider retry delay {requested:?} exceeds {maximum:?}")]
     RetryDelayExceeded {
         requested: Duration,

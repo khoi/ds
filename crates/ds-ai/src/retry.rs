@@ -19,7 +19,14 @@ where
 {
     let mut retries = 0;
     loop {
-        let response = match request().await {
+        let requested = tokio::select! {
+            biased;
+            _ = policy.cancellation.cancelled() => {
+                return Err(Error::Cancelled { partial: None });
+            }
+            response = request() => response,
+        };
+        let response = match requested {
             Ok(response) => response,
             Err(_) if retries < policy.max_retries => {
                 let delay = backoff(retries);
@@ -101,6 +108,6 @@ async fn wait(delay: Duration, cancellation: &CancellationToken) -> Result<(), E
     }
     tokio::select! {
         _ = tokio::time::sleep(delay) => Ok(()),
-        _ = cancellation.cancelled() => Err(Error::Cancelled),
+        _ = cancellation.cancelled() => Err(Error::Cancelled { partial: None }),
     }
 }
