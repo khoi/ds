@@ -25,9 +25,24 @@ pub(crate) enum ProviderEvent {
         content_index: usize,
         delta: String,
     },
+    ThinkingStart {
+        content_index: usize,
+    },
+    ThinkingEnd {
+        content_index: usize,
+        content: ThinkingContent,
+    },
     ReasoningDelta {
         content_index: usize,
         delta: String,
+    },
+    ToolCallStart {
+        content_index: usize,
+        tool_call: AssistantToolCall,
+    },
+    ToolCallEnd {
+        content_index: usize,
+        tool_call: AssistantToolCall,
     },
     ToolCallDelta {
         content_index: usize,
@@ -133,6 +148,44 @@ pub(crate) fn adapt_provider(
                         partial: partial.clone(),
                     };
                 }
+                Ok(ProviderEvent::ThinkingStart { content_index }) => {
+                    if started.insert(content_index) {
+                        partial.content.push(AssistantContent::Thinking(ThinkingContent {
+                            thinking: String::new(),
+                            thinking_signature: None,
+                            redacted: None,
+                        }));
+                        yield AssistantMessageEvent::ThinkingStart {
+                            content_index,
+                            partial: partial.clone(),
+                        };
+                    }
+                }
+                Ok(ProviderEvent::ThinkingEnd {
+                    content_index,
+                    content,
+                }) => {
+                    if started.insert(content_index) {
+                        partial.content.push(AssistantContent::Thinking(ThinkingContent {
+                            thinking: String::new(),
+                            thinking_signature: None,
+                            redacted: None,
+                        }));
+                        yield AssistantMessageEvent::ThinkingStart {
+                            content_index,
+                            partial: partial.clone(),
+                        };
+                    }
+                    if let Some(slot) = partial.content.get_mut(content_index) {
+                        *slot = AssistantContent::Thinking(content.clone());
+                    }
+                    ended.insert(content_index);
+                    yield AssistantMessageEvent::ThinkingEnd {
+                        content_index,
+                        content: content.thinking,
+                        partial: partial.clone(),
+                    };
+                }
                 Ok(ProviderEvent::ReasoningDelta { content_index, delta }) => {
                     if started.insert(content_index) {
                         partial.content.push(AssistantContent::Thinking(ThinkingContent {
@@ -151,6 +204,39 @@ pub(crate) fn adapt_provider(
                     yield AssistantMessageEvent::ThinkingDelta {
                         content_index,
                         delta,
+                        partial: partial.clone(),
+                    };
+                }
+                Ok(ProviderEvent::ToolCallStart {
+                    content_index,
+                    tool_call,
+                }) => {
+                    if started.insert(content_index) {
+                        partial.content.push(AssistantContent::ToolCall(tool_call));
+                        yield AssistantMessageEvent::ToolCallStart {
+                            content_index,
+                            partial: partial.clone(),
+                        };
+                    }
+                }
+                Ok(ProviderEvent::ToolCallEnd {
+                    content_index,
+                    tool_call,
+                }) => {
+                    if started.insert(content_index) {
+                        partial.content.push(AssistantContent::ToolCall(tool_call.clone()));
+                        yield AssistantMessageEvent::ToolCallStart {
+                            content_index,
+                            partial: partial.clone(),
+                        };
+                    }
+                    if let Some(slot) = partial.content.get_mut(content_index) {
+                        *slot = AssistantContent::ToolCall(tool_call.clone());
+                    }
+                    ended.insert(content_index);
+                    yield AssistantMessageEvent::ToolCallEnd {
+                        content_index,
+                        tool_call,
                         partial: partial.clone(),
                     };
                 }
@@ -231,7 +317,12 @@ pub(crate) fn response_stream(mut source: ProviderEventStream) -> ResponseStream
     Box::pin(stream! {
         while let Some(event) = source.next().await {
             match event {
-                Ok(ProviderEvent::TextStart { .. } | ProviderEvent::TextEnd { .. }) => {}
+                Ok(ProviderEvent::TextStart { .. }
+                | ProviderEvent::TextEnd { .. }
+                | ProviderEvent::ThinkingStart { .. }
+                | ProviderEvent::ThinkingEnd { .. }
+                | ProviderEvent::ToolCallStart { .. }
+                | ProviderEvent::ToolCallEnd { .. }) => {}
                 Ok(ProviderEvent::TextDelta { content_index, delta }) => {
                     yield Ok(Event::TextDelta { content_index, delta });
                 }

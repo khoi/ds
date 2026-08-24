@@ -12,6 +12,94 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 #[tokio::test]
+async fn emits_openai_content_events_from_done_items() {
+    let server = serve([Reply::sse(openai_done_items())]).await;
+    let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    model.base_url = server.base_url.clone();
+    let provider = ds_ai::openai::Provider::new([model.clone()]);
+    let mut stream = provider.stream(
+        &model,
+        &Context::new([Message::user("Hello")]),
+        &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+    );
+    let mut events = Vec::new();
+
+    while let Some(event) = stream.next().await {
+        match event {
+            ds_ai::AssistantMessageEvent::Start { .. } => events.push("start"),
+            ds_ai::AssistantMessageEvent::ThinkingStart { .. } => events.push("thinking_start"),
+            ds_ai::AssistantMessageEvent::ThinkingEnd {
+                content, partial, ..
+            } => {
+                events.push("thinking_end");
+                assert_eq!(content, "Think");
+                let AssistantContent::Thinking(thinking) = &partial.content[0] else {
+                    panic!("expected thinking content");
+                };
+                assert_eq!(
+                    serde_json::from_str::<Value>(thinking.thinking_signature.as_deref().unwrap())
+                        .unwrap(),
+                    json!({
+                        "type": "reasoning",
+                        "id": "rs_done",
+                        "summary": [{"type": "summary_text", "text": "Think"}],
+                        "encrypted_content": "secret"
+                    })
+                );
+            }
+            ds_ai::AssistantMessageEvent::TextStart { .. } => events.push("text_start"),
+            ds_ai::AssistantMessageEvent::TextEnd {
+                content, partial, ..
+            } => {
+                events.push("text_end");
+                assert_eq!(content, "Answer");
+                let AssistantContent::Text(text) = &partial.content[1] else {
+                    panic!("expected text content");
+                };
+                assert_eq!(
+                    serde_json::from_str::<Value>(text.text_signature.as_deref().unwrap()).unwrap(),
+                    json!({"v": 1, "id": "msg_done", "phase": "final_answer"})
+                );
+            }
+            ds_ai::AssistantMessageEvent::ToolCallStart { .. } => {
+                events.push("toolcall_start");
+            }
+            ds_ai::AssistantMessageEvent::ToolCallEnd { tool_call, .. } => {
+                events.push("toolcall_end");
+                assert_eq!(tool_call.id, "call_done|fc_done");
+                assert_eq!(tool_call.name, "lookup");
+                assert_eq!(tool_call.arguments, json!({"value": "x"}));
+                assert_eq!(tool_call.namespace.as_deref(), Some("dynamic_tools"));
+            }
+            ds_ai::AssistantMessageEvent::Done { .. } => events.push("done"),
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        events,
+        [
+            "start",
+            "thinking_start",
+            "thinking_end",
+            "text_start",
+            "text_end",
+            "toolcall_start",
+            "toolcall_end",
+            "done"
+        ]
+    );
+    assert_eq!(stream.result().await.unwrap().content.len(), 3);
+    server.requests().await;
+}
+
+#[tokio::test]
 async fn tracks_openai_message_phases() {
     for (added, done, expected) in [
         (
@@ -1162,6 +1250,10 @@ fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
 
 fn openai_done() -> &'static str {
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n"
+}
+
+fn openai_done_items() -> &'static str {
+    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_done\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Think\"}],\"encrypted_content\":\"secret\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_done\",\"content\":[{\"type\":\"output_text\",\"text\":\"Answer\"}],\"phase\":\"final_answer\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_done\",\"call_id\":\"call_done\",\"name\":\"lookup\",\"arguments\":\"{\\\"value\\\":\\\"x\\\"}\",\"namespace\":\"dynamic_tools\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_done\",\"status\":\"completed\"}}\n\n"
 }
 
 fn openai_phased_done(added: &str, done: &str, incomplete: bool) -> String {

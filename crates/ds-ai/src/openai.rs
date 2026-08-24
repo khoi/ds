@@ -693,6 +693,132 @@ enum ToolArguments {
     },
 }
 
+fn output_slot(
+    item: &OutputItem,
+    content_index: usize,
+    grammar_input_properties: &BTreeMap<String, String>,
+) -> Option<(Content, Slot, crate::legacy::ProviderEvent)> {
+    match item.r#type.as_str() {
+        "message" => Some((
+            Content::Text(String::new()),
+            Slot::Text(content_index),
+            crate::legacy::ProviderEvent::TextStart {
+                content_index,
+                stop_reason: (item.phase.as_deref() == Some("final_answer"))
+                    .then_some(StopReason::Stop),
+            },
+        )),
+        "reasoning" => Some((
+            Content::Reasoning(String::new()),
+            Slot::Reasoning(content_index),
+            crate::legacy::ProviderEvent::ThinkingStart { content_index },
+        )),
+        "function_call" => {
+            let call_id = item.call_id.clone()?;
+            let name = item.name.clone()?;
+            let arguments = item.arguments.clone().unwrap_or_default();
+            let call = ToolCall {
+                id: call_id,
+                name,
+                arguments: parse_arguments(&arguments),
+            };
+            Some((
+                Content::ToolCall(call.clone()),
+                Slot::ToolCall {
+                    content_index,
+                    arguments: ToolArguments::Json(arguments),
+                },
+                crate::legacy::ProviderEvent::ToolCallStart {
+                    content_index,
+                    tool_call: assistant_tool_call(
+                        &call,
+                        item.id.as_deref(),
+                        item.namespace.clone(),
+                    ),
+                },
+            ))
+        }
+        "custom_tool_call" => {
+            let call_id = item.call_id.clone()?;
+            let name = item.name.clone()?;
+            let property = grammar_input_properties
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| "input".into());
+            let input = item.input.clone().unwrap_or_default();
+            let call = ToolCall {
+                id: call_id,
+                name,
+                arguments: serde_json::json!({&property: input}),
+            };
+            Some((
+                Content::ToolCall(call.clone()),
+                Slot::ToolCall {
+                    content_index,
+                    arguments: ToolArguments::Grammar {
+                        property,
+                        buffer: GrammarInputBuffer {
+                            input: String::new(),
+                            started: false,
+                            closed: false,
+                        },
+                    },
+                },
+                crate::legacy::ProviderEvent::ToolCallStart {
+                    content_index,
+                    tool_call: assistant_tool_call(
+                        &call,
+                        item.id.as_deref(),
+                        item.namespace.clone(),
+                    ),
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn assistant_tool_call(
+    call: &ToolCall,
+    item_id: Option<&str>,
+    namespace: Option<String>,
+) -> crate::AssistantToolCall {
+    let id = item_id.filter(|_| !call.id.contains('|')).map_or_else(
+        || call.id.clone(),
+        |item_id| format!("{}|{item_id}", call.id),
+    );
+    crate::AssistantToolCall {
+        id,
+        name: call.name.clone(),
+        arguments: call.arguments.clone(),
+        thought_signature: None,
+        namespace,
+    }
+}
+
+fn thinking_content(
+    id: Option<&str>,
+    encrypted_content: Option<&str>,
+    thinking: String,
+) -> crate::ThinkingContent {
+    let thinking_signature = id.and_then(|id| {
+        let mut item = serde_json::json!({
+            "type": "reasoning",
+            "id": id,
+            "summary": [{"type": "summary_text", "text": thinking}]
+        });
+        if let Some(encrypted_content) = encrypted_content {
+            item["encrypted_content"] = encrypted_content.into();
+        }
+        serde_json::to_string(&item).ok()
+    });
+    crate::ThinkingContent {
+        thinking,
+        thinking_signature,
+        redacted: None,
+    }
+}
+
 #[derive(Deserialize)]
 struct CompletedResponse {
     #[serde(flatten)]
@@ -1546,72 +1672,21 @@ pub(crate) fn decode_events(
                     StreamEvent::Created { response } => result.id = Some(response.id),
                     StreamEvent::OutputItemAdded { output_index, item } => {
                         let content_index = result.content.len();
-                        match item.r#type.as_str() {
-                            "message" => {
-                                result.content.push(Content::Text(String::new()));
-                                slots.insert(output_index, Slot::Text(content_index));
-                                let stop_reason = (item.phase.as_deref() == Some("final_answer"))
-                                    .then_some(StopReason::Stop);
-                                if let Some(stop_reason) = stop_reason {
-                                    result.stop_reason = stop_reason;
+                        if let Some((content, slot, start)) =
+                            output_slot(&item, content_index, &grammar_input_properties)
+                        {
+                            if matches!(
+                                start,
+                                crate::legacy::ProviderEvent::TextStart {
+                                    stop_reason: Some(_),
+                                    ..
                                 }
-                                yield Ok(crate::legacy::ProviderEvent::TextStart {
-                                    content_index,
-                                    stop_reason,
-                                });
+                            ) {
+                                result.stop_reason = StopReason::Stop;
                             }
-                            "reasoning" => {
-                                result.content.push(Content::Reasoning(String::new()));
-                                slots.insert(output_index, Slot::Reasoning(content_index));
-                            }
-                            "function_call" => {
-                                let (Some(id), Some(name)) = (item.call_id, item.name) else {
-                                    continue;
-                                };
-                                let arguments = item.arguments.unwrap_or_default();
-                                result.content.push(Content::ToolCall(ToolCall {
-                                    id,
-                                    name,
-                                    arguments: parse_arguments(&arguments),
-                                }));
-                                slots.insert(
-                                    output_index,
-                                    Slot::ToolCall {
-                                        content_index,
-                                        arguments: ToolArguments::Json(arguments),
-                                    },
-                                );
-                            }
-                            "custom_tool_call" => {
-                                let (Some(id), Some(name)) = (item.call_id, item.name) else {
-                                    continue;
-                                };
-                                let property = grammar_input_properties
-                                    .get(&name)
-                                    .cloned()
-                                    .unwrap_or_else(|| "input".into());
-                                let input = item.input.unwrap_or_default();
-                                result.content.push(Content::ToolCall(ToolCall {
-                                    id,
-                                    name,
-                                    arguments: serde_json::json!({&property: input}),
-                                }));
-                                slots.insert(
-                                    output_index,
-                                    Slot::ToolCall {
-                                        content_index,
-                                        arguments: ToolArguments::Grammar {
-                                            property,
-                                            buffer: GrammarInputBuffer {
-                                                input: String::new(),
-                                                started: false,
-                                                closed: false,
-                                            },
-                                        },
-                                    },
-                                );
-                            }
-                            _ => {}
+                            result.content.push(content);
+                            slots.insert(output_index, slot);
+                            yield Ok(start);
                         }
                     }
                     StreamEvent::OutputTextDelta { output_index, delta }
@@ -1737,146 +1812,204 @@ pub(crate) fn decode_events(
                             });
                         }
                     }
-                    StreamEvent::OutputItemDone { output_index, item } if item.r#type == "message" => {
-                        let Some(Slot::Text(content_index)) = slots.get(&output_index) else {
-                            continue;
-                        };
-                        let content_index = *content_index;
-                        let text = item
-                            .content
-                            .iter()
-                            .filter_map(|content| match content.r#type.as_str() {
-                                "output_text" => Some(content.text.as_str()),
-                                "refusal" => Some(content.refusal.as_str()),
-                                _ => None,
-                            })
-                            .collect::<String>();
-                        result.content[content_index] = Content::Text(text.clone());
-                        let phase = item.phase;
-                        let stop_reason = (phase.as_deref() == Some("final_answer"))
-                            .then_some(StopReason::Stop);
-                        let text_signature = item.id.as_ref().and_then(|id| {
-                            serde_json::to_string(&serde_json::json!({
-                                "v": 1,
-                                "id": id,
-                                "phase": phase
-                            }))
-                            .ok()
-                        });
-                        if let Some(id) = item.id {
-                            result.add_openai_item(OpenAiReplay::Message {
-                                content_index,
-                                id,
-                                phase,
-                            });
-                        }
-                        if stop_reason.is_some() {
-                            result.stop_reason = StopReason::Stop;
-                        }
-                        yield Ok(crate::legacy::ProviderEvent::TextEnd {
-                            content_index,
-                            content: crate::TextContent {
-                                text,
-                                text_signature,
-                            },
-                            stop_reason,
-                        });
-                    }
-                    StreamEvent::OutputItemDone { output_index, item } if item.r#type == "reasoning" => {
-                        let Some(Slot::Reasoning(content_index)) = slots.get(&output_index) else {
-                            continue;
-                        };
-                        let reasoning = if item.summary.is_empty() {
-                            item.content
-                                .iter()
-                                .map(|content| content.text.as_str())
-                                .collect::<Vec<_>>()
-                                .join("\n\n")
-                        } else {
-                            item.summary
-                                .iter()
-                                .map(|content| content.text.as_str())
-                                .collect::<Vec<_>>()
-                                .join("\n\n")
-                        };
-                        if !reasoning.is_empty() {
-                            result.content[*content_index] = Content::Reasoning(reasoning);
-                        }
-                        if let Some(id) = item.id {
-                            result.add_openai_item(OpenAiReplay::Reasoning {
-                                content_index: *content_index,
-                                id,
-                                encrypted_content: item.encrypted_content,
-                            });
-                        }
-                    }
-                    StreamEvent::OutputItemDone { output_index, item } if item.r#type == "function_call" => {
-                        let Some(Slot::ToolCall { content_index, arguments }) = slots.get(&output_index) else {
-                            continue;
-                        };
-                        let ToolArguments::Json(arguments) = arguments else {
-                            continue;
-                        };
-                        let final_arguments = item.arguments.as_deref().unwrap_or(arguments);
-                        if let Content::ToolCall(call) = &mut result.content[*content_index] {
-                            if let Some(id) = item.call_id {
-                                call.id = id;
+                    StreamEvent::OutputItemDone { output_index, item } => {
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                            slots.entry(output_index)
+                        {
+                            let content_index = result.content.len();
+                            if let Some((content, slot, start)) =
+                                output_slot(&item, content_index, &grammar_input_properties)
+                            {
+                                if matches!(
+                                    start,
+                                    crate::legacy::ProviderEvent::TextStart {
+                                        stop_reason: Some(_),
+                                        ..
+                                    }
+                                ) {
+                                    result.stop_reason = StopReason::Stop;
+                                }
+                                result.content.push(content);
+                                entry.insert(slot);
+                                yield Ok(start);
                             }
-                            if let Some(name) = item.name {
-                                call.name = name;
+                        }
+
+                        match item.r#type.as_str() {
+                            "message" => {
+                                let Some(Slot::Text(content_index)) = slots.get(&output_index) else {
+                                    continue;
+                                };
+                                let content_index = *content_index;
+                                let text = item
+                                    .content
+                                    .iter()
+                                    .filter_map(|content| match content.r#type.as_str() {
+                                        "output_text" => Some(content.text.as_str()),
+                                        "refusal" => Some(content.refusal.as_str()),
+                                        _ => None,
+                                    })
+                                    .collect::<String>();
+                                result.content[content_index] = Content::Text(text.clone());
+                                let phase = item.phase;
+                                let stop_reason = (phase.as_deref() == Some("final_answer"))
+                                    .then_some(StopReason::Stop);
+                                let text_signature = item.id.as_ref().and_then(|id| {
+                                    serde_json::to_string(&serde_json::json!({
+                                        "v": 1,
+                                        "id": id,
+                                        "phase": phase
+                                    }))
+                                    .ok()
+                                });
+                                if let Some(id) = item.id {
+                                    result.add_openai_item(OpenAiReplay::Message {
+                                        content_index,
+                                        id,
+                                        phase,
+                                    });
+                                }
+                                if stop_reason.is_some() {
+                                    result.stop_reason = StopReason::Stop;
+                                }
+                                yield Ok(crate::legacy::ProviderEvent::TextEnd {
+                                    content_index,
+                                    content: crate::TextContent {
+                                        text,
+                                        text_signature,
+                                    },
+                                    stop_reason,
+                                });
                             }
-                            call.arguments = parse_arguments(final_arguments);
-                        }
-                        if let Some(item_id) = item.id {
-                            result.add_openai_item(OpenAiReplay::ToolCall {
-                                content_index: *content_index,
-                                item_id,
-                                namespace: item.namespace,
-                            });
-                        }
-                    }
-                    StreamEvent::OutputItemDone { output_index, item } if item.r#type == "custom_tool_call" => {
-                        let Some(Slot::ToolCall { content_index, arguments }) = slots.get_mut(&output_index) else {
-                            continue;
-                        };
-                        let ToolArguments::Grammar { property, buffer } = arguments else {
-                            continue;
-                        };
-                        let input = item.input.unwrap_or_else(|| buffer.input.clone());
-                        let delta = match constrained_sampling::append_grammar_input_delta(
-                            buffer,
-                            property,
-                            &input,
-                            true,
-                        ) {
-                            Ok(delta) => delta,
-                            Err(message) => {
-                                yield Err(Error::Stream { message, partial: result });
-                                return;
+                            "reasoning" => {
+                                let Some(Slot::Reasoning(content_index)) = slots.get(&output_index) else {
+                                    continue;
+                                };
+                                let content_index = *content_index;
+                                let reasoning = if item.summary.is_empty() {
+                                    item.content
+                                        .iter()
+                                        .map(|content| content.text.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("\n\n")
+                                } else {
+                                    item.summary
+                                        .iter()
+                                        .map(|content| content.text.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("\n\n")
+                                };
+                                result.content[content_index] = Content::Reasoning(reasoning.clone());
+                                let id = item.id;
+                                let encrypted_content = item.encrypted_content;
+                                if let Some(id) = &id {
+                                    result.add_openai_item(OpenAiReplay::Reasoning {
+                                        content_index,
+                                        id: id.clone(),
+                                        encrypted_content: encrypted_content.clone(),
+                                    });
+                                }
+                                yield Ok(crate::legacy::ProviderEvent::ThinkingEnd {
+                                    content_index,
+                                    content: thinking_content(
+                                        id.as_deref(),
+                                        encrypted_content.as_deref(),
+                                        reasoning,
+                                    ),
+                                });
                             }
-                        };
-                        if let Content::ToolCall(call) = &mut result.content[*content_index] {
-                            if let Some(id) = item.call_id {
-                                call.id = id;
+                            "function_call" => {
+                                let Some(Slot::ToolCall { content_index, arguments: ToolArguments::Json(arguments) }) = slots.get(&output_index) else {
+                                    continue;
+                                };
+                                let content_index = *content_index;
+                                let arguments = item.arguments.as_deref().unwrap_or(arguments);
+                                let Content::ToolCall(call) = &mut result.content[content_index] else {
+                                    continue;
+                                };
+                                if let Some(id) = item.call_id {
+                                    call.id = id;
+                                }
+                                if let Some(name) = item.name {
+                                    call.name = name;
+                                }
+                                call.arguments = parse_arguments(arguments);
+                                let item_id = item.id;
+                                let namespace = item.namespace;
+                                let tool_call = assistant_tool_call(
+                                    call,
+                                    item_id.as_deref(),
+                                    namespace.clone(),
+                                );
+                                if let Some(item_id) = item_id {
+                                    result.add_openai_item(OpenAiReplay::ToolCall {
+                                        content_index,
+                                        item_id,
+                                        namespace,
+                                    });
+                                }
+                                yield Ok(crate::legacy::ProviderEvent::ToolCallEnd {
+                                    content_index,
+                                    tool_call,
+                                });
                             }
-                            if let Some(name) = item.name {
-                                call.name = name;
+                            "custom_tool_call" => {
+                                let Some(Slot::ToolCall { content_index, arguments: ToolArguments::Grammar { property, buffer } }) = slots.get_mut(&output_index) else {
+                                    continue;
+                                };
+                                let content_index = *content_index;
+                                let property = property.clone();
+                                let input = item.input.unwrap_or_else(|| buffer.input.clone());
+                                let delta = match constrained_sampling::append_grammar_input_delta(
+                                    buffer,
+                                    &property,
+                                    &input,
+                                    true,
+                                ) {
+                                    Ok(delta) => delta,
+                                    Err(message) => {
+                                        yield Err(Error::Stream { message, partial: result });
+                                        return;
+                                    }
+                                };
+                                let Content::ToolCall(call) = &mut result.content[content_index] else {
+                                    continue;
+                                };
+                                if let Some(id) = item.call_id {
+                                    call.id = id;
+                                }
+                                if let Some(name) = item.name {
+                                    call.name = name;
+                                }
+                                call.arguments = serde_json::json!({property: input});
+                                if let Some(delta) = delta {
+                                    yield Ok(crate::legacy::ProviderEvent::ToolCallDelta {
+                                        content_index,
+                                        delta,
+                                    });
+                                }
+                                let item_id = item.id;
+                                let namespace = item.namespace;
+                                let tool_call = assistant_tool_call(
+                                    call,
+                                    item_id.as_deref(),
+                                    namespace.clone(),
+                                );
+                                if let Some(item_id) = item_id {
+                                    result.add_openai_item(OpenAiReplay::ToolCall {
+                                        content_index,
+                                        item_id,
+                                        namespace,
+                                    });
+                                }
+                                yield Ok(crate::legacy::ProviderEvent::ToolCallEnd {
+                                    content_index,
+                                    tool_call,
+                                });
                             }
-                            call.arguments = serde_json::json!({property.as_str(): buffer.input});
+                            _ => {}
                         }
-                        if let Some(delta) = delta {
-                            yield Ok(crate::legacy::ProviderEvent::ToolCallDelta {
-                                content_index: *content_index,
-                                delta,
-                            });
-                        }
-                        if let Some(item_id) = item.id {
-                            result.add_openai_item(OpenAiReplay::ToolCall {
-                                content_index: *content_index,
-                                item_id,
-                                namespace: item.namespace,
-                            });
-                        }
+                        slots.remove(&output_index);
                     }
                     StreamEvent::Completed { response } => {
                         apply_terminal_response(
