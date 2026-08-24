@@ -58,11 +58,8 @@ pub(crate) enum ProviderEvent {
 pub(crate) type ProviderEventStream =
     Pin<Box<dyn futures_core::Stream<Item = Result<ProviderEvent, Error>> + Send>>;
 
-pub(crate) fn adapt(
-    model: Model,
-    setup: impl Future<Output = Result<ResponseStream, Error>> + Send + 'static,
-) -> AssistantMessageEventStream {
-    adapt_provider(model, async move { setup.await.map(provider_event_stream) })
+pub(crate) fn failure(model: Model, error: Error) -> AssistantMessageEventStream {
+    adapt_provider(model, async { Err(error) })
 }
 
 pub(crate) fn adapt_provider(
@@ -296,28 +293,6 @@ pub(crate) fn adapt_provider(
         yield error_event(&model, error, None);
     };
     AssistantMessageEventStream::new(output)
-}
-
-pub(crate) fn provider_event_stream(mut source: ResponseStream) -> ProviderEventStream {
-    Box::pin(stream! {
-        while let Some(event) = source.next().await {
-            yield event.map(|event| match event {
-                Event::TextDelta { content_index, delta } => ProviderEvent::TextDelta {
-                    content_index,
-                    delta,
-                },
-                Event::ReasoningDelta { content_index, delta } => ProviderEvent::ReasoningDelta {
-                    content_index,
-                    delta,
-                },
-                Event::ToolCallDelta { content_index, delta } => ProviderEvent::ToolCallDelta {
-                    content_index,
-                    delta,
-                },
-                Event::Done(response) => ProviderEvent::Done(response),
-            });
-        }
-    })
 }
 
 pub(crate) fn response_stream(mut source: ProviderEventStream) -> ResponseStream {

@@ -16,17 +16,16 @@ async fn emits_openai_content_events_from_done_items() {
     let server = serve([Reply::sse(openai_done_items())]).await;
     let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
     model.base_url = server.base_url.clone();
-    let provider = ds_ai::openai::Provider::new([model.clone()]);
-    let mut stream = provider.stream(
+    let mut stream = ds_ai::openai::stream(
         &model,
         &Context::new([Message::user("Hello")]),
-        &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+        &OpenAiResponsesOptions {
             stream: StreamOptions {
                 api_key: Some("test-key".into()),
                 ..Default::default()
             },
             ..Default::default()
-        }),
+        },
     );
     let mut events = Vec::new();
 
@@ -107,18 +106,17 @@ async fn emits_codex_content_events_with_partial_identity() {
     let server = serve([Reply::sse(openai_done_items())]).await;
     let mut model = builtin_model("openai-codex", "gpt-5.4").unwrap();
     model.base_url = server.base_url.clone();
-    let provider = ds_ai::codex::Provider::new([model.clone()]);
-    let mut stream = provider.stream(
+    let mut stream = ds_ai::codex::stream(
         &model,
         &Context::new([Message::user("Hello")]),
-        &ApiStreamOptions::OpenAiCodexResponses(OpenAiCodexResponsesOptions {
+        &OpenAiCodexResponsesOptions {
             stream: StreamOptions {
                 api_key: Some(token()),
                 transport: Some(Transport::Sse),
                 ..Default::default()
             },
             ..Default::default()
-        }),
+        },
     );
     let mut events = Vec::new();
 
@@ -159,17 +157,16 @@ async fn emits_anthropic_content_events_at_block_boundaries() {
     let server = serve([Reply::sse(anthropic_blocks())]).await;
     let mut model = builtin_model("anthropic", "claude-opus-4-5").unwrap();
     model.base_url = server.base_url.clone();
-    let provider = ds_ai::anthropic::Provider::new([model.clone()]);
-    let mut stream = provider.stream(
+    let mut stream = ds_ai::anthropic::stream(
         &model,
         &Context::new([Message::user("Hello")]),
-        &ApiStreamOptions::AnthropicMessages(AnthropicOptions {
+        &AnthropicOptions {
             stream: StreamOptions {
                 api_key: Some("test-key".into()),
                 ..Default::default()
             },
             ..Default::default()
-        }),
+        },
     );
     let mut events = Vec::new();
 

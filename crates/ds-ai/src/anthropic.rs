@@ -59,65 +59,63 @@ impl Provider {
             },
         }
     }
+}
 
-    fn request(
-        &self,
-        model: &crate::Model,
-        context: &Context,
-        options: &crate::AnthropicOptions,
-    ) -> crate::AssistantMessageEventStream {
-        let requested_model = model.clone();
-        let context = context.for_model(&requested_model);
-        let options = options.clone();
-        crate::legacy::adapt_provider(requested_model.clone(), async move {
-            let thinking = resolve_thinking(&requested_model, &options);
-            let tool_choice = options.tool_choice;
-            let stream_options = options.stream;
-            let request_hooks = stream_options.request_hooks(&requested_model);
-            let api_key = stream_options.api_key;
-            if api_key.as_deref().is_none_or(str::is_empty)
-                && !has_auth_header(&stream_options.headers)
-            {
-                return Err(Error::InvalidRequest(
-                    "Anthropic request authentication is required".into(),
-                ));
-            }
-            let provider_model = Model::from_public(&requested_model);
-            let max_tokens = stream_options
-                .max_tokens
-                .unwrap_or(requested_model.max_tokens)
-                .min(requested_model.max_tokens);
-            let mut provider_options = Options::with_auth(api_key)
-                .with_max_tokens(max_tokens)
-                .with_cancellation(stream_options.cancellation)
-                .with_max_retries(stream_options.max_retries.unwrap_or_default())
-                .with_max_retry_delay(stream_options.max_retry_delay)
-                .with_cache_retention(stream_options.cache_retention)
-                .with_interleaved_thinking(options.interleaved_thinking.unwrap_or(true))
-                .with_session_id(stream_options.session_id)
-                .with_request_options(stream_options.headers, request_hooks);
-            if let Some(temperature) = stream_options.temperature {
-                provider_options = provider_options.with_temperature(temperature);
-            }
-            if let Some(timeout) = stream_options.timeout {
-                provider_options = provider_options.with_overall_timeout(timeout);
-            }
-            if let Some(user_id) = stream_options
-                .metadata
-                .get("user_id")
-                .and_then(serde_json::Value::as_str)
-            {
-                provider_options = provider_options.with_metadata_user_id(user_id);
-            }
-            if let Some(thinking) = thinking {
-                provider_options = provider_options.with_thinking(thinking);
-            }
-            if let Some(tool_choice) = tool_choice {
-                provider_options = provider_options.with_tool_choice(tool_choice);
-            }
-            response_events(&provider_model, &context, &provider_options).await
-        })
-    }
+pub fn stream(
+    model: &crate::Model,
+    context: &Context,
+    options: &crate::AnthropicOptions,
+) -> crate::AssistantMessageEventStream {
+    let requested_model = model.clone();
+    let context = context.for_model(&requested_model);
+    let options = options.clone();
+    crate::legacy::adapt_provider(requested_model.clone(), async move {
+        let thinking = resolve_thinking(&requested_model, &options);
+        let tool_choice = options.tool_choice;
+        let stream_options = options.stream;
+        let request_hooks = stream_options.request_hooks(&requested_model);
+        let api_key = stream_options.api_key;
+        if api_key.as_deref().is_none_or(str::is_empty) && !has_auth_header(&stream_options.headers)
+        {
+            return Err(Error::InvalidRequest(
+                "Anthropic request authentication is required".into(),
+            ));
+        }
+        let provider_model = Model::from_public(&requested_model);
+        let max_tokens = stream_options
+            .max_tokens
+            .unwrap_or(requested_model.max_tokens)
+            .min(requested_model.max_tokens);
+        let mut provider_options = Options::with_auth(api_key)
+            .with_max_tokens(max_tokens)
+            .with_cancellation(stream_options.cancellation)
+            .with_max_retries(stream_options.max_retries.unwrap_or_default())
+            .with_max_retry_delay(stream_options.max_retry_delay)
+            .with_cache_retention(stream_options.cache_retention)
+            .with_interleaved_thinking(options.interleaved_thinking.unwrap_or(true))
+            .with_session_id(stream_options.session_id)
+            .with_request_options(stream_options.headers, request_hooks);
+        if let Some(temperature) = stream_options.temperature {
+            provider_options = provider_options.with_temperature(temperature);
+        }
+        if let Some(timeout) = stream_options.timeout {
+            provider_options = provider_options.with_overall_timeout(timeout);
+        }
+        if let Some(user_id) = stream_options
+            .metadata
+            .get("user_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            provider_options = provider_options.with_metadata_user_id(user_id);
+        }
+        if let Some(thinking) = thinking {
+            provider_options = provider_options.with_thinking(thinking);
+        }
+        if let Some(tool_choice) = tool_choice {
+            provider_options = provider_options.with_tool_choice(tool_choice);
+        }
+        response_events(&provider_model, &context, &provider_options).await
+    })
 }
 
 impl crate::Provider for Provider {
@@ -154,21 +152,21 @@ impl crate::Provider for Provider {
         if model.api != crate::Api::AnthropicMessages {
             let model = model.clone();
             let api = model.api.clone();
-            return crate::legacy::adapt(model, async move {
-                Err(Error::InvalidRequest(format!(
+            return crate::legacy::failure(
+                model,
+                Error::InvalidRequest(format!(
                     "Anthropic provider has no API implementation for {api}"
-                )))
-            });
+                )),
+            );
         }
         let crate::ApiStreamOptions::AnthropicMessages(options) = options else {
             let model = model.clone();
-            return crate::legacy::adapt(model, async {
-                Err(Error::InvalidRequest(
-                    "Anthropic Messages options are required".into(),
-                ))
-            });
+            return crate::legacy::failure(
+                model,
+                Error::InvalidRequest("Anthropic Messages options are required".into()),
+            );
         };
-        self.request(model, context, options)
+        stream(model, context, options)
     }
 
     fn stream_simple(
@@ -177,7 +175,7 @@ impl crate::Provider for Provider {
         context: &Context,
         options: &crate::SimpleStreamOptions,
     ) -> crate::AssistantMessageEventStream {
-        let mut stream =
+        let mut stream_options =
             crate::provider::build_simple_stream_options(model, context, options.stream.clone());
         let thinking = options
             .thinking
@@ -191,20 +189,20 @@ impl crate::Provider for Provider {
             .filter(|level| *level != crate::ThinkingLevel::Off && !adaptive)
             .map(|level| {
                 let budget = thinking_budget(level, options.thinking_budgets.as_ref());
-                let max_tokens = stream
+                let max_tokens = stream_options
                     .max_tokens
                     .unwrap_or(model.max_tokens)
                     .saturating_add(budget)
                     .min(model.max_tokens);
                 let max_tokens = crate::clamp_max_tokens_to_context(model, context, max_tokens);
-                stream.max_tokens = Some(max_tokens);
+                stream_options.max_tokens = Some(max_tokens);
                 budget.min(max_tokens.saturating_sub(1024))
             });
-        self.request(
+        stream(
             model,
             context,
             &crate::AnthropicOptions {
-                stream,
+                stream: stream_options,
                 thinking_enabled: Some(!matches!(thinking, None | Some(crate::ThinkingLevel::Off))),
                 thinking_budget_tokens,
                 effort: thinking.and_then(|level| anthropic_effort(model, level)),
@@ -861,7 +859,8 @@ enum Slot {
     },
 }
 
-pub async fn stream(
+#[doc(hidden)]
+pub async fn raw_stream(
     model: &Model,
     context: &Context,
     options: &Options,

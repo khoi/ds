@@ -8,7 +8,7 @@ async fn openai_live_smoke() {
     if let Ok(base_url) = std::env::var("DS_AI_OPENAI_BASE_URL") {
         model = model.with_base_url(base_url);
     }
-    let stream = openai::stream(
+    let stream = openai::raw_stream(
         &model,
         &Context::new([Message::user("Reply with OK")]),
         &openai::Options::new(required("OPENAI_API_KEY")),
@@ -25,7 +25,7 @@ async fn anthropic_live_smoke() {
     if let Ok(base_url) = std::env::var("DS_AI_ANTHROPIC_BASE_URL") {
         model = model.with_base_url(base_url);
     }
-    let stream = anthropic::stream(
+    let stream = anthropic::raw_stream(
         &model,
         &Context::new([Message::user("Reply with OK")]),
         &anthropic::Options::new(required("ANTHROPIC_API_KEY")),
@@ -42,7 +42,7 @@ async fn codex_live_smoke() {
     if let Ok(base_url) = std::env::var("DS_AI_CODEX_BASE_URL") {
         model = model.with_base_url(base_url);
     }
-    let stream = codex::stream(
+    let stream = codex::raw_stream(
         &model,
         &Context::new([Message::user("Reply with OK")]),
         &codex::Options::new(required("DS_AI_CODEX_ACCESS_TOKEN")),

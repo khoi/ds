@@ -30,7 +30,7 @@ async fn streams_anthropic_text_until_message_stop() {
     let context = Context::new([Message::user("Hello")]).with_system("Be brief");
     let options = anthropic::Options::new("test-key").with_max_tokens(1024);
 
-    let events = anthropic::stream(&model, &context, &options)
+    let events = anthropic::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -112,7 +112,7 @@ async fn preserves_anthropic_http_error_rate_limits() {
     .await;
     let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
 
-    match anthropic::stream(
+    match anthropic::raw_stream(
         &model,
         &Context::new([Message::user("Hello")]),
         &anthropic::Options::new("test-key"),
@@ -159,7 +159,7 @@ async fn streams_and_replays_anthropic_thinking_and_tool_calls() {
     let first_context = Context::new([Message::user("Edit")]);
     let options = anthropic::Options::new("test-key");
 
-    let first_events = anthropic::stream(&first_model, &first_context, &options)
+    let first_events = anthropic::raw_stream(&first_model, &first_context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -229,7 +229,7 @@ async fn streams_and_replays_anthropic_thinking_and_tool_calls() {
         )),
     ]);
 
-    anthropic::stream(&second_model, &second_context, &options)
+    anthropic::raw_stream(&second_model, &second_context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -279,7 +279,7 @@ async fn preserves_anthropic_start_content_and_refusal_details() {
     .concat();
     let server = serve([Reply::sse(sse)]).await;
     let model = anthropic::Model::new("claude-fable-5").with_base_url(&server.base_url);
-    let events = anthropic::stream(
+    let events = anthropic::raw_stream(
         &model,
         &Context::new([Message::user("Blocked request")]),
         &anthropic::Options::new("test-key"),
@@ -326,7 +326,7 @@ async fn rejects_sensitive_and_unknown_anthropic_stop_reasons() {
         .concat();
         let server = serve([Reply::sse(sse)]).await;
         let model = anthropic::Model::new("claude-haiku-4-5").with_base_url(&server.base_url);
-        let events = anthropic::stream(
+        let events = anthropic::raw_stream(
             &model,
             &Context::new([Message::user("Blocked request")]),
             &anthropic::Options::new("test-key"),
@@ -367,7 +367,7 @@ async fn retries_anthropic_before_streaming_starts() {
     let context = Context::new([Message::user("Hello")]);
     let options = anthropic::Options::new("test-key").with_max_retries(1);
 
-    let events = anthropic::stream(&model, &context, &options)
+    let events = anthropic::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -390,7 +390,9 @@ async fn cancels_an_active_anthropic_stream_with_partial_content() {
     let context = Context::new([Message::user("Hello")]);
     let cancellation = tokio_util::sync::CancellationToken::new();
     let options = anthropic::Options::new("test-key").with_cancellation(cancellation.clone());
-    let mut response = anthropic::stream(&model, &context, &options).await.unwrap();
+    let mut response = anthropic::raw_stream(&model, &context, &options)
+        .await
+        .unwrap();
 
     assert!(matches!(
         response.next().await,
@@ -416,7 +418,9 @@ async fn times_out_an_anthropic_stream_before_its_first_event() {
     let context = Context::new([Message::user("Hello")]);
     let options = anthropic::Options::new("test-key")
         .with_first_event_timeout(std::time::Duration::from_secs(5));
-    let mut response = anthropic::stream(&model, &context, &options).await.unwrap();
+    let mut response = anthropic::raw_stream(&model, &context, &options)
+        .await
+        .unwrap();
     let next = tokio::spawn(async move { response.next().await });
 
     tokio::time::advance(std::time::Duration::from_secs(5)).await;
@@ -445,7 +449,7 @@ async fn maps_anthropic_pause_turn_to_stop() {
     let context = Context::new([Message::user("Hello")]);
     let options = anthropic::Options::new("test-key");
 
-    let events = anthropic::stream(&model, &context, &options)
+    let events = anthropic::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -470,7 +474,7 @@ async fn rejects_anthropic_stream_closure_before_message_stop() {
     let context = Context::new([Message::user("Hello")]);
     let options = anthropic::Options::new("test-key");
 
-    let events = anthropic::stream(&model, &context, &options)
+    let events = anthropic::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -499,7 +503,7 @@ async fn rejects_an_anthropic_error_event_with_partial_content() {
     let context = Context::new([Message::user("Hello")]);
     let options = anthropic::Options::new("test-key");
 
-    let events = anthropic::stream(&model, &context, &options)
+    let events = anthropic::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -554,7 +558,7 @@ async fn encodes_anthropic_generation_thinking_and_cache_options() {
         .with_tool_choice(anthropic::ToolChoice::Tool("inspect".into()))
         .with_cache_retention(CacheRetention::Long);
 
-    anthropic::stream(&model, &context, &options)
+    anthropic::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -618,7 +622,7 @@ async fn keeps_anthropic_temperature_with_disabled_thinking_and_cache() {
         .with_thinking(anthropic::Thinking::Disabled)
         .with_cache_retention(CacheRetention::None);
 
-    anthropic::stream(&model, &context, &options)
+    anthropic::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -660,7 +664,7 @@ async fn encodes_legacy_tool_streaming_and_strict_schemas() {
     )
     .with_strict()]);
 
-    anthropic::stream(&model, &context, &anthropic::Options::new("test-key"))
+    anthropic::raw_stream(&model, &context, &anthropic::Options::new("test-key"))
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -707,7 +711,7 @@ async fn replays_empty_signature_thinking_as_text_unless_enabled() {
     let first_server = serve([Reply::sse(thinking)]).await;
     let first_model =
         anthropic::Model::new("claude-sonnet-4-5").with_base_url(&first_server.base_url);
-    let events = anthropic::stream(
+    let events = anthropic::raw_stream(
         &first_model,
         &Context::new([Message::user("Think")]),
         &anthropic::Options::new("test-key"),
@@ -726,7 +730,7 @@ async fn replays_empty_signature_thinking_as_text_unless_enabled() {
     let default_server = serve([Reply::sse(completed.clone())]).await;
     let default_model =
         anthropic::Model::new("claude-sonnet-4-5").with_base_url(&default_server.base_url);
-    anthropic::stream(
+    anthropic::raw_stream(
         &default_model,
         &Context::new([Message::assistant(response.clone())]),
         &anthropic::Options::new("test-key"),
@@ -750,7 +754,7 @@ async fn replays_empty_signature_thinking_as_text_unless_enabled() {
     let enabled_model = anthropic::Model::new("claude-sonnet-4-5")
         .with_base_url(&enabled_server.base_url)
         .with_empty_thinking_signatures();
-    anthropic::stream(
+    anthropic::raw_stream(
         &enabled_model,
         &Context::new([Message::assistant(response)]),
         &anthropic::Options::new("test-key"),
@@ -791,7 +795,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta"
     let context = Context::new([Message::user("Edit")]);
     let options = anthropic::Options::new("test-key");
 
-    let events = anthropic::stream(&model, &context, &options)
+    let events = anthropic::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()

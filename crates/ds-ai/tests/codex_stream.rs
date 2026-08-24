@@ -49,7 +49,7 @@ async fn retries_and_compresses_a_codex_sse_request() {
         .with_session_id("session_1")
         .with_transport(codex::Transport::Sse);
 
-    let events = codex::stream(&model, &context, &options)
+    let events = codex::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -134,7 +134,7 @@ async fn follows_codex_specific_retry_statuses_and_error_text() {
         }
         let server = serve(replies).await;
         let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
-        let result = codex::stream(
+        let result = codex::raw_stream(
             &model,
             &Context::new([Message::user("Retry")]),
             &codex::Options::new(token("acc_retry_matrix"))
@@ -181,7 +181,7 @@ async fn does_not_retry_a_terminal_codex_quota_error() {
     let server = serve([failure(), failure(), failure()]).await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
 
-    let error = match codex::stream(
+    let error = match codex::raw_stream(
         &model,
         &Context::new([Message::user("Quota")]),
         &codex::Options::new(token("acc_quota"))
@@ -211,7 +211,7 @@ async fn disables_the_codex_retry_delay_cap_with_zero() {
     .await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
 
-    let events = codex::stream(
+    let events = codex::raw_stream(
         &model,
         &Context::new([Message::user("Retry")]),
         &codex::Options::new(token("acc_no_cap"))
@@ -236,7 +236,7 @@ async fn rejects_a_codex_retry_delay_above_the_cap() {
         .await;
         let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
 
-        let error = match codex::stream(
+        let error = match codex::raw_stream(
             &model,
             &Context::new([Message::user("Retry")]),
             &codex::Options::new(token("acc_capped"))
@@ -272,7 +272,7 @@ async fn uses_fixed_exponential_backoff_for_codex_retries() {
     .await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
     let task = tokio::spawn(async move {
-        codex::stream(
+        codex::raw_stream(
             &model,
             &Context::new([Message::user("Retry")]),
             &codex::Options::new(token("acc_backoff"))
@@ -317,7 +317,7 @@ async fn honors_numeric_codex_retry_headers() {
         .await;
         let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
         let task = tokio::spawn(async move {
-            codex::stream(
+            codex::raw_stream(
                 &model,
                 &Context::new([Message::user("Retry")]),
                 &codex::Options::new(token("acc_delay"))
@@ -352,7 +352,7 @@ async fn parses_codex_http_date_retry_headers() {
     .await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
 
-    let error = match codex::stream(
+    let error = match codex::raw_stream(
         &model,
         &Context::new([Message::user("Retry")]),
         &codex::Options::new(token("acc_date_delay"))
@@ -456,7 +456,7 @@ async fn finishes_codex_sse_at_a_terminal_event_while_the_body_stays_open() {
         let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
 
         let events = tokio::time::timeout(Duration::from_secs(1), async {
-            codex::stream(
+            codex::raw_stream(
                 &model,
                 &Context::new([Message::user("Finish")]),
                 &codex::Options::new(token("acc_open_terminal"))
@@ -493,7 +493,7 @@ async fn cancels_an_active_codex_sse_body_with_partial_content() {
     .await;
     let cancellation = tokio_util::sync::CancellationToken::new();
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
-    let mut stream = codex::stream(
+    let mut stream = codex::raw_stream(
         &model,
         &Context::new([Message::user("Cancel")]),
         &codex::Options::new(token("acc_cancel"))
@@ -549,7 +549,7 @@ async fn applies_codex_sse_cache_affinity_rules() {
             options = options.with_session_id(session);
         }
 
-        codex::stream(&model, &Context::new([Message::user("Cache")]), &options)
+        codex::raw_stream(&model, &Context::new([Message::user("Cache")]), &options)
             .await
             .unwrap()
             .collect::<Vec<_>>()
@@ -659,7 +659,7 @@ async fn streams_a_codex_websocket_request() {
         .with_session_id("session_ws")
         .with_transport(codex::Transport::WebSocket);
 
-    let events = codex::stream(&model, &context, &options)
+    let events = codex::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -695,7 +695,7 @@ async fn uses_uuid_v7_for_a_sessionless_codex_websocket_request() {
     let (base_url, capture) = serve_websocket([text_events("resp_uuid", "msg_uuid", "Done")]).await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
 
-    codex::stream(
+    codex::raw_stream(
         &model,
         &Context::new([Message::user("Hello")]),
         &codex::Options::new(token("acc_uuid")).with_transport(codex::Transport::WebSocket),
@@ -718,7 +718,7 @@ async fn encodes_codex_generation_options() {
     let (base_url, capture) =
         serve_websocket([text_events("resp_options", "msg_options", "Configured")]).await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
-    let events = codex::stream(
+    let events = codex::raw_stream(
         &model,
         &Context::new([Message::user("Configure")]),
         &codex::Options::new(token("acc_options"))
@@ -766,7 +766,7 @@ async fn reuses_a_codex_websocket_with_an_input_delta() {
         .with_session_id("session_reuse")
         .with_transport(codex::Transport::WebSocketCached);
     let first_context = Context::new([Message::user("First")]).with_system("Be brief");
-    let first_events = codex::stream(&model, &first_context, &options)
+    let first_events = codex::raw_stream(&model, &first_context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -779,7 +779,7 @@ async fn reuses_a_codex_websocket_with_an_input_delta() {
     ])
     .with_system("Be brief");
 
-    let second_events = codex::stream(&model, &second_context, &options)
+    let second_events = codex::raw_stream(&model, &second_context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -829,7 +829,7 @@ async fn scopes_cached_codex_websockets_to_the_account() {
     .await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
     let context = Context::new([Message::user("Connect")]);
-    let first = codex::stream(
+    let first = codex::raw_stream(
         &model,
         &context,
         &codex::Options::new(token("acc_scope_one"))
@@ -840,7 +840,7 @@ async fn scopes_cached_codex_websockets_to_the_account() {
     .unwrap()
     .collect::<Vec<_>>()
     .await;
-    let second = codex::stream(
+    let second = codex::raw_stream(
         &model,
         &context,
         &codex::Options::new(token("acc_scope_two"))
@@ -869,7 +869,7 @@ async fn opens_a_one_shot_codex_websocket_while_the_cached_session_is_busy() {
     let first_model = model.clone();
     let first_context = context.clone();
     let first = tokio::spawn(async move {
-        codex::stream(
+        codex::raw_stream(
             &first_model,
             &first_context,
             &codex::Options::new(token("acc_busy"))
@@ -884,7 +884,7 @@ async fn opens_a_one_shot_codex_websocket_while_the_cached_session_is_busy() {
     first_received.await.unwrap();
 
     let second = tokio::spawn(async move {
-        codex::stream(
+        codex::raw_stream(
             &model,
             &context,
             &codex::Options::new(token("acc_busy"))
@@ -933,7 +933,7 @@ async fn scopes_cached_codex_websockets_to_the_unclamped_session() {
     let first_session = format!("{prefix}a");
     let second_session = format!("{prefix}b");
 
-    let first = codex::stream(
+    let first = codex::raw_stream(
         &model,
         &context,
         &codex::Options::new(token("acc_session_scope"))
@@ -944,7 +944,7 @@ async fn scopes_cached_codex_websockets_to_the_unclamped_session() {
     .unwrap()
     .collect::<Vec<_>>()
     .await;
-    let second = codex::stream(
+    let second = codex::raw_stream(
         &model,
         &context,
         &codex::Options::new(token("acc_session_scope"))
@@ -974,7 +974,7 @@ async fn retries_a_missing_codex_continuation_with_full_context() {
     let options = codex::Options::new(token("acc_recovery"))
         .with_session_id("session_recovery")
         .with_transport(codex::Transport::WebSocketCached);
-    let first_events = codex::stream(
+    let first_events = codex::raw_stream(
         &model,
         &Context::new([Message::user("Seed")]).with_system("Be brief"),
         &options,
@@ -991,7 +991,7 @@ async fn retries_a_missing_codex_continuation_with_full_context() {
     ])
     .with_system("Be brief");
 
-    let second_events = codex::stream(&model, &second_context, &options)
+    let second_events = codex::raw_stream(&model, &second_context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1031,7 +1031,7 @@ async fn falls_back_to_sse_when_missing_continuation_recovery_cannot_start() {
     let options = codex::Options::new(token("acc_recovery_sse"))
         .with_session_id("session_recovery_sse")
         .with_transport(codex::Transport::WebSocketCached);
-    let first = codex::stream(&model, &Context::new([Message::user("Seed")]), &options)
+    let first = codex::raw_stream(&model, &Context::new([Message::user("Seed")]), &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1042,7 +1042,7 @@ async fn falls_back_to_sse_when_missing_continuation_recovery_cannot_start() {
         Message::user("Continue"),
     ]);
 
-    let second = codex::stream(&model, &context, &options)
+    let second = codex::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1095,7 +1095,7 @@ async fn reconnects_once_when_the_codex_websocket_limit_is_reached() {
     ])
     .await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
-    let events = codex::stream(
+    let events = codex::raw_stream(
         &model,
         &Context::new([Message::user("Connect")]),
         &codex::Options::new(token("acc_limit"))
@@ -1142,7 +1142,7 @@ async fn falls_back_after_the_codex_websocket_limit_retry_is_exhausted() {
     codex::reset_websocket_debug_stats(Some("session_limit_twice"));
     let (base_url, requests) = serve_repeated_limit_then_sse().await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
-    let events = codex::stream(
+    let events = codex::raw_stream(
         &model,
         &Context::new([Message::user("Connect")]),
         &codex::Options::new(token("acc_limit_twice"))
@@ -1177,14 +1177,14 @@ async fn replaces_a_stale_cached_codex_websocket() {
         .with_session_id("session_stale")
         .with_transport(codex::Transport::WebSocket);
     let context = Context::new([Message::user("Connect")]);
-    let first = codex::stream(&model, &context, &options)
+    let first = codex::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
         .await;
     assert_eq!(done(&first).content, [ds_ai::Content::Text("First".into())]);
 
-    let second = codex::stream(&model, &context, &options)
+    let second = codex::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1206,7 +1206,7 @@ async fn expires_an_idle_cached_codex_websocket() {
         .with_session_id("session_idle")
         .with_websocket_cache_ttl(Duration::from_millis(10))
         .with_transport(codex::Transport::WebSocket);
-    let events = codex::stream(&model, &Context::new([Message::user("Connect")]), &options)
+    let events = codex::raw_stream(&model, &Context::new([Message::user("Connect")]), &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1227,7 +1227,7 @@ async fn evicts_a_cached_codex_websocket_after_stream_failure() {
         .with_transport(codex::Transport::WebSocket);
     let context = Context::new([Message::user("Connect")]);
 
-    let failed = codex::stream(&model, &context, &options)
+    let failed = codex::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1247,7 +1247,7 @@ async fn evicts_a_cached_codex_websocket_after_stream_failure() {
     );
     codex::reset_websocket_debug_stats(Some("session_failed_cache"));
 
-    let fresh = codex::stream(&model, &context, &options)
+    let fresh = codex::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1271,7 +1271,7 @@ async fn replaces_a_codex_websocket_at_the_connection_age_limit() {
         .with_websocket_cache_ttl(Duration::from_secs(56 * 60))
         .with_transport(codex::Transport::WebSocket);
     let context = Context::new([Message::user("Connect")]);
-    let first = codex::stream(&model, &context, &options)
+    let first = codex::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1281,7 +1281,7 @@ async fn replaces_a_codex_websocket_at_the_connection_age_limit() {
     tokio::time::advance(Duration::from_secs(55 * 60)).await;
     tokio::time::resume();
 
-    let second = codex::stream(&model, &context, &options)
+    let second = codex::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1299,7 +1299,7 @@ async fn closes_a_one_shot_codex_websocket_after_completion() {
     let (base_url, closed) =
         serve_one_shot_websocket(text_events("resp_one_shot", "msg_one_shot", "Done")).await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
-    let events = codex::stream(
+    let events = codex::raw_stream(
         &model,
         &Context::new([Message::user("Connect")]),
         &codex::Options::new(token("acc_one_shot"))
@@ -1325,7 +1325,7 @@ async fn falls_back_to_sse_when_codex_websocket_connect_fails() {
     .concat();
     let server = serve([Reply::disconnect(), Reply::sse(sse)]).await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
-    let events = codex::stream(
+    let events = codex::raw_stream(
         &model,
         &Context::new([Message::user("Connect")]),
         &codex::Options::new(token("acc_fallback")),
@@ -1354,7 +1354,7 @@ async fn falls_back_to_sse_after_the_codex_websocket_connect_timeout() {
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
 
     let events = tokio::time::timeout(Duration::from_secs(1), async {
-        codex::stream(
+        codex::raw_stream(
             &model,
             &Context::new([Message::user("Connect")]),
             &codex::Options::new(token("acc_connect_timeout"))
@@ -1503,7 +1503,7 @@ async fn keeps_a_codex_session_on_sse_after_a_websocket_failure() {
         .with_session_id("session_sticky")
         .with_transport(codex::Transport::Auto);
 
-    let first = codex::stream(
+    let first = codex::raw_stream(
         &first_model,
         &Context::new([Message::user("First")]),
         &options,
@@ -1534,7 +1534,7 @@ async fn keeps_a_codex_session_on_sse_after_a_websocket_failure() {
     .await;
     let second_model = codex::Model::new("gpt-5.6-codex").with_base_url(&second_server.base_url);
 
-    let second = codex::stream(
+    let second = codex::raw_stream(
         &second_model,
         &Context::new([Message::user("Second")]),
         &options,
@@ -1569,7 +1569,7 @@ async fn closes_cached_codex_websockets_by_session() {
         serve_one_shot_websocket(text_events("resp_close", "msg_close", "Done")).await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
 
-    let events = codex::stream(
+    let events = codex::raw_stream(
         &model,
         &Context::new([Message::user("Connect")]),
         &codex::Options::new(token("acc_close"))
@@ -1590,7 +1590,7 @@ async fn closes_cached_codex_websockets_by_session() {
 async fn falls_back_to_sse_when_codex_websocket_has_no_first_event() {
     let (base_url, capture) = serve_idle_websocket_then_sse().await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
-    let events = codex::stream(
+    let events = codex::raw_stream(
         &model,
         &Context::new([Message::user("Wait")]),
         &codex::Options::new(token("acc_idle_fallback"))
@@ -1617,7 +1617,7 @@ async fn does_not_fall_back_after_a_codex_websocket_event() {
     codex::reset_websocket_debug_stats(Some("session_started_idle"));
     let base_url = serve_started_idle_websocket().await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
-    let events = codex::stream(
+    let events = codex::raw_stream(
         &model,
         &Context::new([Message::user("Wait")]),
         &codex::Options::new(token("acc_started_idle"))
@@ -1661,7 +1661,7 @@ async fn preserves_partial_content_after_an_oversized_websocket_close() {
     ])
     .await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
-    let events = codex::stream(
+    let events = codex::raw_stream(
         &model,
         &Context::new([Message::user("Large response")]),
         &codex::Options::new(token("acc_large"))

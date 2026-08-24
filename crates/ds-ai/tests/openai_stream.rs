@@ -21,7 +21,7 @@ async fn streams_openai_text_until_the_provider_completes() {
     let context = Context::new([Message::user("Hello")]);
     let options = openai::Options::new("test-key");
 
-    let events = openai::stream(&model, &context, &options)
+    let events = openai::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -84,7 +84,7 @@ async fn rejects_an_openai_stream_that_ends_without_a_terminal_event() {
     let context = Context::new([Message::user("Hello")]);
     let options = openai::Options::new("test-key");
 
-    let events = openai::stream(&model, &context, &options)
+    let events = openai::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -130,7 +130,7 @@ async fn decodes_openai_sse_across_arbitrary_chunks() {
     let context = Context::new([Message::user("Hello")]);
     let options = openai::Options::new("test-key");
 
-    let events = openai::stream(&model, &context, &options)
+    let events = openai::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -179,7 +179,7 @@ async fn retries_openai_before_streaming_starts() {
     let context = Context::new([Message::user("Hello")]);
     let options = openai::Options::new("test-key").with_max_retries(1);
 
-    let events = openai::stream(&model, &context, &options)
+    let events = openai::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -217,7 +217,7 @@ async fn waits_for_openai_retry_headers() {
         let context = Context::new([Message::user("Hello")]);
         let options = openai::Options::new("test-key").with_max_retries(1);
         let task = tokio::spawn(async move {
-            openai::stream(&model, &context, &options)
+            openai::raw_stream(&model, &context, &options)
                 .await
                 .unwrap()
                 .collect::<Vec<_>>()
@@ -256,7 +256,7 @@ async fn waits_for_an_openai_retry_after_http_date() {
     let context = Context::new([Message::user("Hello")]);
     let options = openai::Options::new("test-key").with_max_retries(1);
     let task = tokio::spawn(async move {
-        openai::stream(&model, &context, &options)
+        openai::raw_stream(&model, &context, &options)
             .await
             .unwrap()
             .collect::<Vec<_>>()
@@ -293,7 +293,7 @@ async fn cancels_an_openai_retry_wait() {
     let options = openai::Options::new("test-key")
         .with_max_retries(1)
         .with_cancellation(cancellation.clone());
-    let task = tokio::spawn(async move { openai::stream(&model, &context, &options).await });
+    let task = tokio::spawn(async move { openai::raw_stream(&model, &context, &options).await });
 
     server.wait_for_requests(1).await;
     cancellation.cancel();
@@ -338,7 +338,7 @@ async fn follows_openai_retry_status_and_override_headers() {
         let context = Context::new([Message::user("Hello")]);
         let options = openai::Options::new("test-key").with_max_retries(1);
 
-        let result = openai::stream(&model, &context, &options).await;
+        let result = openai::raw_stream(&model, &context, &options).await;
 
         if should_retry {
             let events = result.unwrap().collect::<Vec<_>>().await;
@@ -366,7 +366,7 @@ async fn retries_openai_network_failures_before_streaming_starts() {
     let options = openai::Options::new("test-key").with_max_retries(1);
 
     let task = tokio::spawn(async move {
-        openai::stream(&model, &context, &options)
+        openai::raw_stream(&model, &context, &options)
             .await
             .unwrap()
             .collect::<Vec<_>>()
@@ -400,7 +400,7 @@ async fn rejects_an_openai_retry_delay_above_a_custom_limit() {
         .with_max_retries(1)
         .with_max_retry_delay(Some(std::time::Duration::from_secs(1)));
 
-    let error = match openai::stream(&model, &context, &options).await {
+    let error = match openai::raw_stream(&model, &context, &options).await {
         Ok(_) => panic!("retry delay was accepted"),
         Err(error) => error,
     };
@@ -430,7 +430,7 @@ async fn backs_off_before_an_openai_retry_without_a_header() {
     let context = Context::new([Message::user("Hello")]);
     let options = openai::Options::new("test-key").with_max_retries(1);
     let task = tokio::spawn(async move {
-        openai::stream(&model, &context, &options)
+        openai::raw_stream(&model, &context, &options)
             .await
             .unwrap()
             .collect::<Vec<_>>()
@@ -466,7 +466,7 @@ async fn accepts_fractional_openai_retry_headers() {
     let context = Context::new([Message::user("Hello")]);
     let options = openai::Options::new("test-key").with_max_retries(1);
     let task = tokio::spawn(async move {
-        openai::stream(&model, &context, &options)
+        openai::raw_stream(&model, &context, &options)
             .await
             .unwrap()
             .collect::<Vec<_>>()
@@ -507,7 +507,7 @@ async fn streams_openai_reasoning_and_text_in_content_order() {
     let context = Context::new([Message::user("Hello")]);
     let options = openai::Options::new("test-key");
 
-    let events = openai::stream(&model, &context, &options)
+    let events = openai::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -567,7 +567,7 @@ async fn streams_openai_reasoning_text_and_refusal_content() {
     let server = serve([Reply::sse(sse)]).await;
     let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
 
-    let events = openai::stream(
+    let events = openai::raw_stream(
         &model,
         &Context::new([Message::user("Answer")]),
         &openai::Options::new("test-key"),
@@ -618,7 +618,7 @@ async fn replays_serialized_openai_reasoning_and_message_items() {
     let first_model = openai::Model::new("gpt-5.6").with_base_url(&first_server.base_url);
     let first_context = Context::new([Message::user("Hello")]);
     let options = openai::Options::new("test-key");
-    let first_events = openai::stream(&first_model, &first_context, &options)
+    let first_events = openai::raw_stream(&first_model, &first_context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -632,7 +632,7 @@ async fn replays_serialized_openai_reasoning_and_message_items() {
     let second_model = openai::Model::new("gpt-5.6").with_base_url(&second_server.base_url);
     let second_context = Context::new([Message::assistant(response), Message::user("Continue")]);
 
-    openai::stream(&second_model, &second_context, &options)
+    openai::raw_stream(&second_model, &second_context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -681,14 +681,14 @@ async fn generates_distinct_replay_ids_for_text_without_provider_ids() {
     let server = serve([Reply::sse(first_sse), Reply::sse(done_sse)]).await;
     let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
     let options = openai::Options::new("test-key");
-    let first = openai::stream(&model, &Context::new([Message::user("Split")]), &options)
+    let first = openai::raw_stream(&model, &Context::new([Message::user("Split")]), &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
         .await;
     let replay = done(&first).clone();
 
-    openai::stream(
+    openai::raw_stream(
         &model,
         &Context::new([
             Message::user("Split"),
@@ -749,7 +749,7 @@ async fn streams_and_replays_openai_tool_calls() {
     .with_strict()]);
     let options = openai::Options::new("test-key");
 
-    let first_events = openai::stream(&first_model, &first_context, &options)
+    let first_events = openai::raw_stream(&first_model, &first_context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -808,7 +808,7 @@ async fn streams_and_replays_openai_tool_calls() {
     let second_model = openai::Model::new("gpt-5.6").with_base_url(&second_server.base_url);
     let second_context = Context::new([Message::assistant(restored), Message::user("Continue")]);
 
-    openai::stream(&second_model, &second_context, &options)
+    openai::raw_stream(&second_model, &second_context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -847,7 +847,7 @@ async fn uses_the_provider_terminal_token_total() {
     let server = serve([Reply::sse(sse)]).await;
     let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
 
-    let events = openai::stream(
+    let events = openai::raw_stream(
         &model,
         &Context::new([Message::user("Hello")]),
         &openai::Options::new("test-key"),
@@ -867,7 +867,7 @@ async fn rejects_an_incomplete_response_without_a_reason() {
     let server = serve([Reply::sse(sse)]).await;
     let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
 
-    let events = openai::stream(
+    let events = openai::raw_stream(
         &model,
         &Context::new([Message::user("Hello")]),
         &openai::Options::new("test-key"),
@@ -903,7 +903,7 @@ async fn rejects_invalid_strict_tool_schemas_before_connecting() {
     )
     .with_strict()]);
 
-    let result = openai::stream(&model, &context, &openai::Options::new("test-key")).await;
+    let result = openai::raw_stream(&model, &context, &openai::Options::new("test-key")).await;
 
     assert!(matches!(
         result,
@@ -935,7 +935,7 @@ async fn sends_openai_tool_result_text_images_and_empty_output() {
     ]);
     let options = openai::Options::new("test-key");
 
-    openai::stream(&model, &context, &options)
+    openai::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -985,7 +985,7 @@ async fn finalizes_an_incomplete_openai_response_as_a_length_stop() {
     let context = Context::new([Message::user("Write")]);
     let options = openai::Options::new("test-key");
 
-    let events = openai::stream(&model, &context, &options)
+    let events = openai::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1017,7 +1017,7 @@ async fn rejects_a_content_filtered_openai_response_with_partial_content() {
     let context = Context::new([Message::user("Write")]);
     let options = openai::Options::new("test-key");
 
-    let events = openai::stream(&model, &context, &options)
+    let events = openai::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1056,7 +1056,7 @@ async fn rejects_a_failed_openai_response_with_code_and_partial_content() {
     let context = Context::new([Message::user("Think")]);
     let options = openai::Options::new("test-key");
 
-    let events = openai::stream(&model, &context, &options)
+    let events = openai::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1096,7 +1096,7 @@ async fn rejects_an_openai_error_event_with_code_and_partial_content() {
     let context = Context::new([Message::user("Write")]);
     let options = openai::Options::new("test-key");
 
-    let events = openai::stream(&model, &context, &options)
+    let events = openai::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1143,7 +1143,7 @@ async fn encodes_openai_multimodal_context_and_generation_options() {
         .with_tool_choice(openai::ToolChoice::Required)
         .with_service_tier(openai::ServiceTier::Priority);
 
-    openai::stream(&model, &context, &options)
+    openai::raw_stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1202,7 +1202,7 @@ async fn cancels_an_openai_request_before_response_headers() {
     let context = Context::new([Message::user("Hello")]);
     let cancellation = tokio_util::sync::CancellationToken::new();
     let options = openai::Options::new("test-key").with_cancellation(cancellation.clone());
-    let request = tokio::spawn(async move { openai::stream(&model, &context, &options).await });
+    let request = tokio::spawn(async move { openai::raw_stream(&model, &context, &options).await });
 
     server.wait_for_requests(1).await;
     cancellation.cancel();
@@ -1224,7 +1224,7 @@ async fn cancels_while_reading_an_openai_error_body() {
     let context = Context::new([Message::user("Hello")]);
     let cancellation = tokio_util::sync::CancellationToken::new();
     let options = openai::Options::new("test-key").with_cancellation(cancellation.clone());
-    let request = tokio::spawn(async move { openai::stream(&model, &context, &options).await });
+    let request = tokio::spawn(async move { openai::raw_stream(&model, &context, &options).await });
     server.wait_for_requests(1).await;
     tokio::task::yield_now().await;
 
@@ -1250,7 +1250,9 @@ async fn cancels_an_active_openai_stream_with_partial_content() {
     let context = Context::new([Message::user("Hello")]);
     let cancellation = tokio_util::sync::CancellationToken::new();
     let options = openai::Options::new("test-key").with_cancellation(cancellation.clone());
-    let mut response = openai::stream(&model, &context, &options).await.unwrap();
+    let mut response = openai::raw_stream(&model, &context, &options)
+        .await
+        .unwrap();
 
     assert_eq!(
         response.next().await,
@@ -1280,7 +1282,7 @@ async fn times_out_an_openai_request_before_response_headers() {
     let context = Context::new([Message::user("Hello")]);
     let options = openai::Options::new("test-key")
         .with_connection_timeout(std::time::Duration::from_millis(50));
-    let request = tokio::spawn(async move { openai::stream(&model, &context, &options).await });
+    let request = tokio::spawn(async move { openai::raw_stream(&model, &context, &options).await });
 
     server.wait_for_requests(1).await;
     match request.await.unwrap() {
@@ -1303,7 +1305,7 @@ async fn times_out_while_reading_an_openai_error_body() {
     let context = Context::new([Message::user("Hello")]);
     let options =
         openai::Options::new("test-key").with_overall_timeout(std::time::Duration::from_secs(5));
-    let request = tokio::spawn(async move { openai::stream(&model, &context, &options).await });
+    let request = tokio::spawn(async move { openai::raw_stream(&model, &context, &options).await });
 
     server.wait_for_requests(1).await;
     tokio::task::yield_now().await;
@@ -1327,7 +1329,9 @@ async fn times_out_an_openai_stream_before_its_first_event() {
     let context = Context::new([Message::user("Hello")]);
     let options = openai::Options::new("test-key")
         .with_first_event_timeout(std::time::Duration::from_secs(5));
-    let mut response = openai::stream(&model, &context, &options).await.unwrap();
+    let mut response = openai::raw_stream(&model, &context, &options)
+        .await
+        .unwrap();
     let next = tokio::spawn(async move { response.next().await });
 
     tokio::time::advance(std::time::Duration::from_secs(5)).await;
@@ -1362,7 +1366,9 @@ async fn times_out_an_idle_openai_stream_with_partial_content() {
     let context = Context::new([Message::user("Hello")]);
     let options =
         openai::Options::new("test-key").with_idle_timeout(std::time::Duration::from_secs(5));
-    let mut response = openai::stream(&model, &context, &options).await.unwrap();
+    let mut response = openai::raw_stream(&model, &context, &options)
+        .await
+        .unwrap();
 
     assert!(matches!(
         response.next().await,
@@ -1399,7 +1405,9 @@ async fn enforces_an_overall_openai_stream_deadline() {
     let options = openai::Options::new("test-key")
         .with_idle_timeout(std::time::Duration::from_secs(30))
         .with_overall_timeout(std::time::Duration::from_secs(5));
-    let mut response = openai::stream(&model, &context, &options).await.unwrap();
+    let mut response = openai::raw_stream(&model, &context, &options)
+        .await
+        .unwrap();
 
     assert!(matches!(
         response.next().await,
@@ -1434,7 +1442,7 @@ async fn encodes_openai_prompt_cache_retention_and_session_keys() {
         .with_session_id(&session_id)
         .with_cache_retention(ds_ai::CacheRetention::Long);
 
-    openai::stream(&model, &context, &long)
+    openai::raw_stream(&model, &context, &long)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1443,7 +1451,7 @@ async fn encodes_openai_prompt_cache_retention_and_session_keys() {
     let disabled = openai::Options::new("test-key")
         .with_session_id(&session_id)
         .with_cache_retention(ds_ai::CacheRetention::None);
-    openai::stream(&model, &context, &disabled)
+    openai::raw_stream(&model, &context, &disabled)
         .await
         .unwrap()
         .collect::<Vec<_>>()
@@ -1480,7 +1488,7 @@ async fn preserves_openai_http_error_and_response_metadata() {
     let context = Context::new([Message::user("Hello")]);
     let options = openai::Options::new("test-key");
 
-    match openai::stream(&failure_model, &context, &options).await {
+    match openai::raw_stream(&failure_model, &context, &options).await {
         Err(ds_ai::Error::Provider {
             status,
             code,
@@ -1509,7 +1517,7 @@ async fn preserves_openai_http_error_and_response_metadata() {
         .with_header("x-ratelimit-reset-tokens", "2s");
     let success_server = serve([success]).await;
     let success_model = openai::Model::new("gpt-5.6").with_base_url(&success_server.base_url);
-    let events = openai::stream(&success_model, &context, &options)
+    let events = openai::raw_stream(&success_model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()

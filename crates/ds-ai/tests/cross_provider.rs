@@ -27,7 +27,7 @@ async fn normalizes_a_cross_provider_tool_transcript() {
     .concat();
     let source_server = serve([Reply::sse(source_sse)]).await;
     let source_model = openai::Model::new("gpt-5.6").with_base_url(&source_server.base_url);
-    let source_events = openai::stream(
+    let source_events = openai::raw_stream(
         &source_model,
         &Context::new([Message::user("Run")]),
         &openai::Options::new("test-key"),
@@ -57,7 +57,7 @@ async fn normalizes_a_cross_provider_tool_transcript() {
         )),
     ]);
 
-    anthropic::stream(
+    anthropic::raw_stream(
         &target_model,
         &target_context,
         &anthropic::Options::new("test-key").with_cache_retention(CacheRetention::None),
@@ -129,7 +129,7 @@ async fn replays_an_anthropic_transcript_to_openai() {
     let source_server = serve([Reply::sse(source_sse)]).await;
     let source_model =
         anthropic::Model::new("claude-sonnet-4-5").with_base_url(&source_server.base_url);
-    let source = anthropic::stream(
+    let source = anthropic::raw_stream(
         &source_model,
         &Context::new([Message::user("Run")]),
         &anthropic::Options::new("test-key").with_cache_retention(CacheRetention::None),
@@ -144,7 +144,7 @@ async fn replays_an_anthropic_transcript_to_openai() {
     let target_sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_target\",\"usage\":{}}}\n\n";
     let target_server = serve([Reply::sse(target_sse)]).await;
     let target_model = openai::Model::new("gpt-5.6").with_base_url(&target_server.base_url);
-    openai::stream(
+    openai::raw_stream(
         &target_model,
         &Context::new([
             Message::user("Run"),

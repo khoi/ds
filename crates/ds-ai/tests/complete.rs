@@ -12,7 +12,7 @@ async fn completes_a_provider_stream() {
         .concat(),
     )])
     .await;
-    let stream = openai::stream(
+    let stream = openai::raw_stream(
         &openai::Model::new("gpt-test").with_base_url(&server.base_url),
         &Context::new([Message::user("Complete")]),
         &openai::Options::new("test-key"),

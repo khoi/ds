@@ -58,84 +58,83 @@ impl Provider {
             }),
         }
     }
+}
 
-    fn request(
-        &self,
-        model: &crate::Model,
-        context: &Context,
-        options: &crate::OpenAiCodexResponsesOptions,
-    ) -> crate::AssistantMessageEventStream {
-        let requested_model = model.clone();
-        let context = context.for_model(&requested_model);
-        let options = options.clone();
-        crate::legacy::adapt_provider(requested_model.clone(), async move {
-            let stream_options = options.stream;
-            let request_hooks = stream_options.request_hooks(&requested_model);
-            let access_token = stream_options
-                .api_key
-                .ok_or_else(|| Error::InvalidRequest("Codex access token is required".into()))?;
-            let provider_model =
-                Model::new(&requested_model.id).with_base_url(requested_model.base_url.clone());
-            let mut provider_options = Options::new(access_token)
-                .with_cancellation(stream_options.cancellation)
-                .with_max_retries(stream_options.max_retries.unwrap_or_default())
-                .with_max_retry_delay(stream_options.max_retry_delay)
-                .with_cache_retention(stream_options.cache_retention)
-                .with_request_options(stream_options.headers, request_hooks);
-            let compat = match &requested_model.compat {
-                Some(crate::ModelCompatibility::OpenAi(compat)) => compat.clone(),
-                _ => Default::default(),
-            };
-            let mode = if compat.supports_additional_tools == Some(true) {
-                Some(DeferredToolsMode::AdditionalTools)
-            } else if compat.supports_tool_search == Some(true) {
-                Some(DeferredToolsMode::ToolSearch)
-            } else {
-                None
-            };
-            provider_options = provider_options
-                .with_deferred_tools_mode(mode)
-                .with_compatibility(&compat);
-            if let Some(temperature) = stream_options.temperature {
-                provider_options = provider_options.with_temperature(temperature);
-            }
-            if let Some(timeout) = stream_options.timeout {
-                provider_options = provider_options.with_timeout(timeout);
-            }
-            if let Some(session_id) = stream_options.session_id {
-                provider_options = provider_options.with_session_id(session_id);
-            }
-            if let Some(timeout) = stream_options.websocket_connect_timeout {
-                provider_options = provider_options.with_websocket_connect_timeout(timeout);
-            }
-            if let Some(transport) = stream_options.transport {
-                provider_options = provider_options.with_transport(match transport {
-                    crate::Transport::Sse => Transport::Sse,
-                    crate::Transport::WebSocket => Transport::WebSocket,
-                    crate::Transport::WebSocketCached => Transport::WebSocketCached,
-                    crate::Transport::Auto => Transport::Auto,
-                });
-            }
-            if let Some(effort) = options.reasoning_effort
-                && let Some(effort) = mapped_reasoning_effort(&requested_model, effort)
-            {
-                provider_options = provider_options.with_reasoning_value(
-                    effort,
-                    options.reasoning_summary.unwrap_or(ReasoningSummary::Auto),
-                );
-            }
-            if let Some(service_tier) = options.service_tier {
-                provider_options = provider_options.with_service_tier(service_tier);
-            }
-            if let Some(text_verbosity) = options.text_verbosity {
-                provider_options = provider_options.with_text_verbosity(text_verbosity);
-            }
-            if let Some(tool_choice) = options.tool_choice {
-                provider_options = provider_options.with_tool_choice(tool_choice);
-            }
-            response_events(&provider_model, &context, &provider_options).await
-        })
-    }
+pub fn stream(
+    model: &crate::Model,
+    context: &Context,
+    options: &crate::OpenAiCodexResponsesOptions,
+) -> crate::AssistantMessageEventStream {
+    let requested_model = model.clone();
+    let context = context.for_model(&requested_model);
+    let options = options.clone();
+    crate::legacy::adapt_provider(requested_model.clone(), async move {
+        let stream_options = options.stream;
+        let request_hooks = stream_options.request_hooks(&requested_model);
+        let access_token = stream_options
+            .api_key
+            .ok_or_else(|| Error::InvalidRequest("Codex access token is required".into()))?;
+        let provider_model =
+            Model::new(&requested_model.id).with_base_url(requested_model.base_url.clone());
+        let mut provider_options = Options::new(access_token)
+            .with_cancellation(stream_options.cancellation)
+            .with_max_retries(stream_options.max_retries.unwrap_or_default())
+            .with_max_retry_delay(stream_options.max_retry_delay)
+            .with_cache_retention(stream_options.cache_retention)
+            .with_request_options(stream_options.headers, request_hooks);
+        let compat = match &requested_model.compat {
+            Some(crate::ModelCompatibility::OpenAi(compat)) => compat.clone(),
+            _ => Default::default(),
+        };
+        let mode = if compat.supports_additional_tools == Some(true) {
+            Some(DeferredToolsMode::AdditionalTools)
+        } else if compat.supports_tool_search == Some(true) {
+            Some(DeferredToolsMode::ToolSearch)
+        } else {
+            None
+        };
+        provider_options = provider_options
+            .with_deferred_tools_mode(mode)
+            .with_compatibility(&compat);
+        if let Some(temperature) = stream_options.temperature {
+            provider_options = provider_options.with_temperature(temperature);
+        }
+        if let Some(timeout) = stream_options.timeout {
+            provider_options = provider_options.with_timeout(timeout);
+        }
+        if let Some(session_id) = stream_options.session_id {
+            provider_options = provider_options.with_session_id(session_id);
+        }
+        if let Some(timeout) = stream_options.websocket_connect_timeout {
+            provider_options = provider_options.with_websocket_connect_timeout(timeout);
+        }
+        if let Some(transport) = stream_options.transport {
+            provider_options = provider_options.with_transport(match transport {
+                crate::Transport::Sse => Transport::Sse,
+                crate::Transport::WebSocket => Transport::WebSocket,
+                crate::Transport::WebSocketCached => Transport::WebSocketCached,
+                crate::Transport::Auto => Transport::Auto,
+            });
+        }
+        if let Some(effort) = options.reasoning_effort
+            && let Some(effort) = mapped_reasoning_effort(&requested_model, effort)
+        {
+            provider_options = provider_options.with_reasoning_value(
+                effort,
+                options.reasoning_summary.unwrap_or(ReasoningSummary::Auto),
+            );
+        }
+        if let Some(service_tier) = options.service_tier {
+            provider_options = provider_options.with_service_tier(service_tier);
+        }
+        if let Some(text_verbosity) = options.text_verbosity {
+            provider_options = provider_options.with_text_verbosity(text_verbosity);
+        }
+        if let Some(tool_choice) = options.tool_choice {
+            provider_options = provider_options.with_tool_choice(tool_choice);
+        }
+        response_events(&provider_model, &context, &provider_options).await
+    })
 }
 
 impl crate::Provider for Provider {
@@ -172,21 +171,21 @@ impl crate::Provider for Provider {
         if model.api != crate::Api::OpenAiCodexResponses {
             let model = model.clone();
             let api = model.api.clone();
-            return crate::legacy::adapt(model, async move {
-                Err(Error::InvalidRequest(format!(
+            return crate::legacy::failure(
+                model,
+                Error::InvalidRequest(format!(
                     "Codex provider has no API implementation for {api}"
-                )))
-            });
+                )),
+            );
         }
         let crate::ApiStreamOptions::OpenAiCodexResponses(options) = options else {
             let model = model.clone();
-            return crate::legacy::adapt(model, async {
-                Err(Error::InvalidRequest(
-                    "OpenAI Codex Responses options are required".into(),
-                ))
-            });
+            return crate::legacy::failure(
+                model,
+                Error::InvalidRequest("OpenAI Codex Responses options are required".into()),
+            );
         };
-        self.request(model, context, options)
+        stream(model, context, options)
     }
 
     fn stream_simple(
@@ -195,13 +194,13 @@ impl crate::Provider for Provider {
         context: &Context,
         options: &crate::SimpleStreamOptions,
     ) -> crate::AssistantMessageEventStream {
-        let stream =
+        let stream_options =
             crate::provider::build_simple_stream_options(model, context, options.stream.clone());
-        self.request(
+        stream(
             model,
             context,
             &crate::OpenAiCodexResponsesOptions {
-                stream,
+                stream: stream_options,
                 reasoning_effort: options
                     .thinking
                     .map(|level| model.clamp_thinking_level(level))
@@ -797,7 +796,8 @@ struct SseRequest {
     request_hooks: Option<crate::provider::RequestHooks>,
 }
 
-pub async fn stream(
+#[doc(hidden)]
+pub async fn raw_stream(
     model: &Model,
     context: &Context,
     options: &Options,
