@@ -1,7 +1,7 @@
 use crate::{
     CacheRetention, Content, Context, Error, Event, InputContent, Message, Response,
-    ResponseStream, StopReason, TimeoutPhase, ToolCall, ToolResult, Usage, http, retry, transport,
-    types::OpenAiReplay,
+    ResponseStream, StopReason, TimeoutPhase, ToolCall, ToolResult, Usage, http, json, retry,
+    transport, types::OpenAiReplay,
 };
 use async_stream::stream;
 use serde::{Deserialize, Serialize};
@@ -655,11 +655,11 @@ pub async fn stream(
                     return;
                 }
             };
-            let event = match serde_json::from_str::<StreamEvent>(&data) {
+            let event = match json::parse::<StreamEvent>(&data) {
                 Ok(event) => event,
                 Err(error) => {
                     yield Err(Error::Stream {
-                        message: error.to_string(),
+                        message: error,
                         partial: result,
                     });
                     return;
@@ -891,7 +891,7 @@ pub async fn stream(
 }
 
 fn parse_arguments(arguments: &str) -> serde_json::Value {
-    serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
+    json::value(arguments)
 }
 
 fn clamp_cache_key(key: &str) -> String {

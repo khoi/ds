@@ -477,6 +477,43 @@ async fn keeps_anthropic_temperature_with_disabled_thinking_and_cache() {
     assert!(!request.contains("cache_control"));
 }
 
+#[tokio::test]
+async fn repairs_malformed_anthropic_event_and_tool_json() {
+    let malformed = r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"A\H\",\"text\":\"col1	col2\",\"unicode\":\"\u12xz\"}"}}
+
+"#;
+    let sse = [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_repair\",\"usage\":{}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_repair\",\"name\":\"edit\",\"input\":{}}}\n\n",
+        malformed,
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Edit")]);
+    let options = anthropic::Options::new("test-key");
+
+    let events = anthropic::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    let response = done(&events);
+    assert_eq!(
+        response.content,
+        [ds_ai::Content::ToolCall(ToolCall {
+            id: "toolu_repair".into(),
+            name: "edit".into(),
+            arguments: json!({"path": "A\\H", "text": "col1\tcol2", "unicode": "\\u12xz"}),
+        })]
+    );
+}
+
 fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {
     match events.last() {
         Some(Ok(Event::Done(response))) => response,

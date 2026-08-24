@@ -1,4 +1,5 @@
 mod http;
+mod json;
 mod retry;
 mod sse;
 mod transport;

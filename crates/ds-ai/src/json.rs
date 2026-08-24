@@ -1,0 +1,66 @@
+use serde::de::DeserializeOwned;
+
+pub(crate) fn parse<T: DeserializeOwned>(input: &str) -> Result<T, String> {
+    serde_json::from_str(input)
+        .or_else(|_| serde_json::from_str(&repair(input)))
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn value(input: &str) -> serde_json::Value {
+    parse(input).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn repair(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    while let Some(character) = chars.next() {
+        if !in_string {
+            output.push(character);
+            if character == '"' {
+                in_string = true;
+            }
+            continue;
+        }
+        match character {
+            '"' => {
+                output.push(character);
+                in_string = false;
+            }
+            '\\' => {
+                let Some(escaped) = chars.next() else {
+                    output.push_str("\\\\");
+                    continue;
+                };
+                if escaped == 'u' {
+                    let digits = chars.clone().take(4).collect::<String>();
+                    if digits.len() == 4 && digits.chars().all(|digit| digit.is_ascii_hexdigit()) {
+                        output.push_str("\\u");
+                        output.push_str(&digits);
+                        for _ in 0..4 {
+                            chars.next();
+                        }
+                    } else {
+                        output.push_str("\\\\u");
+                    }
+                } else if matches!(escaped, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') {
+                    output.push('\\');
+                    output.push(escaped);
+                } else {
+                    output.push_str("\\\\");
+                    output.push(escaped);
+                }
+            }
+            '\u{08}' => output.push_str("\\b"),
+            '\u{0c}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character.is_control() => {
+                output.push_str(&format!("\\u{:04x}", character as u32));
+            }
+            character => output.push(character),
+        }
+    }
+    output
+}

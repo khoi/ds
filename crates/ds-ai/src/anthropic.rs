@@ -1,6 +1,6 @@
 use crate::{
     CacheRetention, Content, Context, Error, Event, InputContent, Message, Response,
-    ResponseStream, StopReason, ToolResult, Usage, http, retry, transport,
+    ResponseStream, StopReason, ToolResult, Usage, http, json, retry, transport,
     types::AnthropicReasoning,
 };
 use async_stream::stream;
@@ -459,11 +459,11 @@ pub async fn stream(
                     return;
                 }
             };
-            let event = match serde_json::from_str::<StreamEvent>(&data) {
+            let event = match json::parse::<StreamEvent>(&data) {
                 Ok(event) => event,
                 Err(error) => {
                     yield Err(Error::Stream {
-                        message: error.to_string(),
+                        message: error,
                         partial: result,
                     });
                     return;
@@ -690,7 +690,7 @@ fn assistant_content(model: &Model, response: &Response) -> Vec<serde_json::Valu
 }
 
 fn parse_arguments(arguments: &str) -> serde_json::Value {
-    serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
+    json::value(arguments)
 }
 
 fn input_content(content: &InputContent) -> serde_json::Value {
