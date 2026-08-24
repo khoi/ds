@@ -1,10 +1,12 @@
 use crate::support::{Reply, serve};
 use ds_ai::{
-    Context, Event, InputContent, Message, Response, StopReason, Tool, ToolCall, ToolResultMessage,
-    openai,
+    AssistantContent, AssistantMessage, AssistantMessageEvent, AssistantToolCall, CacheRetention,
+    Context, InputContent, Message, OpenAiResponsesOptions, ResponseHook, StopReason,
+    StreamOptions, TextContent, ThinkingContent, Tool, ToolResultMessage, builtin_model, openai,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
 
 #[tokio::test]
 async fn streams_openai_text_until_the_provider_completes() {
@@ -17,41 +19,31 @@ async fn streams_openai_text_until_the_provider_completes() {
     ]
     .concat();
     let server = serve([Reply::sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key");
+    let options = options(|_| {});
 
-    let events = openai::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let events = events(&model, &context, &options).await;
 
-    assert_eq!(events.len(), 2);
-    assert_eq!(
-        events.first(),
-        Some(&Ok(Event::TextDelta {
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AssistantMessageEvent::TextDelta {
             content_index: 0,
-            delta: "Hello".into(),
-        }))
-    );
+            delta,
+            ..
+        } if delta == "Hello"
+    )));
     let response = done(&events);
-    assert_eq!(response.id.as_deref(), Some("resp_1"));
-    assert_eq!(response.service_tier.as_deref(), Some("flex"));
-    assert_eq!(response.content, [ds_ai::Content::Text("Hello".into())]);
+    assert_eq!(response.response_id.as_deref(), Some("resp_1"));
     assert_eq!(
-        response.usage,
-        ds_ai::Usage {
-            input: 4,
-            output: 1,
-            cache_read: 0,
-            cache_write: 0,
-            cache_write_1h: None,
-            reasoning: Some(0),
-            total_tokens: 5,
-            cost: Default::default(),
-        }
+        response.content,
+        [text("Hello", Some(("msg_1", Some("final_answer"))))]
     );
+    assert_eq!(response.usage.input, 4);
+    assert_eq!(response.usage.output, 1);
+    assert_eq!(response.usage.cache_read, 0);
+    assert_eq!(response.usage.reasoning, Some(0));
+    assert_eq!(response.usage.total_tokens, 5);
 
     let request = server.requests().await.pop().unwrap();
     assert!(request.starts_with("POST /responses HTTP/1.1\r\n"));
@@ -66,7 +58,8 @@ async fn streams_openai_text_until_the_provider_completes() {
                 "content": [{"type": "input_text", "text": "Hello"}]
             }],
             "stream": true,
-            "store": false
+            "store": false,
+            "reasoning": {"effort": "none"}
         })
     );
 }
@@ -80,28 +73,28 @@ async fn rejects_an_openai_stream_that_ends_without_a_terminal_event() {
     ]
     .concat();
     let server = serve([Reply::sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key");
+    let options = options(|_| {});
 
-    let events = openai::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let events = events(&model, &context, &options).await;
 
-    assert_eq!(events.len(), 2);
-    assert_eq!(
-        events.first(),
-        Some(&Ok(Event::TextDelta {
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AssistantMessageEvent::TextDelta {
             content_index: 0,
-            delta: "Part".into(),
-        }))
-    );
-    let partial = incomplete(&events);
-    assert_eq!(partial.id.as_deref(), Some("resp_partial"));
-    assert_eq!(partial.content, [ds_ai::Content::Text("Part".into())]);
+            delta,
+            ..
+        } if delta == "Part"
+    )));
+    let partial = failed(&events);
+    assert_eq!(partial.response_id.as_deref(), Some("resp_partial"));
+    assert_eq!(partial.content, [text("Part", None)]);
     assert_eq!(partial.usage, ds_ai::Usage::default());
+    assert_eq!(
+        partial.error_message.as_deref(),
+        Some("provider stream ended before a terminal event")
+    );
     server.requests().await;
 }
 
@@ -126,40 +119,28 @@ async fn decodes_openai_sse_across_arbitrary_chunks() {
     }
     chunks.push(sse.as_bytes()[start..].to_vec());
     let server = serve([Reply::sse_chunks(chunks)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key");
+    let options = options(|_| {});
 
-    let events = openai::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let events = events(&model, &context, &options).await;
 
-    assert_eq!(events.len(), 2);
-    assert_eq!(
-        events.first(),
-        Some(&Ok(Event::TextDelta {
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AssistantMessageEvent::TextDelta {
             content_index: 0,
-            delta: "Hé".into(),
-        }))
-    );
+            delta,
+            ..
+        } if delta == "Hé"
+    )));
     let response = done(&events);
-    assert_eq!(response.id.as_deref(), Some("resp_chunks"));
-    assert_eq!(response.content, [ds_ai::Content::Text("Hé".into())]);
-    assert_eq!(
-        response.usage,
-        ds_ai::Usage {
-            input: 3,
-            output: 1,
-            cache_read: 0,
-            cache_write: 0,
-            cache_write_1h: None,
-            reasoning: Some(0),
-            total_tokens: 0,
-            cost: Default::default(),
-        }
-    );
+    assert_eq!(response.response_id.as_deref(), Some("resp_chunks"));
+    assert_eq!(response.content, [text("Hé", Some(("msg_chunks", None)))]);
+    assert_eq!(response.usage.input, 3);
+    assert_eq!(response.usage.output, 1);
+    assert_eq!(response.usage.cache_read, 0);
+    assert_eq!(response.usage.reasoning, Some(0));
+    assert_eq!(response.usage.total_tokens, 0);
     server.requests().await;
 }
 
@@ -175,19 +156,14 @@ async fn retries_openai_before_streaming_starts() {
         Reply::sse(completed),
     ])
     .await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key").with_max_retries(1);
+    let options = options(|options| options.stream.max_retries = Some(1));
 
-    let events = openai::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let events = events(&model, &context, &options).await;
 
-    assert_eq!(events.len(), 1);
     let response = done(&events);
-    assert_eq!(response.id.as_deref(), Some("resp_retry"));
+    assert_eq!(response.response_id.as_deref(), Some("resp_retry"));
     assert!(response.content.is_empty());
     assert_eq!(
         response.usage,
@@ -213,16 +189,10 @@ async fn waits_for_openai_retry_headers() {
             Reply::sse(completed),
         ])
         .await;
-        let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+        let model = model(&server.base_url);
         let context = Context::new([Message::user("Hello")]);
-        let options = openai::Options::new("test-key").with_max_retries(1);
-        let task = tokio::spawn(async move {
-            openai::raw_stream(&model, &context, &options)
-                .await
-                .unwrap()
-                .collect::<Vec<_>>()
-                .await
-        });
+        let options = options(|options| options.stream.max_retries = Some(1));
+        let task = tokio::spawn(async move { events(&model, &context, &options).await });
 
         server.wait_for_requests(1).await;
         tokio::time::advance(std::time::Duration::from_millis(delay_ms - 1)).await;
@@ -233,7 +203,7 @@ async fn waits_for_openai_retry_headers() {
 
         tokio::time::advance(std::time::Duration::from_millis(1)).await;
         let events = task.await.unwrap();
-        assert!(matches!(events.as_slice(), [Ok(Event::Done(_))]));
+        done(&events);
         assert_eq!(server.requests().await.len(), 2);
     }
 }
@@ -252,16 +222,10 @@ async fn waits_for_an_openai_retry_after_http_date() {
         Reply::sse(completed),
     ])
     .await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key").with_max_retries(1);
-    let task = tokio::spawn(async move {
-        openai::raw_stream(&model, &context, &options)
-            .await
-            .unwrap()
-            .collect::<Vec<_>>()
-            .await
-    });
+    let options = options(|options| options.stream.max_retries = Some(1));
+    let task = tokio::spawn(async move { events(&model, &context, &options).await });
 
     server.wait_for_requests(1).await;
     tokio::time::advance(std::time::Duration::from_secs(58)).await;
@@ -272,7 +236,7 @@ async fn waits_for_an_openai_retry_after_http_date() {
 
     tokio::time::advance(std::time::Duration::from_secs(3)).await;
     let events = task.await.unwrap();
-    assert!(matches!(events.as_slice(), [Ok(Event::Done(_))]));
+    done(&events);
     assert_eq!(server.requests().await.len(), 2);
 }
 
@@ -287,22 +251,21 @@ async fn cancels_an_openai_retry_wait() {
         Reply::sse(Vec::new()),
     ])
     .await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let options = openai::Options::new("test-key")
-        .with_max_retries(1)
-        .with_cancellation(cancellation.clone());
-    let task = tokio::spawn(async move { openai::raw_stream(&model, &context, &options).await });
+    let options = options(|options| {
+        options.stream.max_retries = Some(1);
+        options.stream.cancellation = cancellation.clone();
+    });
+    let task = tokio::spawn(async move { events(&model, &context, &options).await });
 
     server.wait_for_requests(1).await;
     cancellation.cancel();
-    let error = match task.await.unwrap() {
-        Ok(_) => panic!("retry wait did not cancel"),
-        Err(error) => error,
-    };
-
-    assert_eq!(error, ds_ai::Error::Cancelled { partial: None });
+    let events = task.await.unwrap();
+    let error = failed(&events);
+    assert_eq!(error.stop_reason, StopReason::Aborted);
+    assert_eq!(error.error_message.as_deref(), Some("request cancelled"));
     assert_eq!(server.request_count(), 1);
 }
 
@@ -334,24 +297,22 @@ async fn follows_openai_retry_status_and_override_headers() {
             )));
         }
         let server = serve(replies).await;
-        let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+        let model = model(&server.base_url);
         let context = Context::new([Message::user("Hello")]);
-        let options = openai::Options::new("test-key").with_max_retries(1);
+        let options = options(|options| options.stream.max_retries = Some(1));
 
-        let result = openai::raw_stream(&model, &context, &options).await;
+        let events = events(&model, &context, &options).await;
 
         if should_retry {
-            let events = result.unwrap().collect::<Vec<_>>().await;
-            assert!(matches!(events.as_slice(), [Ok(Event::Done(_))]));
+            done(&events);
             assert_eq!(server.requests().await.len(), 2);
         } else {
-            assert!(matches!(
-                result,
-                Err(ds_ai::Error::Provider {
-                    status: actual,
-                    ..
-                }) if actual == status
-            ));
+            assert_eq!(failed(&events).stop_reason, StopReason::Error);
+            assert!(
+                failed(&events).error_message.as_deref().is_some_and(
+                    |message| message.starts_with(&format!("provider returned HTTP {status}:"))
+                )
+            );
             assert_eq!(server.request_count(), 1);
         }
     }
@@ -361,17 +322,11 @@ async fn follows_openai_retry_status_and_override_headers() {
 async fn retries_openai_network_failures_before_streaming_starts() {
     let completed = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_network\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
     let server = serve([Reply::disconnect(), Reply::sse(completed)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key").with_max_retries(1);
+    let options = options(|options| options.stream.max_retries = Some(1));
 
-    let task = tokio::spawn(async move {
-        openai::raw_stream(&model, &context, &options)
-            .await
-            .unwrap()
-            .collect::<Vec<_>>()
-            .await
-    });
+    let task = tokio::spawn(async move { events(&model, &context, &options).await });
 
     server.wait_for_requests(1).await;
     tokio::time::advance(std::time::Duration::from_millis(374)).await;
@@ -382,7 +337,7 @@ async fn retries_openai_network_failures_before_streaming_starts() {
 
     tokio::time::advance(std::time::Duration::from_millis(126)).await;
     let events = task.await.unwrap();
-    assert!(matches!(events.as_slice(), [Ok(Event::Done(_))]));
+    done(&events);
     assert_eq!(server.requests().await.len(), 2);
 }
 
@@ -394,23 +349,17 @@ async fn rejects_an_openai_retry_delay_above_a_custom_limit() {
     )
     .with_header("retry-after", "2")])
     .await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key")
-        .with_max_retries(1)
-        .with_max_retry_delay(Some(std::time::Duration::from_secs(1)));
+    let options = options(|options| {
+        options.stream.max_retries = Some(1);
+        options.stream.max_retry_delay = Some(std::time::Duration::from_secs(1));
+    });
 
-    let error = match openai::raw_stream(&model, &context, &options).await {
-        Ok(_) => panic!("retry delay was accepted"),
-        Err(error) => error,
-    };
-
+    let events = events(&model, &context, &options).await;
     assert_eq!(
-        error,
-        ds_ai::Error::RetryDelayExceeded {
-            requested: std::time::Duration::from_secs(2),
-            maximum: std::time::Duration::from_secs(1),
-        }
+        failed(&events).error_message.as_deref(),
+        Some("provider retry delay 2s exceeds 1s")
     );
     assert_eq!(server.requests().await.len(), 1);
 }
@@ -426,16 +375,10 @@ async fn backs_off_before_an_openai_retry_without_a_header() {
         Reply::sse(completed),
     ])
     .await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key").with_max_retries(1);
-    let task = tokio::spawn(async move {
-        openai::raw_stream(&model, &context, &options)
-            .await
-            .unwrap()
-            .collect::<Vec<_>>()
-            .await
-    });
+    let options = options(|options| options.stream.max_retries = Some(1));
+    let task = tokio::spawn(async move { events(&model, &context, &options).await });
 
     server.wait_for_requests(1).await;
     tokio::time::advance(std::time::Duration::from_millis(374)).await;
@@ -446,7 +389,7 @@ async fn backs_off_before_an_openai_retry_without_a_header() {
 
     tokio::time::advance(std::time::Duration::from_millis(126)).await;
     let events = task.await.unwrap();
-    assert!(matches!(events.as_slice(), [Ok(Event::Done(_))]));
+    done(&events);
     assert_eq!(server.requests().await.len(), 2);
 }
 
@@ -462,16 +405,10 @@ async fn accepts_fractional_openai_retry_headers() {
         Reply::sse(completed),
     ])
     .await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key").with_max_retries(1);
-    let task = tokio::spawn(async move {
-        openai::raw_stream(&model, &context, &options)
-            .await
-            .unwrap()
-            .collect::<Vec<_>>()
-            .await
-    });
+    let options = options(|options| options.stream.max_retries = Some(1));
+    let task = tokio::spawn(async move { events(&model, &context, &options).await });
 
     server.wait_for_requests(1).await;
     for _ in 0..10 {
@@ -485,7 +422,7 @@ async fn accepts_fractional_openai_retry_headers() {
 
     tokio::time::advance(std::time::Duration::from_millis(1)).await;
     let events = task.await.unwrap();
-    assert!(matches!(events.as_slice(), [Ok(Event::Done(_))]));
+    done(&events);
     assert_eq!(server.requests().await.len(), 2);
 }
 
@@ -503,53 +440,42 @@ async fn streams_openai_reasoning_and_text_in_content_order() {
     ]
     .concat();
     let server = serve([Reply::sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key");
+    let options = options(|_| {});
 
-    let events = openai::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let events = events(&model, &context, &options).await;
 
-    assert_eq!(events.len(), 3);
-    assert_eq!(
-        events.first(),
-        Some(&Ok(Event::ReasoningDelta {
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AssistantMessageEvent::ThinkingDelta {
             content_index: 0,
-            delta: "Need answer.".into(),
-        }))
-    );
-    assert_eq!(
-        events.get(1),
-        Some(&Ok(Event::TextDelta {
+            delta,
+            ..
+        } if delta == "Need answer."
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AssistantMessageEvent::TextDelta {
             content_index: 1,
-            delta: "Hello".into(),
-        }))
-    );
+            delta,
+            ..
+        } if delta == "Hello"
+    )));
     let response = done(&events);
-    assert_eq!(response.id.as_deref(), Some("resp_reasoning"));
+    assert_eq!(response.response_id.as_deref(), Some("resp_reasoning"));
     assert_eq!(
         response.content,
         [
-            ds_ai::Content::Reasoning("Need answer.".into()),
-            ds_ai::Content::Text("Hello".into()),
+            thinking("Need answer.", Some("rs_1"), Some("encrypted")),
+            text("Hello", Some(("msg_1", Some("final_answer")))),
         ]
     );
-    assert_eq!(
-        response.usage,
-        ds_ai::Usage {
-            input: 5,
-            output: 4,
-            cache_read: 0,
-            cache_write: 0,
-            cache_write_1h: None,
-            reasoning: Some(3),
-            total_tokens: 0,
-            cost: Default::default(),
-        }
-    );
+    assert_eq!(response.usage.input, 5);
+    assert_eq!(response.usage.output, 4);
+    assert_eq!(response.usage.cache_read, 0);
+    assert_eq!(response.usage.reasoning, Some(3));
+    assert_eq!(response.usage.total_tokens, 0);
 }
 
 #[tokio::test]
@@ -565,37 +491,32 @@ async fn streams_openai_reasoning_text_and_refusal_content() {
     ]
     .concat();
     let server = serve([Reply::sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
 
-    let events = openai::raw_stream(
-        &model,
-        &Context::new([Message::user("Answer")]),
-        &openai::Options::new("test-key"),
-    )
-    .await
-    .unwrap()
-    .collect::<Vec<_>>()
-    .await;
+    let context = Context::new([Message::user("Answer")]);
+    let events = events(&model, &context, &options(|_| {})).await;
 
-    assert_eq!(
-        events.first(),
-        Some(&Ok(Event::ReasoningDelta {
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AssistantMessageEvent::ThinkingDelta {
             content_index: 0,
-            delta: "Private".into(),
-        }))
-    );
-    assert_eq!(
-        events.get(1),
-        Some(&Ok(Event::TextDelta {
+            delta,
+            ..
+        } if delta == "Private"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AssistantMessageEvent::TextDelta {
             content_index: 1,
-            delta: "Denied".into(),
-        }))
-    );
+            delta,
+            ..
+        } if delta == "Denied"
+    )));
     assert_eq!(
         done(&events).content,
         [
-            ds_ai::Content::Reasoning("Private".into()),
-            ds_ai::Content::Text("Denied".into()),
+            thinking("Private", Some("rs_text"), None),
+            text("Denied", Some(("msg_refusal", None))),
         ]
     );
     server.requests().await;
@@ -615,28 +536,21 @@ async fn replays_serialized_openai_reasoning_and_message_items() {
     ]
     .concat();
     let first_server = serve([Reply::sse(first_sse)]).await;
-    let first_model = openai::Model::new("gpt-5.6").with_base_url(&first_server.base_url);
+    let first_model = model(&first_server.base_url);
     let first_context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key");
-    let first_events = openai::raw_stream(&first_model, &first_context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
-    let response: Response =
+    let options = options(|_| {});
+    let first_events = events(&first_model, &first_context, &options).await;
+    let response: AssistantMessage =
         serde_json::from_value(serde_json::to_value(done(&first_events)).unwrap()).unwrap();
     first_server.requests().await;
 
     let second_sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_second\",\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
     let second_server = serve([Reply::sse(second_sse)]).await;
-    let second_model = openai::Model::new("gpt-5.6").with_base_url(&second_server.base_url);
+    let second_model = model(&second_server.base_url);
     let second_context = Context::new([Message::assistant(response), Message::user("Continue")]);
 
-    openai::raw_stream(&second_model, &second_context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let second_events = events(&second_model, &second_context, &options).await;
+    done(&second_events);
 
     let request = second_server.requests().await.pop().unwrap();
     let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -679,16 +593,12 @@ async fn generates_distinct_replay_ids_for_text_without_provider_ids() {
     .concat();
     let done_sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_next\",\"usage\":{}}}\n\n";
     let server = serve([Reply::sse(first_sse), Reply::sse(done_sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
-    let options = openai::Options::new("test-key");
-    let first = openai::raw_stream(&model, &Context::new([Message::user("Split")]), &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let model = model(&server.base_url);
+    let options = options(|_| {});
+    let first = events(&model, &Context::new([Message::user("Split")]), &options).await;
     let replay = done(&first).clone();
 
-    openai::raw_stream(
+    let second = events(
         &model,
         &Context::new([
             Message::user("Split"),
@@ -697,10 +607,8 @@ async fn generates_distinct_replay_ids_for_text_without_provider_ids() {
         ]),
         &options,
     )
-    .await
-    .unwrap()
-    .collect::<Vec<_>>()
     .await;
+    done(&second);
 
     let requests = server.requests().await;
     let body: Value = serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -732,7 +640,7 @@ async fn streams_and_replays_openai_tool_calls() {
     ]
     .concat();
     let first_server = serve([Reply::sse(first_sse)]).await;
-    let first_model = openai::Model::new("gpt-5.6").with_base_url(&first_server.base_url);
+    let first_model = model(&first_server.base_url);
     let first_context = Context::new([Message::user("Edit the file")]).with_tools([Tool::new(
         "edit",
         "Edit a file",
@@ -747,35 +655,35 @@ async fn streams_and_replays_openai_tool_calls() {
         }),
     )
     .with_strict()]);
-    let options = openai::Options::new("test-key");
+    let options = options(|_| {});
 
-    let first_events = openai::raw_stream(&first_model, &first_context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let first_events = events(&first_model, &first_context, &options).await;
 
-    assert_eq!(
-        first_events.first(),
-        Some(&Ok(Event::ToolCallDelta {
+    assert!(first_events.iter().any(|event| matches!(
+        event,
+        AssistantMessageEvent::ToolCallDelta {
             content_index: 0,
-            delta: "{\"path\":\"README.md\"".into(),
-        }))
-    );
-    assert_eq!(
-        first_events.get(1),
-        Some(&Ok(Event::ToolCallDelta {
+            delta,
+            ..
+        } if delta == "{\"path\":\"README.md\""
+    )));
+    assert!(first_events.iter().any(|event| matches!(
+        event,
+        AssistantMessageEvent::ToolCallDelta {
             content_index: 0,
-            delta: ",\"content\":\"updated\"}".into(),
-        }))
-    );
+            delta,
+            ..
+        } if delta == ",\"content\":\"updated\"}"
+    )));
     let response = done(&first_events);
     assert_eq!(
         response.content,
-        [ds_ai::Content::ToolCall(ToolCall {
-            id: "call_edit".into(),
+        [AssistantContent::ToolCall(AssistantToolCall {
+            id: "call_edit|fc_edit".into(),
             name: "edit".into(),
             arguments: json!({"path": "README.md", "content": "updated"}),
+            thought_signature: None,
+            namespace: Some("dynamic_tools".into()),
         })]
     );
 
@@ -801,18 +709,15 @@ async fn streams_and_replays_openai_tool_calls() {
         }])
     );
 
-    let restored: ds_ai::Response =
+    let restored: AssistantMessage =
         serde_json::from_value(serde_json::to_value(response).unwrap()).unwrap();
     let second_sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_second\",\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
     let second_server = serve([Reply::sse(second_sse)]).await;
-    let second_model = openai::Model::new("gpt-5.6").with_base_url(&second_server.base_url);
+    let second_model = model(&second_server.base_url);
     let second_context = Context::new([Message::assistant(restored), Message::user("Continue")]);
 
-    openai::raw_stream(&second_model, &second_context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let second_events = events(&second_model, &second_context, &options).await;
+    done(&second_events);
 
     let second_request = second_server.requests().await.pop().unwrap();
     let second_body: Value =
@@ -845,16 +750,12 @@ async fn streams_and_replays_openai_tool_calls() {
 async fn uses_the_provider_terminal_token_total() {
     let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_total\",\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":99}}}\n\n";
     let server = serve([Reply::sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
-
-    let events = openai::raw_stream(
+    let model = model(&server.base_url);
+    let events = events(
         &model,
         &Context::new([Message::user("Hello")]),
-        &openai::Options::new("test-key"),
+        &options(|_| {}),
     )
-    .await
-    .unwrap()
-    .collect::<Vec<_>>()
     .await;
 
     assert_eq!(done(&events).usage.total_tokens, 99);
@@ -865,33 +766,26 @@ async fn uses_the_provider_terminal_token_total() {
 async fn rejects_an_incomplete_response_without_a_reason() {
     let sse = "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"incomplete_details\":null}}\n\n";
     let server = serve([Reply::sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
-
-    let events = openai::raw_stream(
+    let model = model(&server.base_url);
+    let events = events(
         &model,
         &Context::new([Message::user("Hello")]),
-        &openai::Options::new("test-key"),
+        &options(|_| {}),
     )
-    .await
-    .unwrap()
-    .collect::<Vec<_>>()
     .await;
 
-    match events.last() {
-        Some(Err(ds_ai::Error::Response {
-            message, partial, ..
-        })) => {
-            assert_eq!(message, "Response incomplete without a provider reason");
-            assert_eq!(partial.raw_stop_reason.as_deref(), Some("incomplete"));
-        }
-        event => panic!("unexpected terminal event: {event:?}"),
-    }
+    let error = failed(&events);
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("provider response failed: Response incomplete without a provider reason")
+    );
+    assert_eq!(error.raw_stop_reason.as_deref(), Some("incomplete"));
     server.requests().await;
 }
 
 #[tokio::test]
 async fn rejects_invalid_strict_tool_schemas_before_connecting() {
-    let model = openai::Model::new("gpt-5.6").with_base_url("http://127.0.0.1:9");
+    let model = model("http://127.0.0.1:9");
     let context = Context::new([Message::user("Look up")]).with_tools([Tool::new(
         "lookup",
         "Look up a value",
@@ -903,20 +797,21 @@ async fn rejects_invalid_strict_tool_schemas_before_connecting() {
     )
     .with_strict()]);
 
-    let result = openai::raw_stream(&model, &context, &openai::Options::new("test-key")).await;
+    let events = events(&model, &context, &options(|_| {})).await;
 
-    assert!(matches!(
-        result,
-        Err(ds_ai::Error::InvalidRequest(message))
-            if message == "tool \"lookup\" requires JSON-schema constrained sampling, but $defs schemas are unsupported"
-    ));
+    assert_eq!(
+        failed(&events).error_message.as_deref(),
+        Some(
+            "invalid request: tool \"lookup\" requires JSON-schema constrained sampling, but $defs schemas are unsupported"
+        )
+    );
 }
 
 #[tokio::test]
 async fn sends_openai_tool_result_text_images_and_empty_output() {
     let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_result\",\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
     let server = serve([Reply::sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([
         Message::user("Inspect the image"),
         Message::tool_result(ToolResultMessage::new(
@@ -933,13 +828,8 @@ async fn sends_openai_tool_result_text_images_and_empty_output() {
             [InputContent::text("")],
         )),
     ]);
-    let options = openai::Options::new("test-key");
-
-    openai::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let events = events(&model, &context, &options(|_| {})).await;
+    done(&events);
 
     let request = server.requests().await.pop().unwrap();
     let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -981,15 +871,9 @@ async fn finalizes_an_incomplete_openai_response_as_a_length_stop() {
     ]
     .concat();
     let server = serve([Reply::sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Write")]);
-    let options = openai::Options::new("test-key");
-
-    let events = openai::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let events = events(&model, &context, &options(|_| {})).await;
 
     let response = done(&events);
     assert_eq!(response.stop_reason, StopReason::Length);
@@ -997,7 +881,7 @@ async fn finalizes_an_incomplete_openai_response_as_a_length_stop() {
         response.raw_stop_reason.as_deref(),
         Some("incomplete.max_output_tokens")
     );
-    assert_eq!(response.content, [ds_ai::Content::Text("Partial".into())]);
+    assert_eq!(response.content, [text("Partial", None)]);
     assert_eq!(response.usage.input, 25);
     assert_eq!(response.usage.cache_read, 5);
     assert_eq!(response.usage.output, 12);
@@ -1013,33 +897,21 @@ async fn rejects_a_content_filtered_openai_response_with_partial_content() {
     ]
     .concat();
     let server = serve([Reply::sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Write")]);
-    let options = openai::Options::new("test-key");
+    let events = events(&model, &context, &options(|_| {})).await;
 
-    let events = openai::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
-
-    match events.last() {
-        Some(Err(ds_ai::Error::Response {
-            code,
-            message,
-            partial,
-        })) => {
-            assert_eq!(code, &None);
-            assert_eq!(message, "Response incomplete: content_filter");
-            assert_eq!(partial.stop_reason, StopReason::Error);
-            assert_eq!(
-                partial.raw_stop_reason.as_deref(),
-                Some("incomplete.content_filter")
-            );
-            assert_eq!(partial.content, [ds_ai::Content::Text("Visible".into())]);
-        }
-        event => panic!("unexpected terminal event: {event:?}"),
-    }
+    let error = failed(&events);
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("provider response failed: Response incomplete: content_filter")
+    );
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(
+        error.raw_stop_reason.as_deref(),
+        Some("incomplete.content_filter")
+    );
+    assert_eq!(error.content, [text("Visible", None)]);
 }
 
 #[tokio::test]
@@ -1052,34 +924,19 @@ async fn rejects_a_failed_openai_response_with_code_and_partial_content() {
     ]
     .concat();
     let server = serve([Reply::sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Think")]);
-    let options = openai::Options::new("test-key");
+    let events = events(&model, &context, &options(|_| {})).await;
 
-    let events = openai::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
-
-    match events.last() {
-        Some(Err(ds_ai::Error::Response {
-            code,
-            message,
-            partial,
-        })) => {
-            assert_eq!(code.as_deref(), Some("server_error"));
-            assert_eq!(message, "boom");
-            assert_eq!(partial.id.as_deref(), Some("resp_failed"));
-            assert_eq!(partial.stop_reason, StopReason::Error);
-            assert_eq!(partial.raw_stop_reason.as_deref(), Some("failed"));
-            assert_eq!(
-                partial.content,
-                [ds_ai::Content::Reasoning("Partial thought".into())]
-            );
-        }
-        event => panic!("unexpected terminal event: {event:?}"),
-    }
+    let error = failed(&events);
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("provider response failed: boom")
+    );
+    assert_eq!(error.response_id.as_deref(), Some("resp_failed"));
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(error.raw_stop_reason.as_deref(), Some("failed"));
+    assert_eq!(error.content, [thinking("Partial thought", None, None)]);
 }
 
 #[tokio::test]
@@ -1092,37 +949,25 @@ async fn rejects_an_openai_error_event_with_code_and_partial_content() {
     ]
     .concat();
     let server = serve([Reply::sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Write")]);
-    let options = openai::Options::new("test-key");
+    let events = events(&model, &context, &options(|_| {})).await;
 
-    let events = openai::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
-
-    match events.last() {
-        Some(Err(ds_ai::Error::Response {
-            code,
-            message,
-            partial,
-        })) => {
-            assert_eq!(code.as_deref(), Some("rate_limit_exceeded"));
-            assert_eq!(message, "slow down");
-            assert_eq!(partial.stop_reason, StopReason::Error);
-            assert_eq!(partial.raw_stop_reason.as_deref(), Some("error"));
-            assert_eq!(partial.content, [ds_ai::Content::Text("Visible".into())]);
-        }
-        event => panic!("unexpected terminal event: {event:?}"),
-    }
+    let error = failed(&events);
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("provider response failed: slow down")
+    );
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(error.raw_stop_reason.as_deref(), Some("error"));
+    assert_eq!(error.content, [text("Visible", None)]);
 }
 
 #[tokio::test]
 async fn encodes_openai_multimodal_context_and_generation_options() {
     let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_options\",\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
     let server = serve([Reply::sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user_content([
         InputContent::text("Describe this"),
         InputContent::image("image/png", "iVBORw0KGgo="),
@@ -1133,21 +978,17 @@ async fn encodes_openai_multimodal_context_and_generation_options() {
         "Inspect an image",
         json!({"type": "object", "properties": {}, "additionalProperties": false}),
     )]);
-    let options = openai::Options::new("test-key")
-        .with_max_output_tokens(128)
-        .with_temperature(0.2)
-        .with_reasoning(
-            openai::ReasoningEffort::High,
-            openai::ReasoningSummary::Concise,
-        )
-        .with_tool_choice(openai::ToolChoice::Required)
-        .with_service_tier(openai::ServiceTier::Priority);
+    let options = options(|options| {
+        options.stream.max_tokens = Some(128);
+        options.stream.temperature = Some(0.2);
+        options.reasoning_effort = Some(openai::ReasoningEffort::High);
+        options.reasoning_summary = Some(openai::ReasoningSummary::Concise);
+        options.tool_choice = Some(openai::ToolChoice::Required);
+        options.service_tier = Some(openai::ServiceTier::Priority);
+    });
 
-    openai::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let events = events(&model, &context, &options).await;
+    done(&events);
 
     let request = server.requests().await.pop().unwrap();
     let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -1198,19 +1039,20 @@ async fn encodes_openai_multimodal_context_and_generation_options() {
 #[tokio::test]
 async fn cancels_an_openai_request_before_response_headers() {
     let server = serve([Reply::pending()]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let options = openai::Options::new("test-key").with_cancellation(cancellation.clone());
-    let request = tokio::spawn(async move { openai::raw_stream(&model, &context, &options).await });
+    let options = options(|options| options.stream.cancellation = cancellation.clone());
+    let request = tokio::spawn(async move { events(&model, &context, &options).await });
 
     server.wait_for_requests(1).await;
     cancellation.cancel();
 
-    match request.await.unwrap() {
-        Err(ds_ai::Error::Cancelled { partial }) => assert_eq!(partial, None),
-        _ => panic!("request was not cancelled"),
-    }
+    let events = request.await.unwrap();
+    let error = failed(&events);
+    assert_eq!(error.stop_reason, StopReason::Aborted);
+    assert_eq!(error.error_message.as_deref(), Some("request cancelled"));
+    assert!(error.content.is_empty());
 }
 
 #[tokio::test]
@@ -1220,20 +1062,21 @@ async fn cancels_while_reading_an_openai_error_body() {
         json!({"error": {"message": "unfinished"}}),
     )])
     .await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let options = openai::Options::new("test-key").with_cancellation(cancellation.clone());
-    let request = tokio::spawn(async move { openai::raw_stream(&model, &context, &options).await });
+    let options = options(|options| options.stream.cancellation = cancellation.clone());
+    let request = tokio::spawn(async move { events(&model, &context, &options).await });
     server.wait_for_requests(1).await;
     tokio::task::yield_now().await;
 
     cancellation.cancel();
 
-    assert!(matches!(
-        request.await.unwrap(),
-        Err(ds_ai::Error::Cancelled { partial: None })
-    ));
+    let events = request.await.unwrap();
+    let error = failed(&events);
+    assert_eq!(error.stop_reason, StopReason::Aborted);
+    assert_eq!(error.error_message.as_deref(), Some("request cancelled"));
+    assert!(error.content.is_empty());
     server.requests().await;
 }
 
@@ -1246,30 +1089,25 @@ async fn cancels_an_active_openai_stream_with_partial_content() {
     ]
     .concat();
     let server = serve([Reply::open_sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let options = openai::Options::new("test-key").with_cancellation(cancellation.clone());
-    let mut response = openai::raw_stream(&model, &context, &options)
-        .await
-        .unwrap();
+    let options = options(|options| options.stream.cancellation = cancellation.clone());
+    let mut response = openai::stream(&model, &context, &options);
 
-    assert_eq!(
+    while !matches!(
         response.next().await,
-        Some(Ok(Event::TextDelta {
-            content_index: 0,
-            delta: "Visible".into(),
-        }))
-    );
+        Some(AssistantMessageEvent::TextDelta { .. })
+    ) {}
     cancellation.cancel();
 
     match response.next().await {
-        Some(Err(ds_ai::Error::Cancelled {
-            partial: Some(partial),
-        })) => {
-            assert_eq!(partial.stop_reason, StopReason::Aborted);
-            assert_eq!(partial.raw_stop_reason.as_deref(), Some("cancelled"));
-            assert_eq!(partial.content, [ds_ai::Content::Text("Visible".into())]);
+        Some(AssistantMessageEvent::Error { reason, error }) => {
+            assert_eq!(reason, StopReason::Aborted);
+            assert_eq!(error.stop_reason, StopReason::Aborted);
+            assert_eq!(error.raw_stop_reason.as_deref(), Some("cancelled"));
+            assert_eq!(error.error_message.as_deref(), Some("request cancelled"));
+            assert_eq!(error.content, [text("Visible", None)]);
         }
         event => panic!("unexpected cancellation event: {event:?}"),
     }
@@ -1278,20 +1116,22 @@ async fn cancels_an_active_openai_stream_with_partial_content() {
 #[tokio::test]
 async fn times_out_an_openai_request_before_response_headers() {
     let server = serve([Reply::pending()]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key")
-        .with_connection_timeout(std::time::Duration::from_millis(50));
-    let request = tokio::spawn(async move { openai::raw_stream(&model, &context, &options).await });
+    let options = options(|options| {
+        options.stream.timeout = Some(std::time::Duration::from_millis(50));
+    });
+    let request = tokio::spawn(async move { events(&model, &context, &options).await });
 
     server.wait_for_requests(1).await;
-    match request.await.unwrap() {
-        Err(ds_ai::Error::Timeout { phase, partial }) => {
-            assert_eq!(phase, ds_ai::TimeoutPhase::Connection);
-            assert_eq!(partial, None);
-        }
-        _ => panic!("request did not time out"),
-    }
+    let events = request.await.unwrap();
+    let error = failed(&events);
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("provider timed out during Overall")
+    );
+    assert!(error.content.is_empty());
 }
 
 #[tokio::test]
@@ -1301,91 +1141,52 @@ async fn times_out_while_reading_an_openai_error_body() {
         json!({"error": {"message": "unfinished"}}),
     )])
     .await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options =
-        openai::Options::new("test-key").with_overall_timeout(std::time::Duration::from_secs(5));
-    let request = tokio::spawn(async move { openai::raw_stream(&model, &context, &options).await });
+    let options = options(|options| {
+        options.stream.timeout = Some(std::time::Duration::from_secs(5));
+    });
+    let request = tokio::spawn(async move { events(&model, &context, &options).await });
 
     server.wait_for_requests(1).await;
     tokio::task::yield_now().await;
     tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(5)).await;
 
-    assert!(matches!(
-        request.await.unwrap(),
-        Err(ds_ai::Error::Timeout {
-            phase: ds_ai::TimeoutPhase::Overall,
-            partial: None,
-        })
-    ));
+    let events = request.await.unwrap();
+    let error = failed(&events);
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("provider timed out during Overall")
+    );
+    assert!(error.content.is_empty());
     server.requests().await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn times_out_an_openai_stream_before_its_first_event() {
     let server = serve([Reply::open_sse(": keepalive\n\n")]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key")
-        .with_first_event_timeout(std::time::Duration::from_secs(5));
-    let mut response = openai::raw_stream(&model, &context, &options)
-        .await
-        .unwrap();
+    let options = options(|options| {
+        options.stream.timeout = Some(std::time::Duration::from_secs(5));
+    });
+    let mut response = openai::stream(&model, &context, &options);
     let next = tokio::spawn(async move { response.next().await });
 
+    tokio::task::yield_now().await;
     tokio::time::advance(std::time::Duration::from_secs(5)).await;
 
     match next.await.unwrap() {
-        Some(Err(ds_ai::Error::Timeout {
-            phase,
-            partial: Some(partial),
-        })) => {
-            assert_eq!(phase, ds_ai::TimeoutPhase::FirstEvent);
-            assert_eq!(partial.stop_reason, StopReason::Error);
+        Some(AssistantMessageEvent::Error { reason, error }) => {
+            assert_eq!(reason, StopReason::Error);
+            assert_eq!(error.stop_reason, StopReason::Error);
+            assert_eq!(error.raw_stop_reason, None);
             assert_eq!(
-                partial.raw_stop_reason.as_deref(),
-                Some("timeout.first_event")
+                error.error_message.as_deref(),
+                Some("provider timed out during Overall")
             );
-            assert!(partial.content.is_empty());
-        }
-        event => panic!("unexpected timeout event: {event:?}"),
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn times_out_an_idle_openai_stream_with_partial_content() {
-    let sse = [
-        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_idle\"}}\n\n",
-        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_idle\",\"type\":\"message\",\"content\":[]}}\n\n",
-        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Visible\"}\n\n",
-    ]
-    .concat();
-    let server = serve([Reply::open_sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
-    let context = Context::new([Message::user("Hello")]);
-    let options =
-        openai::Options::new("test-key").with_idle_timeout(std::time::Duration::from_secs(5));
-    let mut response = openai::raw_stream(&model, &context, &options)
-        .await
-        .unwrap();
-
-    assert!(matches!(
-        response.next().await,
-        Some(Ok(Event::TextDelta { .. }))
-    ));
-    let next = tokio::spawn(async move { response.next().await });
-    tokio::time::advance(std::time::Duration::from_secs(5)).await;
-
-    match next.await.unwrap() {
-        Some(Err(ds_ai::Error::Timeout {
-            phase,
-            partial: Some(partial),
-        })) => {
-            assert_eq!(phase, ds_ai::TimeoutPhase::Idle);
-            assert_eq!(partial.stop_reason, StopReason::Error);
-            assert_eq!(partial.raw_stop_reason.as_deref(), Some("timeout.idle"));
-            assert_eq!(partial.content, [ds_ai::Content::Text("Visible".into())]);
+            assert!(error.content.is_empty());
         }
         event => panic!("unexpected timeout event: {event:?}"),
     }
@@ -1400,32 +1201,27 @@ async fn enforces_an_overall_openai_stream_deadline() {
     ]
     .concat();
     let server = serve([Reply::open_sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key")
-        .with_idle_timeout(std::time::Duration::from_secs(30))
-        .with_overall_timeout(std::time::Duration::from_secs(5));
-    let mut response = openai::raw_stream(&model, &context, &options)
-        .await
-        .unwrap();
+    let options = options(|options| {
+        options.stream.timeout = Some(std::time::Duration::from_secs(5));
+    });
+    let mut response = openai::stream(&model, &context, &options);
 
-    assert!(matches!(
+    while !matches!(
         response.next().await,
-        Some(Ok(Event::TextDelta { .. }))
-    ));
+        Some(AssistantMessageEvent::TextDelta { .. })
+    ) {}
     tokio::time::pause();
     let next = tokio::spawn(async move { response.next().await });
     tokio::time::advance(std::time::Duration::from_secs(5)).await;
 
     match next.await.unwrap() {
-        Some(Err(ds_ai::Error::Timeout {
-            phase,
-            partial: Some(partial),
-        })) => {
-            assert_eq!(phase, ds_ai::TimeoutPhase::Overall);
-            assert_eq!(partial.stop_reason, StopReason::Error);
-            assert_eq!(partial.raw_stop_reason.as_deref(), Some("timeout.overall"));
-            assert_eq!(partial.content, [ds_ai::Content::Text("Visible".into())]);
+        Some(AssistantMessageEvent::Error { reason, error }) => {
+            assert_eq!(reason, StopReason::Error);
+            assert_eq!(error.stop_reason, StopReason::Error);
+            assert_eq!(error.raw_stop_reason.as_deref(), Some("timeout.overall"));
+            assert_eq!(error.content, [text("Visible", None)]);
         }
         event => panic!("unexpected timeout event: {event:?}"),
     }
@@ -1435,27 +1231,22 @@ async fn enforces_an_overall_openai_stream_deadline() {
 async fn encodes_openai_prompt_cache_retention_and_session_keys() {
     let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cache\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
     let server = serve([Reply::sse(sse), Reply::sse(sse)]).await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
     let session_id = "🦀".repeat(70);
-    let long = openai::Options::new("test-key")
-        .with_session_id(&session_id)
-        .with_cache_retention(ds_ai::CacheRetention::Long);
+    let long = options(|options| {
+        options.stream.session_id = Some(session_id.clone());
+        options.stream.cache_retention = CacheRetention::Long;
+    });
+    let first = events(&model, &context, &long).await;
+    done(&first);
 
-    openai::raw_stream(&model, &context, &long)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
-
-    let disabled = openai::Options::new("test-key")
-        .with_session_id(&session_id)
-        .with_cache_retention(ds_ai::CacheRetention::None);
-    openai::raw_stream(&model, &context, &disabled)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let disabled = options(|options| {
+        options.stream.session_id = Some(session_id.clone());
+        options.stream.cache_retention = CacheRetention::None;
+    });
+    let second = events(&model, &context, &disabled).await;
+    done(&second);
 
     let requests = server.requests().await;
     let long_body: Value =
@@ -1484,30 +1275,48 @@ async fn preserves_openai_http_error_and_response_metadata() {
     .with_header("x-ratelimit-remaining-requests", "0")
     .with_header("x-ratelimit-reset-requests", "1s");
     let failure_server = serve([failure]).await;
-    let failure_model = openai::Model::new("gpt-5.6").with_base_url(&failure_server.base_url);
+    let failure_model = model(&failure_server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key");
-
-    match openai::raw_stream(&failure_model, &context, &options).await {
-        Err(ds_ai::Error::Provider {
-            status,
-            code,
-            message,
-            request_id,
-            retry_after,
-            rate_limits,
-        }) => {
-            assert_eq!(status, 429);
-            assert_eq!(code.as_deref(), Some("rate_limit_exceeded"));
-            assert_eq!(message, "Too many requests");
-            assert_eq!(request_id.as_deref(), Some("req_failure"));
-            assert_eq!(retry_after, Some(std::time::Duration::from_millis(250)));
-            assert_eq!(rate_limits.limit_requests, Some(100));
-            assert_eq!(rate_limits.remaining_requests, Some(0));
-            assert_eq!(rate_limits.reset_requests.as_deref(), Some("1s"));
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let captured = responses.clone();
+    let mut options = options(|_| {});
+    options.stream.on_response = Some(ResponseHook::new(move |response, _| {
+        let captured = captured.clone();
+        async move {
+            captured.lock().unwrap().push(response);
+            Ok(())
         }
-        _ => panic!("unexpected provider result"),
-    }
+    }));
+
+    let failure_events = events(&failure_model, &context, &options).await;
+    assert_eq!(
+        failed(&failure_events).error_message.as_deref(),
+        Some("provider returned HTTP 429: Too many requests")
+    );
+    let failure_response = responses.lock().unwrap()[0].clone();
+    assert_eq!(failure_response.status, 429);
+    assert_eq!(
+        failure_response
+            .headers
+            .get("x-request-id")
+            .map(String::as_str),
+        Some("req_failure")
+    );
+    assert_eq!(
+        failure_response
+            .headers
+            .get("retry-after-ms")
+            .map(String::as_str),
+        Some("250")
+    );
+    assert_eq!(
+        failure_response
+            .headers
+            .get("x-ratelimit-remaining-requests")
+            .map(String::as_str),
+        Some("0")
+    );
+    failure_server.requests().await;
 
     let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_metadata\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
     let success = Reply::sse(sse)
@@ -1516,32 +1325,112 @@ async fn preserves_openai_http_error_and_response_metadata() {
         .with_header("x-ratelimit-remaining-tokens", "900")
         .with_header("x-ratelimit-reset-tokens", "2s");
     let success_server = serve([success]).await;
-    let success_model = openai::Model::new("gpt-5.6").with_base_url(&success_server.base_url);
-    let events = openai::raw_stream(&success_model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
-    let response = done(&events);
-    assert_eq!(response.metadata.request_id.as_deref(), Some("req_success"));
-    assert_eq!(response.metadata.rate_limits.limit_tokens, Some(1000));
-    assert_eq!(response.metadata.rate_limits.remaining_tokens, Some(900));
+    let success_model = model(&success_server.base_url);
+    let success_events = events(&success_model, &context, &options).await;
+    done(&success_events);
+    let success_response = responses.lock().unwrap()[1].clone();
+    assert_eq!(success_response.status, 200);
     assert_eq!(
-        response.metadata.rate_limits.reset_tokens.as_deref(),
+        success_response
+            .headers
+            .get("x-request-id")
+            .map(String::as_str),
+        Some("req_success")
+    );
+    assert_eq!(
+        success_response
+            .headers
+            .get("x-ratelimit-limit-tokens")
+            .map(String::as_str),
+        Some("1000")
+    );
+    assert_eq!(
+        success_response
+            .headers
+            .get("x-ratelimit-remaining-tokens")
+            .map(String::as_str),
+        Some("900")
+    );
+    assert_eq!(
+        success_response
+            .headers
+            .get("x-ratelimit-reset-tokens")
+            .map(String::as_str),
         Some("2s")
     );
+    success_server.requests().await;
 }
 
-fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {
+fn model(base_url: &str) -> ds_ai::Model {
+    let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    model.id = "gpt-5.6".into();
+    model.name = "gpt-5.6".into();
+    model.base_url = base_url.into();
+    model
+}
+
+fn options(configure: impl FnOnce(&mut OpenAiResponsesOptions)) -> OpenAiResponsesOptions {
+    let mut options = OpenAiResponsesOptions {
+        stream: StreamOptions {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    configure(&mut options);
+    options
+}
+
+async fn events(
+    model: &ds_ai::Model,
+    context: &Context,
+    options: &OpenAiResponsesOptions,
+) -> Vec<AssistantMessageEvent> {
+    openai::stream(model, context, options).collect().await
+}
+
+fn text(value: &str, signature: Option<(&str, Option<&str>)>) -> AssistantContent {
+    AssistantContent::Text(TextContent {
+        text: value.into(),
+        text_signature: signature.map(|(id, phase)| {
+            json!({
+                "v": 1,
+                "id": id,
+                "phase": phase,
+            })
+            .to_string()
+        }),
+    })
+}
+
+fn thinking(value: &str, id: Option<&str>, encrypted: Option<&str>) -> AssistantContent {
+    AssistantContent::Thinking(ThinkingContent {
+        thinking: value.into(),
+        thinking_signature: id.map(|id| {
+            let mut signature = json!({
+                "type": "reasoning",
+                "id": id,
+                "summary": [{"type": "summary_text", "text": value}],
+            });
+            if let Some(encrypted) = encrypted {
+                signature["encrypted_content"] = encrypted.into();
+            }
+            signature.to_string()
+        }),
+        redacted: None,
+    })
+}
+
+fn done(events: &[AssistantMessageEvent]) -> &AssistantMessage {
     match events.last() {
-        Some(Ok(Event::Done(response))) => response,
+        Some(AssistantMessageEvent::Done { message, .. }) => message,
         _ => panic!("stream did not complete"),
     }
 }
 
-fn incomplete(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {
+fn failed(events: &[AssistantMessageEvent]) -> &AssistantMessage {
     match events.last() {
-        Some(Err(ds_ai::Error::IncompleteStream { partial })) => partial,
-        _ => panic!("stream was not incomplete"),
+        Some(AssistantMessageEvent::Error { error, .. }) => error,
+        event => panic!("stream did not fail: {event:?}"),
     }
 }
