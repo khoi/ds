@@ -111,6 +111,88 @@ async fn normalizes_a_cross_provider_tool_transcript() {
     );
 }
 
+#[tokio::test]
+async fn replays_an_anthropic_transcript_to_openai() {
+    let source_sse = [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_source\",\"usage\":{}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"Working\"}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu/1|foreign\",\"name\":\"inspect\",\"input\":{\"path\":\"README.md\"}}}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let source_server = serve([Reply::sse(source_sse)]).await;
+    let source_model =
+        anthropic::Model::new("claude-sonnet-4-5").with_base_url(&source_server.base_url);
+    let source = anthropic::stream(
+        &source_model,
+        &Context::new([Message::user("Run")]),
+        &anthropic::Options::new("test-key").with_cache_retention(CacheRetention::None),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+    let source = done(&source).clone();
+    source_server.requests().await;
+
+    let target_sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_target\",\"usage\":{}}}\n\n";
+    let target_server = serve([Reply::sse(target_sse)]).await;
+    let target_model = openai::Model::new("gpt-5.6").with_base_url(&target_server.base_url);
+    openai::stream(
+        &target_model,
+        &Context::new([
+            Message::user("Run"),
+            Message::assistant(source),
+            Message::tool_result(ToolResult::new(
+                "toolu/1|foreign",
+                "inspect",
+                [InputContent::text("done")],
+            )),
+            Message::user("Continue"),
+        ]),
+        &openai::Options::new("test-key").with_cache_retention(CacheRetention::None),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+
+    let request = target_server.requests().await.pop().unwrap();
+    let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        body["input"],
+        json!([
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Run"}]
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Working", "annotations": []}],
+                "status": "completed",
+                "id": "msg_ds_1_0"
+            },
+            {
+                "type": "function_call",
+                "call_id": "toolu_1",
+                "name": "inspect",
+                "arguments": "{\"path\":\"README.md\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "toolu_1",
+                "output": "done"
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Continue"}]
+            }
+        ])
+    );
+}
+
 fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {
     match events.last() {
         Some(Ok(Event::Done(response))) => response,

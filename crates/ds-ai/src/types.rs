@@ -376,3 +376,18 @@ pub enum CacheRetention {
 }
 
 pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send>>;
+
+pub(crate) fn normalize_id(id: &str) -> String {
+    let id = id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect::<String>();
+    if id.is_empty() { "_".into() } else { id }
+}

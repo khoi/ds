@@ -1,7 +1,8 @@
 use crate::{
     CacheRetention, Content, Context, Error, Event, InputContent, Message, Response,
     ResponseMetadata, ResponseStream, StopReason, TimeoutPhase, ToolCall, ToolResult, Usage, http,
-    json, retry, schema, transport, types::OpenAiReplay,
+    json, retry, schema, transport,
+    types::{OpenAiReplay, normalize_id},
 };
 use async_stream::stream;
 use futures_core::Stream;
@@ -189,7 +190,7 @@ impl Options {
 #[derive(Serialize)]
 struct Request<'a> {
     model: &'a str,
-    input: Vec<RequestItem<'a>>,
+    input: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<RequestTool>,
     stream: bool,
@@ -210,87 +211,6 @@ struct Request<'a> {
     prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_retention: Option<&'static str>,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum RequestItem<'a> {
-    User(RequestUser<'a>),
-    Reasoning(RequestReasoning<'a>),
-    Assistant(RequestAssistant<'a>),
-    FunctionCall(RequestFunctionCall<'a>),
-    FunctionOutput(RequestFunctionOutput<'a>),
-}
-
-#[derive(Serialize)]
-struct RequestUser<'a> {
-    role: &'static str,
-    content: Vec<RequestInputContent<'a>>,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum RequestInputContent<'a> {
-    Text {
-        r#type: &'static str,
-        text: &'a str,
-    },
-    Image {
-        r#type: &'static str,
-        detail: &'static str,
-        image_url: String,
-    },
-}
-
-#[derive(Serialize)]
-struct RequestReasoning<'a> {
-    r#type: &'static str,
-    id: &'a str,
-    summary: [RequestSummary<'a>; 1],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    encrypted_content: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-struct RequestSummary<'a> {
-    r#type: &'static str,
-    text: &'a str,
-}
-
-#[derive(Serialize)]
-struct RequestAssistant<'a> {
-    r#type: &'static str,
-    role: &'static str,
-    content: [RequestAssistantContent<'a>; 1],
-    status: &'static str,
-    id: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    phase: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-struct RequestAssistantContent<'a> {
-    r#type: &'static str,
-    text: &'a str,
-    annotations: [(); 0],
-}
-
-#[derive(Serialize)]
-struct RequestFunctionCall<'a> {
-    r#type: &'static str,
-    id: &'a str,
-    call_id: &'a str,
-    name: &'a str,
-    arguments: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    namespace: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-struct RequestFunctionOutput<'a> {
-    r#type: &'static str,
-    call_id: &'a str,
-    output: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -467,119 +387,7 @@ pub async fn stream(
     let overall_deadline = options
         .overall_timeout
         .map(|timeout| Instant::now() + timeout);
-    let mut input = Vec::new();
-    if let Some(system) = context.system() {
-        input.push(RequestItem::User(RequestUser {
-            role: "developer",
-            content: vec![RequestInputContent::Text {
-                r#type: "input_text",
-                text: system,
-            }],
-        }));
-    }
-    for message in context.messages() {
-        match message {
-            Message::User(content) => input.push(RequestItem::User(RequestUser {
-                role: "user",
-                content: request_input_content(content),
-            })),
-            Message::Assistant(response) => {
-                let Some(items) = response.openai_items(&model.id) else {
-                    continue;
-                };
-                for (content_index, content) in response.content.iter().enumerate() {
-                    match content {
-                        Content::Reasoning(text) => {
-                            let Some(OpenAiReplay::Reasoning {
-                                id,
-                                encrypted_content,
-                                ..
-                            }) = items.iter().find(|item| {
-                                matches!(
-                                    item,
-                                    OpenAiReplay::Reasoning {
-                                        content_index: index,
-                                        ..
-                                    } if *index == content_index
-                                )
-                            })
-                            else {
-                                continue;
-                            };
-                            input.push(RequestItem::Reasoning(RequestReasoning {
-                                r#type: "reasoning",
-                                id,
-                                summary: [RequestSummary {
-                                    r#type: "summary_text",
-                                    text,
-                                }],
-                                encrypted_content: encrypted_content.as_deref(),
-                            }));
-                        }
-                        Content::Text(text) => {
-                            let Some(OpenAiReplay::Message { id, phase, .. }) =
-                                items.iter().find(|item| {
-                                    matches!(
-                                        item,
-                                        OpenAiReplay::Message {
-                                            content_index: index,
-                                            ..
-                                        } if *index == content_index
-                                    )
-                                })
-                            else {
-                                continue;
-                            };
-                            input.push(RequestItem::Assistant(RequestAssistant {
-                                r#type: "message",
-                                role: "assistant",
-                                content: [RequestAssistantContent {
-                                    r#type: "output_text",
-                                    text,
-                                    annotations: [],
-                                }],
-                                status: "completed",
-                                id,
-                                phase: phase.as_deref(),
-                            }));
-                        }
-                        Content::ToolCall(call) => {
-                            let Some(OpenAiReplay::ToolCall {
-                                item_id, namespace, ..
-                            }) = items.iter().find(|item| {
-                                matches!(
-                                    item,
-                                    OpenAiReplay::ToolCall {
-                                        content_index: index,
-                                        ..
-                                    } if *index == content_index
-                                )
-                            })
-                            else {
-                                continue;
-                            };
-                            input.push(RequestItem::FunctionCall(RequestFunctionCall {
-                                r#type: "function_call",
-                                id: item_id,
-                                call_id: &call.id,
-                                name: &call.name,
-                                arguments: serde_json::to_string(&call.arguments)
-                                    .expect("tool arguments serialize"),
-                                namespace: namespace.as_deref(),
-                            }));
-                        }
-                    }
-                }
-            }
-            Message::ToolResult(result) => {
-                input.push(RequestItem::FunctionOutput(RequestFunctionOutput {
-                    r#type: "function_call_output",
-                    call_id: &result.id,
-                    output: tool_result_output(result),
-                }));
-            }
-        }
-    }
+    let input = response_input(&model.id, context, true);
     let tools = context
         .tools()
         .iter()
@@ -661,6 +469,134 @@ pub async fn stream(
         options.idle_timeout,
         overall_deadline,
     ))
+}
+
+fn fallback_message_id(message_index: usize, text_index: usize) -> String {
+    format!("msg_ds_{message_index}_{text_index}")
+}
+
+fn openai_call_id(id: &str) -> String {
+    normalize_id(id.split('|').next().unwrap_or(id))
+}
+
+pub(crate) fn response_input(
+    model: &str,
+    context: &Context,
+    include_system: bool,
+) -> Vec<serde_json::Value> {
+    let mut input = Vec::new();
+    if include_system && let Some(system) = context.system() {
+        input.push(serde_json::json!({
+            "role": "developer",
+            "content": [{"type": "input_text", "text": system}]
+        }));
+    }
+    for (message_index, message) in context.messages().iter().enumerate() {
+        match message {
+            Message::User(content) => input.push(serde_json::json!({
+                "role": "user",
+                "content": content.iter().map(response_input_content).collect::<Vec<_>>()
+            })),
+            Message::Assistant(response) => {
+                let items = response.openai_items(model).unwrap_or_default();
+                let mut text_index = 0;
+                for (content_index, content) in response.content.iter().enumerate() {
+                    let replay = items.iter().find(|item| match item {
+                        OpenAiReplay::Reasoning {
+                            content_index: index,
+                            ..
+                        }
+                        | OpenAiReplay::Message {
+                            content_index: index,
+                            ..
+                        }
+                        | OpenAiReplay::ToolCall {
+                            content_index: index,
+                            ..
+                        } => *index == content_index,
+                    });
+                    match (content, replay) {
+                        (
+                            Content::Reasoning(text),
+                            Some(OpenAiReplay::Reasoning {
+                                id,
+                                encrypted_content,
+                                ..
+                            }),
+                        ) => {
+                            let mut item = serde_json::json!({
+                                "type": "reasoning",
+                                "id": id,
+                                "summary": [{"type": "summary_text", "text": text}]
+                            });
+                            if let Some(encrypted_content) = encrypted_content {
+                                item["encrypted_content"] = encrypted_content.clone().into();
+                            }
+                            input.push(item);
+                        }
+                        (Content::Reasoning(text) | Content::Text(text), _) if !text.is_empty() => {
+                            let mut item = serde_json::json!({
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "output_text",
+                                    "text": text,
+                                    "annotations": []
+                                }],
+                                "status": "completed",
+                                "id": fallback_message_id(message_index, text_index)
+                            });
+                            if let Some(OpenAiReplay::Message { id, phase, .. }) = replay {
+                                item["id"] = id.clone().into();
+                                if let Some(phase) = phase {
+                                    item["phase"] = phase.clone().into();
+                                }
+                            }
+                            input.push(item);
+                            text_index += 1;
+                        }
+                        (Content::ToolCall(call), replay) => {
+                            let mut item = serde_json::json!({
+                                "type": "function_call",
+                                "call_id": openai_call_id(&call.id),
+                                "name": call.name,
+                                "arguments": serde_json::to_string(&call.arguments)
+                                    .expect("tool arguments serialize")
+                            });
+                            if let Some(OpenAiReplay::ToolCall {
+                                item_id, namespace, ..
+                            }) = replay
+                            {
+                                item["id"] = item_id.clone().into();
+                                if let Some(namespace) = namespace {
+                                    item["namespace"] = namespace.clone().into();
+                                }
+                            }
+                            input.push(item);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Message::ToolResult(result) => input.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": openai_call_id(&result.id),
+                "output": tool_result_output(result)
+            })),
+        }
+    }
+    input
+}
+
+fn response_input_content(content: &InputContent) -> serde_json::Value {
+    match content {
+        InputContent::Text(text) => serde_json::json!({"type": "input_text", "text": text}),
+        InputContent::Image { media_type, data } => serde_json::json!({
+            "type": "input_image",
+            "detail": "auto",
+            "image_url": format!("data:{media_type};base64,{data}")
+        }),
+    }
 }
 
 pub(crate) fn decode_stream(
@@ -1027,23 +963,6 @@ fn parse_arguments(arguments: &str) -> serde_json::Value {
 
 pub(crate) fn clamp_cache_key(key: &str) -> String {
     key.chars().take(64).collect()
-}
-
-fn request_input_content(content: &[InputContent]) -> Vec<RequestInputContent<'_>> {
-    content
-        .iter()
-        .map(|content| match content {
-            InputContent::Text(text) => RequestInputContent::Text {
-                r#type: "input_text",
-                text,
-            },
-            InputContent::Image { media_type, data } => RequestInputContent::Image {
-                r#type: "input_image",
-                detail: "auto",
-                image_url: format!("data:{media_type};base64,{data}"),
-            },
-        })
-        .collect()
 }
 
 fn usage(usage: CompletedUsage) -> Usage {

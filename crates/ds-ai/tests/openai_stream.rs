@@ -601,6 +601,60 @@ async fn replays_serialized_openai_reasoning_and_message_items() {
 }
 
 #[tokio::test]
+async fn generates_distinct_replay_ids_for_text_without_provider_ids() {
+    let first_sse = [
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"First\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"First\"}]}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"Second\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Second\"}]}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_without_ids\",\"usage\":{}}}\n\n",
+    ]
+    .concat();
+    let done_sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_next\",\"usage\":{}}}\n\n";
+    let server = serve([Reply::sse(first_sse), Reply::sse(done_sse)]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let options = openai::Options::new("test-key");
+    let first = openai::stream(&model, &Context::new([Message::user("Split")]), &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    let replay = done(&first).clone();
+
+    openai::stream(
+        &model,
+        &Context::new([
+            Message::user("Split"),
+            Message::assistant(replay),
+            Message::user("Continue"),
+        ]),
+        &options,
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+
+    let requests = server.requests().await;
+    let body: Value = serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let messages = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "message" && item["role"] == "assistant")
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 2);
+    assert_ne!(messages[0]["id"], messages[1]["id"]);
+    assert!(
+        messages
+            .iter()
+            .all(|message| message["id"].as_str().unwrap().starts_with("msg_ds_"))
+    );
+}
+
+#[tokio::test]
 async fn streams_and_replays_openai_tool_calls() {
     let first_sse = [
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool\"}}\n\n",

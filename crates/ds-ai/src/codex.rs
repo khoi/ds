@@ -1,6 +1,6 @@
 use crate::{
-    CacheRetention, Content, Context, Error, InputContent, Message, ResponseMetadata,
-    ResponseStream, http, openai, retry, schema, transport, types::OpenAiReplay,
+    CacheRetention, Context, Error, ResponseMetadata, ResponseStream, http, openai, retry, schema,
+    transport,
 };
 use base64::prelude::*;
 use futures_util::{SinkExt, StreamExt};
@@ -295,7 +295,7 @@ pub async fn stream(
         store: false,
         stream: true,
         instructions: context.system().unwrap_or("You are a helpful assistant."),
-        input: input(model, context),
+        input: openai::response_input(&model.id, context, false),
         tools: tools(context).map_err(Error::InvalidRequest)?,
         text: TextOptions {
             verbosity: options.text_verbosity,
@@ -977,7 +977,12 @@ fn continuation_request(
         .cloned()
         .unwrap_or_default();
     baseline.extend(continuation.response_items.iter().cloned());
-    if current.len() < baseline.len() || current[..baseline.len()] != baseline {
+    if current.len() < baseline.len()
+        || !current[..baseline.len()]
+            .iter()
+            .zip(&baseline)
+            .all(|(current, baseline)| equivalent_json(current, baseline))
+    {
         return request.clone();
     }
     let mut request = request.clone();
@@ -988,6 +993,35 @@ fn continuation_request(
     );
     request.insert("input".into(), current[baseline.len()..].to_vec().into());
     serde_json::Value::Object(request.clone())
+}
+
+fn equivalent_json(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    match (left, right) {
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            left.iter()
+                .filter(|(_, value)| !value.is_null())
+                .all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|right| equivalent_json(value, right))
+                })
+                && right
+                    .iter()
+                    .filter(|(_, value)| !value.is_null())
+                    .all(|(key, value)| {
+                        left.get(key)
+                            .is_some_and(|left| equivalent_json(left, value))
+                    })
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| equivalent_json(left, right))
+        }
+        _ => left == right,
+    }
 }
 
 fn request_configuration(request: &serde_json::Value) -> serde_json::Value {
@@ -1062,95 +1096,6 @@ fn websocket_url(base_url: &str) -> String {
     response_url(base_url)
         .replacen("https://", "wss://", 1)
         .replacen("http://", "ws://", 1)
-}
-
-fn input(model: &Model, context: &Context) -> Vec<serde_json::Value> {
-    let mut input = Vec::new();
-    for message in context.messages() {
-        match message {
-            Message::User(content) => input.push(serde_json::json!({
-                "role": "user",
-                "content": content.iter().map(input_content).collect::<Vec<_>>()
-            })),
-            Message::Assistant(response) => {
-                let Some(items) = response.openai_items(&model.id) else {
-                    continue;
-                };
-                for (content_index, content) in response.content.iter().enumerate() {
-                    let item = items.iter().find(|item| match item {
-                        OpenAiReplay::Reasoning {
-                            content_index: index,
-                            ..
-                        }
-                        | OpenAiReplay::Message {
-                            content_index: index,
-                            ..
-                        }
-                        | OpenAiReplay::ToolCall {
-                            content_index: index,
-                            ..
-                        } => *index == content_index,
-                    });
-                    match (content, item) {
-                        (
-                            Content::Reasoning(text),
-                            Some(OpenAiReplay::Reasoning {
-                                id,
-                                encrypted_content,
-                                ..
-                            }),
-                        ) => input.push(serde_json::json!({
-                            "type": "reasoning",
-                            "id": id,
-                            "summary": [{"type": "summary_text", "text": text}],
-                            "encrypted_content": encrypted_content
-                        })),
-                        (Content::Text(text), Some(OpenAiReplay::Message { id, phase, .. })) => {
-                            input.push(serde_json::json!({
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [{"type": "output_text", "text": text, "annotations": []}],
-                                "status": "completed",
-                                "id": id,
-                                "phase": phase
-                            }));
-                        }
-                        (
-                            Content::ToolCall(call),
-                            Some(OpenAiReplay::ToolCall {
-                                item_id, namespace, ..
-                            }),
-                        ) => input.push(serde_json::json!({
-                            "type": "function_call",
-                            "id": item_id,
-                            "call_id": call.id,
-                            "name": call.name,
-                            "arguments": serde_json::to_string(&call.arguments).expect("tool arguments serialize"),
-                            "namespace": namespace
-                        })),
-                        _ => {}
-                    }
-                }
-            }
-            Message::ToolResult(result) => input.push(serde_json::json!({
-                "type": "function_call_output",
-                "call_id": result.id,
-                "output": openai::tool_result_output(result)
-            })),
-        }
-    }
-    input
-}
-
-fn input_content(content: &InputContent) -> serde_json::Value {
-    match content {
-        InputContent::Text(text) => serde_json::json!({"type": "input_text", "text": text}),
-        InputContent::Image { media_type, data } => serde_json::json!({
-            "type": "input_image",
-            "detail": "auto",
-            "image_url": format!("data:{media_type};base64,{data}")
-        }),
-    }
 }
 
 fn tools(context: &Context) -> Result<Vec<serde_json::Value>, String> {

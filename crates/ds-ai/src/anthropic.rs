@@ -1,7 +1,7 @@
 use crate::{
     CacheRetention, Content, Context, Error, Event, InputContent, Message, Response,
     ResponseStream, StopReason, ToolResult, Usage, http, json, retry, schema, transport,
-    types::AnthropicReasoning,
+    types::{AnthropicReasoning, normalize_id},
 };
 use async_stream::stream;
 use serde::{Deserialize, Serialize};
@@ -729,7 +729,7 @@ fn messages(
                 let content = assistant_content(model, response);
                 pending_tool_calls.extend(response.content.iter().filter_map(|content| {
                     if let Content::ToolCall(call) = content {
-                        Some(normalize_tool_id(&call.id))
+                        Some(normalize_id(&call.id))
                     } else {
                         None
                     }
@@ -737,7 +737,7 @@ fn messages(
                 push_message(&mut messages, "assistant", content);
             }
             Message::ToolResult(result) => {
-                let id = normalize_tool_id(&result.id);
+                let id = normalize_id(&result.id);
                 tool_results.insert(id.clone());
                 push_message(&mut messages, "user", vec![tool_result(result, &id)]);
             }
@@ -839,7 +839,7 @@ fn assistant_content(model: &Model, response: &Response) -> Vec<serde_json::Valu
             Content::Text(text) => Some(serde_json::json!({"type": "text", "text": text})),
             Content::ToolCall(call) => Some(serde_json::json!({
                 "type": "tool_use",
-                "id": normalize_tool_id(&call.id),
+                "id": normalize_id(&call.id),
                 "name": call.name,
                 "input": call.arguments
             })),
@@ -887,21 +887,6 @@ fn assistant_content(model: &Model, response: &Response) -> Vec<serde_json::Valu
             }
         })
         .collect()
-}
-
-fn normalize_tool_id(id: &str) -> String {
-    let id = id
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .take(64)
-        .collect::<String>();
-    if id.is_empty() { "_".into() } else { id }
 }
 
 fn parse_arguments(arguments: &str) -> serde_json::Value {
