@@ -19,7 +19,11 @@ use tokio::{
 };
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Message as WebSocketMessage, client::IntoClientRequest, http::HeaderValue},
+    tungstenite::{
+        Message as WebSocketMessage,
+        client::IntoClientRequest,
+        http::{HeaderName, HeaderValue},
+    },
 };
 use tokio_util::sync::CancellationToken;
 
@@ -63,6 +67,7 @@ impl Provider {
         let options = options.clone();
         crate::legacy::adapt(requested_model.clone(), async move {
             let stream_options = options.stream;
+            let request_hooks = stream_options.request_hooks(&requested_model);
             let access_token = stream_options
                 .api_key
                 .ok_or_else(|| Error::InvalidRequest("Codex access token is required".into()))?;
@@ -72,7 +77,8 @@ impl Provider {
                 .with_cancellation(stream_options.cancellation)
                 .with_max_retries(stream_options.max_retries.unwrap_or_default())
                 .with_max_retry_delay(stream_options.max_retry_delay)
-                .with_cache_retention(stream_options.cache_retention);
+                .with_cache_retention(stream_options.cache_retention)
+                .with_request_options(stream_options.headers, request_hooks);
             let compat = match &requested_model.compat {
                 Some(crate::ModelCompatibility::OpenAi(compat)) => compat.clone(),
                 _ => Default::default(),
@@ -449,6 +455,8 @@ pub struct Options {
     deferred_tools_mode: Option<DeferredToolsMode>,
     supports_strict_mode: bool,
     supports_grammar_tools: bool,
+    headers: BTreeMap<String, Option<String>>,
+    request_hooks: Option<crate::provider::RequestHooks>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -498,6 +506,8 @@ impl Options {
             deferred_tools_mode: None,
             supports_strict_mode: true,
             supports_grammar_tools: false,
+            headers: BTreeMap::new(),
+            request_hooks: None,
         }
     }
 
@@ -596,6 +606,16 @@ impl Options {
         self.supports_grammar_tools = compat.supports_open_ai_grammar_tools.unwrap_or(false);
         self
     }
+
+    fn with_request_options(
+        mut self,
+        headers: BTreeMap<String, Option<String>>,
+        request_hooks: crate::provider::RequestHooks,
+    ) -> Self {
+        self.headers = headers;
+        self.request_hooks = Some(request_hooks);
+        self
+    }
 }
 
 #[derive(Serialize)]
@@ -648,6 +668,8 @@ struct SseRequest {
     idle_timeout: Option<Duration>,
     overall_deadline: Option<Instant>,
     grammar_input_properties: BTreeMap<String, String>,
+    headers: BTreeMap<String, Option<String>>,
+    request_hooks: Option<crate::provider::RequestHooks>,
 }
 
 pub async fn stream(
@@ -708,6 +730,10 @@ pub async fn stream(
     };
     let value =
         serde_json::to_value(&request).map_err(|error| Error::InvalidRequest(error.to_string()))?;
+    let value = match &options.request_hooks {
+        Some(hooks) => hooks.payload(value).await?,
+        None => value,
+    };
     let json =
         serde_json::to_vec(&value).map_err(|error| Error::InvalidRequest(error.to_string()))?;
     let sse_request = SseRequest {
@@ -725,6 +751,8 @@ pub async fn stream(
         idle_timeout: options.idle_timeout,
         overall_deadline,
         grammar_input_properties: grammar_input_properties.clone(),
+        headers: options.headers.clone(),
+        request_hooks: options.request_hooks.clone(),
     };
     if options.transport != Transport::Sse {
         let mut websocket_value = value.clone();
@@ -741,6 +769,7 @@ pub async fn stream(
                 session_id: session_id.as_deref(),
                 body: websocket_value,
                 grammar_input_properties: &grammar_input_properties,
+                headers: &options.headers,
             },
             options,
             overall_deadline,
@@ -788,6 +817,29 @@ async fn sse_stream(request: &SseRequest) -> Result<ResponseStream, Error> {
         .map_err(|error| Error::Compression(error.to_string()))?;
     let client = reqwest::Client::new();
     let url = response_url(&request.base_url);
+    let mut headers =
+        http::request_headers(BTreeMap::new(), &request.headers).map_err(Error::InvalidRequest)?;
+    let mut fixed = BTreeMap::from([
+        (
+            "authorization".into(),
+            format!("Bearer {}", request.access_token),
+        ),
+        ("chatgpt-account-id".into(), request.account_id.clone()),
+        ("openai-beta".into(), "responses=experimental".into()),
+        ("originator".into(), "ds".into()),
+        (
+            "user-agent".into(),
+            concat!("ds-ai/", env!("CARGO_PKG_VERSION")).into(),
+        ),
+        ("accept".into(), "text/event-stream".into()),
+        ("content-type".into(), "application/json".into()),
+        ("content-encoding".into(), "zstd".into()),
+    ]);
+    if let Some(session_id) = &request.session_id {
+        fixed.insert("session-id".into(), session_id.clone());
+        fixed.insert("x-client-request-id".into(), session_id.clone());
+    }
+    headers.extend(http::request_headers(fixed, &BTreeMap::new()).map_err(Error::InvalidRequest)?);
     let response = transport::connect(
         retry::send(
             retry::Policy {
@@ -796,22 +848,17 @@ async fn sse_stream(request: &SseRequest) -> Result<ResponseStream, Error> {
                 cancellation: &request.cancellation,
             },
             || {
-                let mut builder = client
+                client
                     .post(&url)
-                    .bearer_auth(&request.access_token)
-                    .header("chatgpt-account-id", &request.account_id)
-                    .header("openai-beta", "responses=experimental")
-                    .header("originator", "ds")
-                    .header("user-agent", concat!("ds-ai/", env!("CARGO_PKG_VERSION")))
-                    .header("accept", "text/event-stream")
-                    .header("content-type", "application/json")
-                    .header("content-encoding", "zstd");
-                if let Some(session_id) = &request.session_id {
-                    builder = builder
-                        .header("session-id", session_id)
-                        .header("x-client-request-id", session_id);
+                    .headers(headers.clone())
+                    .body(body.clone())
+                    .send()
+            },
+            |response| async {
+                match &request.request_hooks {
+                    Some(hooks) => hooks.response(response).await,
+                    None => Ok(()),
                 }
-                builder.body(body.clone()).send()
             },
         ),
         request.connection_timeout,
@@ -866,6 +913,7 @@ struct WebSocketRequest<'a> {
     session_id: Option<&'a str>,
     body: serde_json::Value,
     grammar_input_properties: &'a BTreeMap<String, String>,
+    headers: &'a BTreeMap<String, Option<String>>,
 }
 
 #[derive(Clone)]
@@ -874,6 +922,7 @@ struct WebSocketHandshake {
     access_token: String,
     account_id: String,
     request_id: String,
+    headers: BTreeMap<String, Option<String>>,
 }
 
 async fn websocket_stream(
@@ -896,6 +945,7 @@ async fn websocket_stream(
         access_token: request.access_token.to_owned(),
         account_id: request.account_id.to_owned(),
         request_id,
+        headers: request.headers.clone(),
     };
     let cached = cache_key
         .as_deref()
@@ -1234,6 +1284,21 @@ async fn connect_websocket(
         .as_str()
         .into_client_request()
         .map_err(|_| WebSocketConnectError::Transport)?;
+    for (name, value) in &handshake.headers {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| WebSocketConnectError::Transport)?;
+        match value {
+            Some(value) => {
+                connection_request.headers_mut().insert(
+                    name,
+                    HeaderValue::from_str(value).map_err(|_| WebSocketConnectError::Transport)?,
+                );
+            }
+            None => {
+                connection_request.headers_mut().remove(name);
+            }
+        }
+    }
     for (name, value) in [
         (
             "authorization",

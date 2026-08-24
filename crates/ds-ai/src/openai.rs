@@ -50,6 +50,7 @@ impl Provider {
         let options = options.clone();
         crate::legacy::adapt(requested_model.clone(), async move {
             let stream_options = options.stream;
+            let request_hooks = stream_options.request_hooks(&requested_model);
             let api_key = stream_options
                 .api_key
                 .ok_or_else(|| Error::InvalidRequest("OpenAI API key is required".into()))?;
@@ -59,7 +60,8 @@ impl Provider {
                 .with_cancellation(stream_options.cancellation)
                 .with_max_retries(stream_options.max_retries.unwrap_or_default())
                 .with_max_retry_delay(stream_options.max_retry_delay)
-                .with_cache_retention(stream_options.cache_retention);
+                .with_cache_retention(stream_options.cache_retention)
+                .with_request_options(stream_options.headers, request_hooks);
             let compat = match &requested_model.compat {
                 Some(crate::ModelCompatibility::OpenAi(compat)) => compat.clone(),
                 _ => Default::default(),
@@ -242,6 +244,8 @@ pub struct Options {
     supports_strict_mode: bool,
     supports_grammar_tools: bool,
     supports_explicit_prompt_cache_mode: bool,
+    headers: BTreeMap<String, Option<String>>,
+    request_hooks: Option<crate::provider::RequestHooks>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -311,6 +315,8 @@ impl Options {
             supports_strict_mode: true,
             supports_grammar_tools: false,
             supports_explicit_prompt_cache_mode: true,
+            headers: BTreeMap::new(),
+            request_hooks: None,
         }
     }
 
@@ -404,6 +410,16 @@ impl Options {
         self.supports_grammar_tools = compat.supports_open_ai_grammar_tools.unwrap_or(false);
         self.supports_explicit_prompt_cache_mode =
             compat.supports_explicit_prompt_cache_mode.unwrap_or(false);
+        self
+    }
+
+    fn with_request_options(
+        mut self,
+        headers: BTreeMap<String, Option<String>>,
+        request_hooks: crate::provider::RequestHooks,
+    ) -> Self {
+        self.headers = headers;
+        self.request_hooks = Some(request_hooks);
         self
     }
 }
@@ -723,6 +739,23 @@ pub async fn stream(
         .as_object_mut()
         .ok_or_else(|| Error::InvalidRequest("request body must be an object".into()))?;
     fields.extend(options.sampling_params.clone());
+    let request = match &options.request_hooks {
+        Some(hooks) => hooks.payload(request).await?,
+        None => request,
+    };
+    let body =
+        serde_json::to_vec(&request).map_err(|error| Error::InvalidRequest(error.to_string()))?;
+    let headers = http::request_headers(
+        BTreeMap::from([
+            (
+                "authorization".into(),
+                format!("Bearer {}", options.api_key),
+            ),
+            ("content-type".into(), "application/json".into()),
+        ]),
+        &options.headers,
+    )
+    .map_err(Error::InvalidRequest)?;
     let client = reqwest::Client::new();
     let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
     let response = transport::connect(
@@ -735,9 +768,15 @@ pub async fn stream(
             || {
                 client
                     .post(&url)
-                    .bearer_auth(&options.api_key)
-                    .json(&request)
+                    .headers(headers.clone())
+                    .body(body.clone())
                     .send()
+            },
+            |response| async {
+                match &options.request_hooks {
+                    Some(hooks) => hooks.response(response).await,
+                    None => Ok(()),
+                }
             },
         ),
         options.connection_timeout,

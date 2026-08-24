@@ -48,6 +48,7 @@ impl Provider {
             let thinking = resolve_thinking(&requested_model, &options);
             let tool_choice = options.tool_choice;
             let stream_options = options.stream;
+            let request_hooks = stream_options.request_hooks(&requested_model);
             let api_key = stream_options
                 .api_key
                 .ok_or_else(|| Error::InvalidRequest("Anthropic API key is required".into()))?;
@@ -80,7 +81,8 @@ impl Provider {
                 .with_max_retries(stream_options.max_retries.unwrap_or_default())
                 .with_max_retry_delay(stream_options.max_retry_delay)
                 .with_cache_retention(stream_options.cache_retention)
-                .with_interleaved_thinking(options.interleaved_thinking.unwrap_or(true));
+                .with_interleaved_thinking(options.interleaved_thinking.unwrap_or(true))
+                .with_request_options(stream_options.headers, request_hooks);
             if let Some(temperature) = stream_options.temperature {
                 provider_options = provider_options.with_temperature(temperature);
             }
@@ -396,6 +398,8 @@ pub struct Options {
     tool_choice: Option<ToolChoice>,
     cache_retention: CacheRetention,
     interleaved_thinking: bool,
+    headers: BTreeMap<String, Option<String>>,
+    request_hooks: Option<crate::provider::RequestHooks>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -455,6 +459,8 @@ impl Options {
             tool_choice: None,
             cache_retention: CacheRetention::Short,
             interleaved_thinking: true,
+            headers: BTreeMap::new(),
+            request_hooks: None,
         }
     }
 
@@ -533,6 +539,16 @@ impl Options {
 
     pub fn with_interleaved_thinking(mut self, enabled: bool) -> Self {
         self.interleaved_thinking = enabled;
+        self
+    }
+
+    fn with_request_options(
+        mut self,
+        headers: BTreeMap<String, Option<String>>,
+        request_hooks: crate::provider::RequestHooks,
+    ) -> Self {
+        self.headers = headers;
+        self.request_hooks = Some(request_hooks);
         self
     }
 }
@@ -745,6 +761,14 @@ pub async fn stream(
             .map(|user_id| serde_json::json!({"user_id": user_id})),
         tool_choice: options.tool_choice.as_ref().map(tool_choice),
     };
+    let request =
+        serde_json::to_value(request).map_err(|error| Error::InvalidRequest(error.to_string()))?;
+    let request = match &options.request_hooks {
+        Some(hooks) => hooks.payload(request).await?,
+        None => request,
+    };
+    let body =
+        serde_json::to_vec(&request).map_err(|error| Error::InvalidRequest(error.to_string()))?;
     let client = reqwest::Client::new();
     let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
     let mut beta_features = Vec::new();
@@ -755,6 +779,16 @@ pub async fn stream(
         beta_features.push("interleaved-thinking-2025-05-14");
     }
     let beta_features = beta_features.join(",");
+    let mut default_headers = BTreeMap::from([
+        ("x-api-key".into(), options.api_key.clone()),
+        ("anthropic-version".into(), "2023-06-01".into()),
+        ("content-type".into(), "application/json".into()),
+    ]);
+    if !beta_features.is_empty() {
+        default_headers.insert("anthropic-beta".into(), beta_features);
+    }
+    let headers =
+        http::request_headers(default_headers, &options.headers).map_err(Error::InvalidRequest)?;
     let response = transport::connect(
         retry::send(
             retry::Policy {
@@ -763,16 +797,17 @@ pub async fn stream(
                 cancellation: &options.cancellation,
             },
             || {
-                let builder = client
+                client
                     .post(&url)
-                    .header("x-api-key", &options.api_key)
-                    .header("anthropic-version", "2023-06-01");
-                let builder = if beta_features.is_empty() {
-                    builder
-                } else {
-                    builder.header("anthropic-beta", &beta_features)
-                };
-                builder.json(&request).send()
+                    .headers(headers.clone())
+                    .body(body.clone())
+                    .send()
+            },
+            |response| async {
+                match &options.request_hooks {
+                    Some(hooks) => hooks.response(response).await,
+                    None => Ok(()),
+                }
             },
         ),
         options.connection_timeout,

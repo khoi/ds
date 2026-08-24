@@ -196,10 +196,16 @@ pub(crate) struct Policy<'a> {
     pub cancellation: &'a CancellationToken,
 }
 
-pub(crate) async fn send<F, Fut>(policy: Policy<'_>, mut request: F) -> Result<Response, Error>
+pub(crate) async fn send<F, Fut, O, OFut>(
+    policy: Policy<'_>,
+    mut request: F,
+    mut observe: O,
+) -> Result<Response, Error>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<Response, reqwest::Error>>,
+    O: FnMut(crate::ProviderResponse) -> OFut,
+    OFut: Future<Output = Result<(), Error>>,
 {
     let mut retries = 0;
     loop {
@@ -220,6 +226,7 @@ where
             }
             Err(error) => return Err(Error::Http(error.to_string())),
         };
+        observe(crate::http::provider_response(&response)).await?;
         if response.status().is_success() {
             return Ok(response);
         }

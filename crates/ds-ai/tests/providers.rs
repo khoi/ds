@@ -32,6 +32,8 @@ mod model;
 mod models;
 #[path = "openai_stream.rs"]
 mod openai_stream;
+#[path = "request_options.rs"]
+mod request_options;
 mod support;
 mod transcript;
 mod validation;

@@ -8,11 +8,113 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, stream as futures_stream};
 use std::{
     collections::BTreeMap,
+    fmt,
     future::Future,
+    pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio_util::sync::CancellationToken;
+
+type PayloadFuture =
+    Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, String>> + Send + 'static>>;
+type ResponseFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
+
+#[derive(Clone)]
+pub struct PayloadHook {
+    hook: Arc<dyn Fn(serde_json::Value, Model) -> PayloadFuture + Send + Sync>,
+}
+
+impl PayloadHook {
+    pub fn new<F, Fut>(hook: F) -> Self
+    where
+        F: Fn(serde_json::Value, Model) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<serde_json::Value>, String>> + Send + 'static,
+    {
+        Self {
+            hook: Arc::new(move |payload, model| Box::pin(hook(payload, model))),
+        }
+    }
+
+    async fn run(
+        &self,
+        payload: serde_json::Value,
+        model: Model,
+    ) -> Result<Option<serde_json::Value>, String> {
+        (self.hook)(payload, model).await
+    }
+}
+
+impl fmt::Debug for PayloadHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PayloadHook")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderResponse {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Clone)]
+pub struct ResponseHook {
+    hook: Arc<dyn Fn(ProviderResponse, Model) -> ResponseFuture + Send + Sync>,
+}
+
+impl ResponseHook {
+    pub fn new<F, Fut>(hook: F) -> Self
+    where
+        F: Fn(ProviderResponse, Model) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        Self {
+            hook: Arc::new(move |response, model| Box::pin(hook(response, model))),
+        }
+    }
+
+    async fn run(&self, response: ProviderResponse, model: Model) -> Result<(), String> {
+        (self.hook)(response, model).await
+    }
+}
+
+impl fmt::Debug for ResponseHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ResponseHook")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RequestHooks {
+    model: Model,
+    payload: Option<PayloadHook>,
+    response: Option<ResponseHook>,
+}
+
+impl RequestHooks {
+    pub(crate) async fn payload(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, crate::Error> {
+        let Some(hook) = &self.payload else {
+            return Ok(payload);
+        };
+        Ok(hook
+            .run(payload.clone(), self.model.clone())
+            .await
+            .map_err(crate::Error::Hook)?
+            .unwrap_or(payload))
+    }
+
+    pub(crate) async fn response(&self, response: ProviderResponse) -> Result<(), crate::Error> {
+        let Some(hook) = &self.response else {
+            return Ok(());
+        };
+        hook.run(response, self.model.clone())
+            .await
+            .map_err(crate::Error::Hook)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Transport {
@@ -28,6 +130,8 @@ pub struct StreamOptions {
     pub api_key: Option<String>,
     pub env: BTreeMap<String, String>,
     pub headers: BTreeMap<String, Option<String>>,
+    pub on_payload: Option<PayloadHook>,
+    pub on_response: Option<ResponseHook>,
     pub timeout: Option<Duration>,
     pub max_retries: Option<usize>,
     pub max_retry_delay: Option<Duration>,
@@ -48,6 +152,8 @@ impl Default for StreamOptions {
             api_key: None,
             env: BTreeMap::new(),
             headers: BTreeMap::new(),
+            on_payload: None,
+            on_response: None,
             timeout: None,
             max_retries: Some(2),
             max_retry_delay: Some(Duration::from_secs(60)),
@@ -59,6 +165,16 @@ impl Default for StreamOptions {
             session_id: None,
             websocket_connect_timeout: None,
             metadata: BTreeMap::new(),
+        }
+    }
+}
+
+impl StreamOptions {
+    pub(crate) fn request_hooks(&self, model: &Model) -> RequestHooks {
+        RequestHooks {
+            model: model.clone(),
+            payload: self.on_payload.clone(),
+            response: self.on_response.clone(),
         }
     }
 }
