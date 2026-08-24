@@ -15,6 +15,7 @@ pub struct Reply {
     content_type: &'static str,
     headers: Vec<(&'static str, String)>,
     chunks: Vec<Vec<u8>>,
+    disconnect: bool,
 }
 
 impl Reply {
@@ -29,6 +30,7 @@ impl Reply {
             content_type: "text/event-stream",
             headers: Vec::new(),
             chunks: chunks.into_iter().collect(),
+            disconnect: false,
         }
     }
 
@@ -45,6 +47,18 @@ impl Reply {
             content_type: "application/json",
             headers: Vec::new(),
             chunks: vec![serde_json::to_vec(&body).unwrap()],
+            disconnect: false,
+        }
+    }
+
+    pub fn disconnect() -> Self {
+        Self {
+            status: 0,
+            reason: "",
+            content_type: "",
+            headers: Vec::new(),
+            chunks: Vec::new(),
+            disconnect: true,
         }
     }
 
@@ -135,6 +149,9 @@ async fn read_request(socket: &mut TcpStream) -> String {
 }
 
 async fn write_reply(socket: &mut TcpStream, reply: Reply) {
+    if reply.disconnect {
+        return;
+    }
     let headers = reply
         .headers
         .iter()

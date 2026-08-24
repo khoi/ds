@@ -171,13 +171,20 @@ pub async fn stream(
     let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
     let mut retries = 0;
     let response = loop {
-        let response = client
+        let response = match client
             .post(&url)
             .bearer_auth(&options.api_key)
             .json(&request)
             .send()
             .await
-            .map_err(|error| Error::Http(error.to_string()))?;
+        {
+            Ok(response) => response,
+            Err(_) if retries < options.max_retries => {
+                retries += 1;
+                continue;
+            }
+            Err(error) => return Err(Error::Http(error.to_string())),
+        };
         let status = response.status();
         if status.is_success() {
             break response;
