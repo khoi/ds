@@ -1051,6 +1051,130 @@ async fn cancels_an_active_openai_stream_with_partial_content() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn times_out_an_openai_request_before_response_headers() {
+    let server = serve([Reply::pending()]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options =
+        openai::Options::new("test-key").with_connection_timeout(std::time::Duration::from_secs(5));
+    let request = tokio::spawn(async move { openai::stream(&model, &context, &options).await });
+
+    server.wait_for_requests(1).await;
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+
+    match request.await.unwrap() {
+        Err(ds_ai::Error::Timeout { phase, partial }) => {
+            assert_eq!(phase, ds_ai::TimeoutPhase::Connection);
+            assert_eq!(partial, None);
+        }
+        _ => panic!("request did not time out"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn times_out_an_openai_stream_before_its_first_event() {
+    let server = serve([Reply::open_sse(": keepalive\n\n")]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options = openai::Options::new("test-key")
+        .with_first_event_timeout(std::time::Duration::from_secs(5));
+    let mut response = openai::stream(&model, &context, &options).await.unwrap();
+    let next = tokio::spawn(async move { response.next().await });
+
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+
+    match next.await.unwrap() {
+        Some(Err(ds_ai::Error::Timeout {
+            phase,
+            partial: Some(partial),
+        })) => {
+            assert_eq!(phase, ds_ai::TimeoutPhase::FirstEvent);
+            assert_eq!(partial.stop_reason, StopReason::Error);
+            assert_eq!(
+                partial.raw_stop_reason.as_deref(),
+                Some("timeout.first_event")
+            );
+            assert!(partial.content.is_empty());
+        }
+        event => panic!("unexpected timeout event: {event:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn times_out_an_idle_openai_stream_with_partial_content() {
+    let sse = [
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_idle\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_idle\",\"type\":\"message\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Visible\"}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::open_sse(sse)]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options =
+        openai::Options::new("test-key").with_idle_timeout(std::time::Duration::from_secs(5));
+    let mut response = openai::stream(&model, &context, &options).await.unwrap();
+
+    assert!(matches!(
+        response.next().await,
+        Some(Ok(Event::TextDelta { .. }))
+    ));
+    let next = tokio::spawn(async move { response.next().await });
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+
+    match next.await.unwrap() {
+        Some(Err(ds_ai::Error::Timeout {
+            phase,
+            partial: Some(partial),
+        })) => {
+            assert_eq!(phase, ds_ai::TimeoutPhase::Idle);
+            assert_eq!(partial.stop_reason, StopReason::Error);
+            assert_eq!(partial.raw_stop_reason.as_deref(), Some("timeout.idle"));
+            assert_eq!(partial.content, [ds_ai::Content::Text("Visible".into())]);
+        }
+        event => panic!("unexpected timeout event: {event:?}"),
+    }
+}
+
+#[tokio::test]
+async fn enforces_an_overall_openai_stream_deadline() {
+    let sse = [
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_overall\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_overall\",\"type\":\"message\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Visible\"}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::open_sse(sse)]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options = openai::Options::new("test-key")
+        .with_idle_timeout(std::time::Duration::from_secs(30))
+        .with_overall_timeout(std::time::Duration::from_secs(5));
+    let mut response = openai::stream(&model, &context, &options).await.unwrap();
+
+    assert!(matches!(
+        response.next().await,
+        Some(Ok(Event::TextDelta { .. }))
+    ));
+    tokio::time::pause();
+    let next = tokio::spawn(async move { response.next().await });
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+
+    match next.await.unwrap() {
+        Some(Err(ds_ai::Error::Timeout {
+            phase,
+            partial: Some(partial),
+        })) => {
+            assert_eq!(phase, ds_ai::TimeoutPhase::Overall);
+            assert_eq!(partial.stop_reason, StopReason::Error);
+            assert_eq!(partial.raw_stop_reason.as_deref(), Some("timeout.overall"));
+            assert_eq!(partial.content, [ds_ai::Content::Text("Visible".into())]);
+        }
+        event => panic!("unexpected timeout event: {event:?}"),
+    }
+}
+
 fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {
     match events.last() {
         Some(Ok(Event::Done(response))) => response,

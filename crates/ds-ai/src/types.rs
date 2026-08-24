@@ -263,11 +263,24 @@ pub enum Error {
     },
     #[error("request cancelled")]
     Cancelled { partial: Option<Response> },
+    #[error("provider timed out during {phase:?}")]
+    Timeout {
+        phase: TimeoutPhase,
+        partial: Option<Response>,
+    },
     #[error("provider retry delay {requested:?} exceeds {maximum:?}")]
     RetryDelayExceeded {
         requested: Duration,
         maximum: Duration,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimeoutPhase {
+    Connection,
+    FirstEvent,
+    Idle,
+    Overall,
 }
 
 pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send>>;

@@ -1,11 +1,12 @@
 use crate::{
     Content, Context, Error, Event, InputContent, Message, Response, ResponseStream, StopReason,
-    ToolCall, ToolResult, Usage, retry, sse, types::OpenAiReplay,
+    TimeoutPhase, ToolCall, ToolResult, Usage, retry, sse, types::OpenAiReplay,
 };
 use async_stream::stream;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, future::pending, time::Duration};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -40,6 +41,10 @@ pub struct Options {
     temperature: Option<f64>,
     reasoning: Option<Reasoning>,
     tool_choice: Option<ToolChoice>,
+    connection_timeout: Option<Duration>,
+    first_event_timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
+    overall_timeout: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -86,6 +91,10 @@ impl Options {
             temperature: None,
             reasoning: None,
             tool_choice: None,
+            connection_timeout: None,
+            first_event_timeout: None,
+            idle_timeout: None,
+            overall_timeout: None,
         }
     }
 
@@ -121,6 +130,26 @@ impl Options {
 
     pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = Some(tool_choice);
+        self
+    }
+
+    pub fn with_connection_timeout(mut self, timeout: Duration) -> Self {
+        self.connection_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_first_event_timeout(mut self, timeout: Duration) -> Self {
+        self.first_event_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_overall_timeout(mut self, timeout: Duration) -> Self {
+        self.overall_timeout = Some(timeout);
         self
     }
 }
@@ -382,6 +411,9 @@ pub async fn stream(
     context: &Context,
     options: &Options,
 ) -> Result<ResponseStream, Error> {
+    let overall_deadline = options
+        .overall_timeout
+        .map(|timeout| Instant::now() + timeout);
     let mut input = Vec::new();
     if let Some(system) = context.system() {
         input.push(RequestItem::User(RequestUser {
@@ -526,7 +558,7 @@ pub async fn stream(
     };
     let client = reqwest::Client::new();
     let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
-    let response = retry::send(
+    let sending = retry::send(
         retry::Policy {
             max_retries: options.max_retries,
             max_delay: options.max_retry_delay,
@@ -539,8 +571,24 @@ pub async fn stream(
                 .json(&request)
                 .send()
         },
-    )
-    .await?;
+    );
+    tokio::pin!(sending);
+    let response = tokio::select! {
+        biased;
+        response = &mut sending => response?,
+        _ = wait_for(options.connection_timeout) => {
+            return Err(Error::Timeout {
+                phase: TimeoutPhase::Connection,
+                partial: None,
+            });
+        }
+        _ = wait_until(overall_deadline) => {
+            return Err(Error::Timeout {
+                phase: TimeoutPhase::Overall,
+                partial: None,
+            });
+        }
+    };
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -552,11 +600,15 @@ pub async fn stream(
 
     let response_model = model.id.clone();
     let stream_cancellation = options.cancellation.clone();
+    let first_event_timeout = options.first_event_timeout;
+    let idle_timeout = options.idle_timeout;
     let output = stream! {
         let mut chunks = response.bytes_stream();
         let mut decoder = sse::Decoder::default();
         let mut result = Response::openai(response_model);
         let mut slots = HashMap::new();
+        let mut saw_event = false;
+        let mut event_deadline = first_event_timeout.map(|timeout| Instant::now() + timeout);
 
         loop {
             let chunk = tokio::select! {
@@ -565,6 +617,33 @@ pub async fn stream(
                     result.stop_reason = StopReason::Aborted;
                     result.raw_stop_reason = Some("cancelled".into());
                     yield Err(Error::Cancelled { partial: Some(result) });
+                    return;
+                }
+                _ = wait_until(overall_deadline) => {
+                    result.stop_reason = StopReason::Error;
+                    result.raw_stop_reason = Some("timeout.overall".into());
+                    yield Err(Error::Timeout {
+                        phase: TimeoutPhase::Overall,
+                        partial: Some(result),
+                    });
+                    return;
+                }
+                _ = wait_until(event_deadline) => {
+                    let phase = if saw_event {
+                        TimeoutPhase::Idle
+                    } else {
+                        TimeoutPhase::FirstEvent
+                    };
+                    result.stop_reason = StopReason::Error;
+                    result.raw_stop_reason = Some(match phase {
+                        TimeoutPhase::FirstEvent => "timeout.first_event".into(),
+                        TimeoutPhase::Idle => "timeout.idle".into(),
+                        _ => unreachable!(),
+                    });
+                    yield Err(Error::Timeout {
+                        phase,
+                        partial: Some(result),
+                    });
                     return;
                 }
                 chunk = chunks.next() => chunk,
@@ -590,6 +669,8 @@ pub async fn stream(
                         return;
                     }
                 };
+                saw_event = true;
+                event_deadline = idle_timeout.map(|timeout| Instant::now() + timeout);
                 let event = match serde_json::from_str::<StreamEvent>(&data) {
                     Ok(event) => event,
                     Err(error) => {
@@ -825,6 +906,20 @@ pub async fn stream(
 
 fn parse_arguments(arguments: &str) -> serde_json::Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+async fn wait_for(timeout: Option<Duration>) {
+    match timeout {
+        Some(timeout) => tokio::time::sleep(timeout).await,
+        None => pending().await,
+    }
+}
+
+async fn wait_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => pending().await,
+    }
 }
 
 fn request_input_content(content: &[InputContent]) -> Vec<RequestInputContent<'_>> {

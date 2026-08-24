@@ -109,8 +109,12 @@ impl Server {
     }
 
     pub async fn wait_for_requests(&self, count: usize) {
-        while self.request_count() < count {
-            self.request_notify.notified().await;
+        loop {
+            let notified = self.request_notify.notified();
+            if self.request_count() >= count {
+                return;
+            }
+            notified.await;
         }
     }
 
