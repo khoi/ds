@@ -230,33 +230,35 @@ async fn disables_the_codex_retry_delay_cap_with_zero() {
 
 #[tokio::test]
 async fn rejects_a_codex_retry_delay_above_the_cap() {
-    let server = serve([Reply::json(429, json!({"error": {"message": "retry"}}))
-        .with_header("retry-after-ms", "1000")])
-    .await;
-    let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
+    for status in [429, 503] {
+        let server = serve([Reply::json(status, json!({"error": {"message": "retry"}}))
+            .with_header("retry-after-ms", "1000")])
+        .await;
+        let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
 
-    let error = match codex::stream(
-        &model,
-        &Context::new([Message::user("Retry")]),
-        &codex::Options::new(token("acc_capped"))
-            .with_max_retries(1)
-            .with_max_retry_delay(Some(Duration::from_millis(999)))
-            .with_transport(codex::Transport::Sse),
-    )
-    .await
-    {
-        Ok(_) => panic!("retry delay above the cap was accepted"),
-        Err(error) => error,
-    };
+        let error = match codex::stream(
+            &model,
+            &Context::new([Message::user("Retry")]),
+            &codex::Options::new(token("acc_capped"))
+                .with_max_retries(1)
+                .with_max_retry_delay(Some(Duration::from_millis(999)))
+                .with_transport(codex::Transport::Sse),
+        )
+        .await
+        {
+            Ok(_) => panic!("retry delay above the cap was accepted"),
+            Err(error) => error,
+        };
 
-    assert_eq!(
-        error,
-        ds_ai::Error::RetryDelayExceeded {
-            requested: Duration::from_secs(1),
-            maximum: Duration::from_millis(999),
-        }
-    );
-    assert_eq!(server.request_count(), 1);
+        assert_eq!(
+            error,
+            ds_ai::Error::RetryDelayExceeded {
+                requested: Duration::from_secs(1),
+                maximum: Duration::from_millis(999),
+            }
+        );
+        assert_eq!(server.request_count(), 1);
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -300,6 +302,77 @@ async fn uses_fixed_exponential_backoff_for_codex_retries() {
         done(&task.await.unwrap()).content,
         [ds_ai::Content::Text("Done".into())]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn honors_numeric_codex_retry_headers() {
+    for (header, value, delay) in [
+        ("retry-after-ms", "1500", Duration::from_millis(1500)),
+        ("retry-after", "60", Duration::from_secs(60)),
+    ] {
+        let server = serve([
+            Reply::json(429, json!({"error": {"message": "retry"}})).with_header(header, value),
+            Reply::sse(sse_text_events("resp_delay", "msg_delay", "Done")),
+        ])
+        .await;
+        let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
+        let task = tokio::spawn(async move {
+            codex::stream(
+                &model,
+                &Context::new([Message::user("Retry")]),
+                &codex::Options::new(token("acc_delay"))
+                    .with_max_retries(1)
+                    .with_max_retry_delay(None)
+                    .with_transport(codex::Transport::Sse),
+            )
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+        });
+
+        server.wait_for_requests(1).await;
+        tokio::time::advance(delay - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(server.request_count(), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        server.wait_for_requests(2).await;
+        assert_eq!(
+            done(&task.await.unwrap()).content,
+            [ds_ai::Content::Text("Done".into())]
+        );
+    }
+}
+
+#[tokio::test]
+async fn parses_codex_http_date_retry_headers() {
+    let retry_at = std::time::SystemTime::now() + Duration::from_secs(60);
+    let server = serve([Reply::json(429, json!({"error": {"message": "retry"}}))
+        .with_header("retry-after", httpdate::fmt_http_date(retry_at))])
+    .await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
+
+    let error = match codex::stream(
+        &model,
+        &Context::new([Message::user("Retry")]),
+        &codex::Options::new(token("acc_date_delay"))
+            .with_max_retries(1)
+            .with_max_retry_delay(Some(Duration::from_secs(1)))
+            .with_transport(codex::Transport::Sse),
+    )
+    .await
+    {
+        Ok(_) => panic!("HTTP-date retry delay was accepted"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        ds_ai::Error::RetryDelayExceeded { requested, maximum }
+            if requested >= Duration::from_secs(58)
+                && requested <= Duration::from_secs(60)
+                && maximum == Duration::from_secs(1)
+    ));
 }
 
 #[tokio::test]
@@ -948,6 +1021,66 @@ async fn retries_a_missing_codex_continuation_with_full_context() {
     );
     codex::close_websocket_sessions(Some("session_recovery"));
     codex::reset_websocket_debug_stats(Some("session_recovery"));
+}
+
+#[tokio::test]
+async fn falls_back_to_sse_when_missing_continuation_recovery_cannot_start() {
+    codex::reset_websocket_debug_stats(Some("session_recovery_sse"));
+    let (base_url, capture) = serve_missing_continuation_then_sse().await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let options = codex::Options::new(token("acc_recovery_sse"))
+        .with_session_id("session_recovery_sse")
+        .with_transport(codex::Transport::WebSocketCached);
+    let first = codex::stream(&model, &Context::new([Message::user("Seed")]), &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    let context = Context::new([
+        Message::user("Seed"),
+        Message::assistant(done(&first).clone()),
+        Message::user("Continue"),
+    ]);
+
+    let second = codex::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert_eq!(
+        done(&second).content,
+        [ds_ai::Content::Text("Fallback".into())]
+    );
+    let capture = capture.await.unwrap();
+    assert_eq!(capture.websocket_bodies.len(), 3);
+    assert_eq!(
+        capture.websocket_bodies[1]["previous_response_id"],
+        "resp_seed_sse"
+    );
+    assert!(
+        capture.websocket_bodies[2]
+            .get("previous_response_id")
+            .is_none()
+    );
+    assert_eq!(
+        capture.websocket_bodies[2]["input"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(capture.http_requests, 1);
+    let stats = codex::websocket_debug_stats("session_recovery_sse").unwrap();
+    assert_eq!(stats.requests, 3);
+    assert_eq!(stats.connections_created, 2);
+    assert_eq!(stats.connections_reused, 1);
+    assert_eq!(stats.full_context_requests, 2);
+    assert_eq!(stats.delta_requests, 1);
+    assert_eq!(stats.websocket_failures, 1);
+    assert_eq!(stats.sse_fallbacks, 1);
+    codex::close_websocket_sessions(Some("session_recovery_sse"));
+    codex::reset_websocket_debug_stats(Some("session_recovery_sse"));
 }
 
 #[tokio::test]
@@ -1791,6 +1924,84 @@ async fn serve_missing_continuation_websockets() -> (String, oneshot::Receiver<V
                 .unwrap();
         }
         sender.send(bodies).ok();
+    });
+    (format!("http://{address}"), receiver)
+}
+
+struct MissingContinuationSseCapture {
+    websocket_bodies: Vec<Value>,
+    http_requests: usize,
+}
+
+async fn serve_missing_continuation_then_sse()
+-> (String, oneshot::Receiver<MissingContinuationSseCapture>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sender, receiver) = oneshot::channel();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        let mut websocket_bodies = Vec::new();
+        websocket_bodies.push(match socket.next().await {
+            Some(Ok(WebSocketMessage::Text(body))) => serde_json::from_str(&body).unwrap(),
+            message => panic!("unexpected websocket request: {message:?}"),
+        });
+        for event in text_events("resp_seed_sse", "msg_seed_sse", "Seed") {
+            socket
+                .send(WebSocketMessage::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        websocket_bodies.push(match socket.next().await {
+            Some(Ok(WebSocketMessage::Text(body))) => serde_json::from_str(&body).unwrap(),
+            message => panic!("unexpected websocket request: {message:?}"),
+        });
+        socket
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type": "error",
+                    "error": {
+                        "code": "previous_response_not_found",
+                        "message": "Continuation expired"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            socket.next().await,
+            Some(Ok(WebSocketMessage::Close(_)))
+        ));
+
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        websocket_bodies.push(match socket.next().await {
+            Some(Ok(WebSocketMessage::Text(body))) => serde_json::from_str(&body).unwrap(),
+            message => panic!("unexpected websocket request: {message:?}"),
+        });
+        socket.close(None).await.unwrap();
+
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_http_request(&mut socket).await;
+        let sse = sse_text_events("resp_recovery_sse", "msg_recovery_sse", "Fallback");
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                    sse.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        sender
+            .send(MissingContinuationSseCapture {
+                websocket_bodies,
+                http_requests: 1,
+            })
+            .ok();
     });
     (format!("http://{address}"), receiver)
 }

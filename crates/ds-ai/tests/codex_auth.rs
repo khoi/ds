@@ -2,6 +2,7 @@ use crate::support::{Reply, serve};
 use async_trait::async_trait;
 use base64::prelude::*;
 use ds_ai::codex::auth::{Client, CredentialManager, Credentials, Interaction, Notification};
+use ds_ai::{AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthSelectOption, Provider as _};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
@@ -365,6 +366,143 @@ async fn preserves_codex_device_poll_failure_details() {
         }) if body.contains("server_error") && body.contains("broken")
     ));
     server.requests().await;
+}
+
+#[tokio::test]
+async fn offers_pi_codex_login_methods_and_preserves_selection_cancellation() {
+    let provider = ds_ai::codex::Provider::new([]);
+    let oauth = provider.auth().oauth.as_ref().unwrap();
+    let interaction = SelectionInteraction {
+        answer: None,
+        ..Default::default()
+    };
+
+    let result = oauth.login(&interaction).await;
+
+    assert_eq!(oauth.name(), "OpenAI (ChatGPT Plus/Pro)");
+    assert!(matches!(result, Err(AuthError::Cancelled)));
+    assert_eq!(
+        interaction.prompt.lock().unwrap().clone(),
+        Some(AuthPrompt::Select {
+            message: "Select OpenAI Codex login method:".into(),
+            options: vec![
+                AuthSelectOption {
+                    id: "browser".into(),
+                    label: "Browser login (default)".into(),
+                    description: None,
+                },
+                AuthSelectOption {
+                    id: "device_code".into(),
+                    label: "Device code login (headless)".into(),
+                    description: None,
+                },
+            ],
+        })
+    );
+}
+
+#[tokio::test]
+async fn rejects_an_unknown_codex_login_method() {
+    let provider = ds_ai::codex::Provider::new([]);
+    let interaction = SelectionInteraction {
+        answer: Some("unknown".into()),
+        ..Default::default()
+    };
+
+    let error = provider
+        .auth()
+        .oauth
+        .as_ref()
+        .unwrap()
+        .login(&interaction)
+        .await;
+
+    assert!(matches!(
+        error,
+        Err(AuthError::Authentication(message))
+            if message == "Unknown OpenAI Codex login method: unknown"
+    ));
+}
+
+#[tokio::test]
+async fn exposes_pi_codex_browser_login_events_and_manual_prompt() {
+    let provider = ds_ai::codex::Provider::new([]);
+    let interaction = BrowserSelectionInteraction::default();
+
+    let result = provider
+        .auth()
+        .oauth
+        .as_ref()
+        .unwrap()
+        .login(&interaction)
+        .await;
+
+    assert!(matches!(result, Err(AuthError::OAuth(_))));
+    let events = interaction.events.lock().unwrap();
+    let [AuthEvent::AuthUrl { url, instructions }] = events.as_slice() else {
+        panic!("missing authorization URL event");
+    };
+    assert_eq!(
+        instructions.as_deref(),
+        Some("A browser window should open. Complete login to finish.")
+    );
+    assert_eq!(url::Url::parse(url).unwrap().path(), "/oauth/authorize");
+    let prompts = interaction.prompts.lock().unwrap();
+    assert!(matches!(
+        prompts.as_slice(),
+        [AuthPrompt::Select { .. }, AuthPrompt::ManualCode { message, placeholder, .. }]
+            if message == "Complete login in your browser, or paste the authorization code / redirect URL here:"
+                && placeholder.as_deref() == Some("http://localhost:1455/auth/callback")
+    ));
+}
+
+#[derive(Default)]
+struct SelectionInteraction {
+    answer: Option<String>,
+    prompt: Mutex<Option<AuthPrompt>>,
+    cancellation: CancellationToken,
+}
+
+#[async_trait]
+impl AuthInteraction for SelectionInteraction {
+    fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    async fn prompt(&self, prompt: AuthPrompt) -> Result<String, AuthError> {
+        *self.prompt.lock().unwrap() = Some(prompt);
+        self.answer.clone().ok_or(AuthError::Cancelled)
+    }
+
+    fn notify(&self, _event: AuthEvent) {}
+}
+
+#[derive(Default)]
+struct BrowserSelectionInteraction {
+    prompts: Mutex<Vec<AuthPrompt>>,
+    events: Mutex<Vec<AuthEvent>>,
+    cancellation: CancellationToken,
+}
+
+#[async_trait]
+impl AuthInteraction for BrowserSelectionInteraction {
+    fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    async fn prompt(&self, prompt: AuthPrompt) -> Result<String, AuthError> {
+        let browser = matches!(prompt, AuthPrompt::Select { .. });
+        self.prompts.lock().unwrap().push(prompt);
+        if browser {
+            Ok("browser".into())
+        } else {
+            Err(AuthError::Cancelled)
+        }
+    }
+
+    fn notify(&self, event: AuthEvent) {
+        self.events.lock().unwrap().push(event);
+    }
 }
 
 #[derive(Default)]

@@ -789,6 +789,61 @@ async fn routes_codex_specific_options() {
 }
 
 #[tokio::test]
+async fn maps_codex_specific_reasoning_effort() {
+    for (effort, off_mapping, expected) in [
+        (
+            ds_ai::codex::ReasoningEffort::Minimal,
+            None,
+            Some(json!({"effort": "low", "summary": "auto"})),
+        ),
+        (
+            ds_ai::codex::ReasoningEffort::None,
+            None,
+            Some(json!({"effort": "none", "summary": "auto"})),
+        ),
+        (ds_ai::codex::ReasoningEffort::None, Some(None), None),
+    ] {
+        let server = serve([Reply::sse(openai_done())]).await;
+        let mut model = builtin_model("openai-codex", "gpt-5.6-sol").unwrap();
+        model.base_url = server.base_url.clone();
+        if let Some(mapping) = off_mapping {
+            model
+                .thinking_level_map
+                .insert(ds_ai::ThinkingLevel::Off, mapping);
+        }
+        let provider = ds_ai::codex::Provider::new([model.clone()]);
+
+        provider
+            .stream(
+                &model,
+                &Context::new([Message::user("Hello")]),
+                &ApiStreamOptions::OpenAiCodexResponses(OpenAiCodexResponsesOptions {
+                    stream: StreamOptions {
+                        api_key: Some(token()),
+                        transport: Some(Transport::Sse),
+                        ..Default::default()
+                    },
+                    reasoning_effort: Some(effort),
+                    ..Default::default()
+                }),
+            )
+            .result()
+            .await
+            .unwrap();
+
+        let request = server.request_bytes().await.pop().unwrap();
+        let split = request
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let payload: Value =
+            serde_json::from_slice(&zstd::stream::decode_all(&request[split..]).unwrap()).unwrap();
+        assert_eq!(payload.get("reasoning").cloned(), expected);
+    }
+}
+
+#[tokio::test]
 async fn rejects_options_for_a_different_api() {
     let model = builtin_model("openai", "gpt-5.6-sol").unwrap();
     let provider = ds_ai::openai::Provider::new([model.clone()]);

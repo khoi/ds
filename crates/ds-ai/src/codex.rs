@@ -30,7 +30,7 @@ use tokio_tungstenite::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub use crate::openai::{ReasoningEffort, ReasoningSummary, ServiceTier};
+pub use crate::openai::{ReasoningSummary, ServiceTier};
 
 pub mod auth;
 
@@ -116,8 +116,10 @@ impl Provider {
                     crate::Transport::Auto => Transport::Auto,
                 });
             }
-            if let Some(effort) = options.reasoning_effort {
-                provider_options = provider_options.with_reasoning(
+            if let Some(effort) = options.reasoning_effort
+                && let Some(effort) = mapped_reasoning_effort(&requested_model, effort)
+            {
+                provider_options = provider_options.with_reasoning_value(
                     effort,
                     options.reasoning_summary.unwrap_or(ReasoningSummary::Auto),
                 );
@@ -230,6 +232,14 @@ fn reasoning_effort(level: crate::ThinkingLevel) -> Option<ReasoningEffort> {
     }
 }
 
+fn mapped_reasoning_effort(model: &crate::Model, effort: ReasoningEffort) -> Option<String> {
+    model
+        .thinking_level_map
+        .get(&effort.thinking_level())
+        .cloned()
+        .unwrap_or_else(|| Some(effort.as_str().into()))
+}
+
 struct CodexOAuthAuth {
     client: auth::Client,
 }
@@ -237,7 +247,7 @@ struct CodexOAuthAuth {
 #[async_trait]
 impl crate::OAuthAuth for CodexOAuthAuth {
     fn name(&self) -> &str {
-        "OpenAI Codex"
+        "OpenAI (ChatGPT Plus/Pro)"
     }
 
     fn is_subscription(&self) -> bool {
@@ -250,16 +260,16 @@ impl crate::OAuthAuth for CodexOAuthAuth {
     ) -> Result<crate::Credential, crate::AuthError> {
         let method = interaction
             .prompt(crate::AuthPrompt::Select {
-                message: "Choose a sign-in method".into(),
+                message: "Select OpenAI Codex login method:".into(),
                 options: vec![
                     crate::AuthSelectOption {
                         id: "browser".into(),
-                        label: "Browser".into(),
+                        label: "Browser login (default)".into(),
                         description: None,
                     },
                     crate::AuthSelectOption {
-                        id: "device".into(),
-                        label: "Device code".into(),
+                        id: "device_code".into(),
+                        label: "Device code login (headless)".into(),
                         description: None,
                     },
                 ],
@@ -272,14 +282,14 @@ impl crate::OAuthAuth for CodexOAuthAuth {
                     .login_browser(&adapter, interaction.cancellation())
                     .await
             }
-            "device" => {
+            "device_code" => {
                 self.client
                     .login_device(&adapter, interaction.cancellation())
                     .await
             }
             method => {
                 return Err(crate::AuthError::Authentication(format!(
-                    "unknown sign-in method {method}"
+                    "Unknown OpenAI Codex login method: {method}"
                 )));
             }
         }
@@ -324,7 +334,9 @@ impl auth::Interaction for CodexInteraction<'_> {
         let event = match notification {
             auth::Notification::AuthorizationUrl { url } => crate::AuthEvent::AuthUrl {
                 url,
-                instructions: None,
+                instructions: Some(
+                    "A browser window should open. Complete login to finish.".into(),
+                ),
             },
             auth::Notification::DeviceCode {
                 user_code,
@@ -347,8 +359,8 @@ impl auth::Interaction for CodexInteraction<'_> {
     ) -> Result<String, auth::Error> {
         self.0
             .prompt(crate::AuthPrompt::ManualCode {
-                message: "Paste the authorization redirect".into(),
-                placeholder: None,
+                message: "Complete login in your browser, or paste the authorization code / redirect URL here:".into(),
+                placeholder: Some("http://localhost:1455/auth/callback".into()),
                 cancellation,
             })
             .await
@@ -527,6 +539,44 @@ pub enum TextVerbosity {
     High,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    fn thinking_level(self) -> crate::ThinkingLevel {
+        match self {
+            Self::None => crate::ThinkingLevel::Off,
+            Self::Minimal => crate::ThinkingLevel::Minimal,
+            Self::Low => crate::ThinkingLevel::Low,
+            Self::Medium => crate::ThinkingLevel::Medium,
+            Self::High => crate::ThinkingLevel::High,
+            Self::XHigh => crate::ThinkingLevel::XHigh,
+            Self::Max => crate::ThinkingLevel::Max,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolChoice {
@@ -536,9 +586,9 @@ pub enum ToolChoice {
     Required,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Reasoning {
-    effort: ReasoningEffort,
+    effort: String,
     summary: ReasoningSummary,
 }
 
@@ -643,6 +693,14 @@ impl Options {
     }
 
     pub fn with_reasoning(mut self, effort: ReasoningEffort, summary: ReasoningSummary) -> Self {
+        self.reasoning = Some(Reasoning {
+            effort: effort.as_str().into(),
+            summary,
+        });
+        self
+    }
+
+    fn with_reasoning_value(mut self, effort: String, summary: ReasoningSummary) -> Self {
         self.reasoning = Some(Reasoning { effort, summary });
         self
     }
@@ -697,7 +755,7 @@ struct Request<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<RequestReasoning>,
+    reasoning: Option<RequestReasoning<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     service_tier: Option<ServiceTier>,
     include: [&'static str; 1],
@@ -713,8 +771,8 @@ struct TextOptions {
 }
 
 #[derive(Serialize)]
-struct RequestReasoning {
-    effort: ReasoningEffort,
+struct RequestReasoning<'a> {
+    effort: &'a str,
     summary: ReasoningSummary,
 }
 
@@ -784,10 +842,13 @@ pub async fn stream(
             verbosity: options.text_verbosity,
         },
         temperature: options.temperature,
-        reasoning: options.reasoning.map(|reasoning| RequestReasoning {
-            effort: reasoning.effort,
-            summary: reasoning.summary,
-        }),
+        reasoning: options
+            .reasoning
+            .as_ref()
+            .map(|reasoning| RequestReasoning {
+                effort: &reasoning.effort,
+                summary: reasoning.summary,
+            }),
         service_tier: options.service_tier,
         include: ["reasoning.encrypted_content"],
         prompt_cache_key: session_id.clone(),
