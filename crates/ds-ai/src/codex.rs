@@ -68,7 +68,7 @@ impl Provider {
         let requested_model = model.clone();
         let context = context.for_model(&requested_model);
         let options = options.clone();
-        crate::legacy::adapt(requested_model.clone(), async move {
+        crate::legacy::adapt_provider(requested_model.clone(), async move {
             let stream_options = options.stream;
             let request_hooks = stream_options.request_hooks(&requested_model);
             let access_token = stream_options
@@ -133,7 +133,7 @@ impl Provider {
             if let Some(tool_choice) = options.tool_choice {
                 provider_options = provider_options.with_tool_choice(tool_choice);
             }
-            stream(&provider_model, &context, &provider_options).await
+            response_events(&provider_model, &context, &provider_options).await
         })
     }
 }
@@ -802,6 +802,16 @@ pub async fn stream(
     context: &Context,
     options: &Options,
 ) -> Result<ResponseStream, Error> {
+    response_events(model, context, options)
+        .await
+        .map(crate::legacy::response_stream)
+}
+
+async fn response_events(
+    model: &Model,
+    context: &Context,
+    options: &Options,
+) -> Result<crate::legacy::ProviderEventStream, Error> {
     let overall_deadline = options
         .overall_timeout
         .map(|timeout| Instant::now() + timeout);
@@ -990,7 +1000,7 @@ pub async fn stream(
     })
 }
 
-async fn sse_stream(request: &SseRequest) -> Result<ResponseStream, Error> {
+async fn sse_stream(request: &SseRequest) -> Result<crate::legacy::ProviderEventStream, Error> {
     let body = zstd::stream::encode_all(request.json.as_slice(), 3)
         .map_err(|error| Error::Compression(error.to_string()))?;
     let client = reqwest::Client::new();
@@ -1056,7 +1066,7 @@ async fn sse_stream(request: &SseRequest) -> Result<ResponseStream, Error> {
         )
         .await);
     }
-    Ok(crate::legacy::response_stream(openai::decode_stream(
+    Ok(openai::decode_stream(
         response,
         request.model.clone(),
         request.cancellation.clone(),
@@ -1071,10 +1081,10 @@ async fn sse_stream(request: &SseRequest) -> Result<ResponseStream, Error> {
             use_requested_for_default: true,
             codex: true,
         },
-    )))
+    ))
 }
 
-fn should_fallback_to_sse(event: &Result<crate::Event, Error>) -> bool {
+fn should_fallback_to_sse(event: &Result<crate::legacy::ProviderEvent, Error>) -> bool {
     match event {
         Err(Error::Timeout {
             phase: crate::TimeoutPhase::FirstEvent,
@@ -1097,7 +1107,7 @@ fn should_fallback_to_sse(event: &Result<crate::Event, Error>) -> bool {
 }
 
 fn diagnose_websocket_failure(
-    event: &mut Result<crate::Event, Error>,
+    event: &mut Result<crate::legacy::ProviderEvent, Error>,
     session_id: Option<&str>,
     transport: Transport,
     request_bytes: usize,
@@ -1112,7 +1122,9 @@ fn diagnose_websocket_failure(
     );
 }
 
-fn websocket_transport_failure(event: &Result<crate::Event, Error>) -> Option<String> {
+fn websocket_transport_failure(
+    event: &Result<crate::legacy::ProviderEvent, Error>,
+) -> Option<String> {
     match event {
         Err(
             error @ (Error::Http(_)
@@ -1124,7 +1136,7 @@ fn websocket_transport_failure(event: &Result<crate::Event, Error>) -> Option<St
     }
 }
 
-fn websocket_error_message(event: &Result<crate::Event, Error>) -> String {
+fn websocket_error_message(event: &Result<crate::legacy::ProviderEvent, Error>) -> String {
     event.as_ref().err().map_or_else(
         || "websocket closed before a terminal event".into(),
         ToString::to_string,
@@ -1176,9 +1188,9 @@ fn websocket_diagnostic(
 }
 
 fn stream_with_diagnostic(
-    mut stream: ResponseStream,
+    mut stream: crate::legacy::ProviderEventStream,
     diagnostic: crate::AssistantMessageDiagnostic,
-) -> ResponseStream {
+) -> crate::legacy::ProviderEventStream {
     Box::pin(async_stream::stream! {
         while let Some(mut event) = stream.next().await {
             add_websocket_diagnostic(&mut event, diagnostic.clone());
@@ -1188,11 +1200,11 @@ fn stream_with_diagnostic(
 }
 
 fn add_websocket_diagnostic(
-    event: &mut Result<crate::Event, Error>,
+    event: &mut Result<crate::legacy::ProviderEvent, Error>,
     diagnostic: crate::AssistantMessageDiagnostic,
 ) {
     match event {
-        Ok(crate::Event::Done(response)) => response.add_diagnostic(diagnostic),
+        Ok(crate::legacy::ProviderEvent::Done(response)) => response.add_diagnostic(diagnostic),
         Err(
             Error::Stream { partial, .. }
             | Error::IncompleteStream { partial }
@@ -1252,7 +1264,7 @@ async fn websocket_stream(
     request: WebSocketRequest<'_>,
     options: &Options,
     overall_deadline: Option<Instant>,
-) -> Result<ResponseStream, WebSocketConnectError> {
+) -> Result<crate::legacy::ProviderEventStream, WebSocketConnectError> {
     let cache_key = request.cache_session_id.map(|session_id| {
         format!(
             "{}\u{1f}{}\u{1f}{session_id}",
@@ -1628,7 +1640,7 @@ async fn websocket_stream(
             }
         }
     };
-    let mut decoded = crate::legacy::response_stream(openai::decode_events(
+    let mut decoded = openai::decode_events(
         Box::pin(events),
         request.model.to_owned(),
         metadata,
@@ -1640,15 +1652,15 @@ async fn websocket_stream(
             use_requested_for_default: true,
             codex: true,
         },
-    ));
+    );
     let websocket_cache_ttl = options.websocket_cache_ttl;
     let output = async_stream::stream! {
         while let Some(event) = decoded.next().await {
             match event {
-                Ok(crate::Event::Done(response)) => {
+                Ok(crate::legacy::ProviderEvent::Done(response)) => {
                     drop(decoded);
                     lease.complete(websocket_cache_ttl);
-                    yield Ok(crate::Event::Done(response));
+                    yield Ok(crate::legacy::ProviderEvent::Done(response));
                     return;
                 }
                 Err(error) => {

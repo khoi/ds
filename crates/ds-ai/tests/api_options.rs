@@ -103,6 +103,58 @@ async fn emits_openai_content_events_from_done_items() {
 }
 
 #[tokio::test]
+async fn emits_codex_content_events_with_partial_identity() {
+    let server = serve([Reply::sse(openai_done_items())]).await;
+    let mut model = builtin_model("openai-codex", "gpt-5.4").unwrap();
+    model.base_url = server.base_url.clone();
+    let provider = ds_ai::codex::Provider::new([model.clone()]);
+    let mut stream = provider.stream(
+        &model,
+        &Context::new([Message::user("Hello")]),
+        &ApiStreamOptions::OpenAiCodexResponses(OpenAiCodexResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some(token()),
+                transport: Some(Transport::Sse),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+    );
+    let mut events = Vec::new();
+
+    while let Some(event) = stream.next().await {
+        match event {
+            ds_ai::AssistantMessageEvent::ThinkingStart { partial, .. } => {
+                events.push("thinking_start");
+                assert_eq!(partial.response_id.as_deref(), Some("resp_done"));
+            }
+            ds_ai::AssistantMessageEvent::ThinkingEnd { .. } => events.push("thinking_end"),
+            ds_ai::AssistantMessageEvent::TextStart { .. } => events.push("text_start"),
+            ds_ai::AssistantMessageEvent::TextEnd { .. } => events.push("text_end"),
+            ds_ai::AssistantMessageEvent::ToolCallStart { .. } => {
+                events.push("toolcall_start");
+            }
+            ds_ai::AssistantMessageEvent::ToolCallEnd { .. } => events.push("toolcall_end"),
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        events,
+        [
+            "thinking_start",
+            "thinking_end",
+            "text_start",
+            "text_end",
+            "toolcall_start",
+            "toolcall_end"
+        ]
+    );
+    assert_eq!(stream.result().await.unwrap().content.len(), 3);
+    server.request_bytes().await;
+}
+
+#[tokio::test]
 async fn tracks_openai_message_phases() {
     for (added, done, expected) in [
         (
