@@ -433,7 +433,8 @@ async fn encodes_anthropic_generation_thinking_and_cache_options() {
             "tools": [{
                 "name": "inspect",
                 "description": "Inspect the input",
-                "input_schema": {"type": "object", "properties": {}},
+                "eager_input_streaming": true,
+                "input_schema": {"type": "object", "properties": {}, "required": []},
                 "cache_control": {"type": "ephemeral", "ttl": "1h"}
             }],
             "max_tokens": 4096,
@@ -456,7 +457,9 @@ async fn keeps_anthropic_temperature_with_disabled_thinking_and_cache() {
     ]
     .concat();
     let server = serve([Reply::sse(completed)]).await;
-    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let model = anthropic::Model::new("claude-sonnet-4-5")
+        .with_base_url(&server.base_url)
+        .with_eager_tool_input_streaming(false);
     let context = Context::new([Message::user("Hello")]).with_system("Be brief");
     let options = anthropic::Options::new("test-key")
         .with_temperature(0.0)
@@ -475,6 +478,143 @@ async fn keeps_anthropic_temperature_with_disabled_thinking_and_cache() {
     assert_eq!(body["thinking"], json!({"type": "disabled"}));
     assert!(body.get("output_config").is_none());
     assert!(!request.contains("cache_control"));
+    assert!(!request.contains("anthropic-beta"));
+}
+
+#[tokio::test]
+async fn encodes_legacy_tool_streaming_and_strict_schemas() {
+    let completed = [
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(completed)]).await;
+    let model = anthropic::Model::new("claude-opus-4-8")
+        .with_base_url(&server.base_url)
+        .with_eager_tool_input_streaming(false)
+        .with_strict_tools();
+    let context = Context::new([Message::user("Look up")]).with_tools([Tool::new(
+        "lookup",
+        "Look up a value",
+        json!({
+            "type": "object",
+            "title": "LookupInput",
+            "properties": {
+                "value": {"type": "string"},
+                "optional": {"type": "number"}
+            },
+            "required": ["value"]
+        }),
+    )
+    .with_strict()]);
+
+    anthropic::stream(&model, &context, &anthropic::Options::new("test-key"))
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    let request = server.requests().await.pop().unwrap();
+    assert!(request.contains("anthropic-beta: fine-grained-tool-streaming-2025-05-14\r\n"));
+    let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        body["tools"],
+        json!([{
+            "name": "lookup",
+            "description": "Look up a value",
+            "strict": true,
+            "input_schema": {
+                "type": "object",
+                "title": "LookupInput",
+                "properties": {
+                    "value": {"type": "string"},
+                    "optional": {"anyOf": [{"type": "number"}, {"type": "null"}]}
+                },
+                "required": ["value", "optional"],
+                "additionalProperties": false
+            },
+            "cache_control": {"type": "ephemeral"}
+        }])
+    );
+}
+
+#[tokio::test]
+async fn replays_empty_signature_thinking_as_text_unless_enabled() {
+    let thinking = [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_unsigned\",\"usage\":{}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"unsigned\",\"signature\":\"\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"signed\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let first_server = serve([Reply::sse(thinking)]).await;
+    let first_model =
+        anthropic::Model::new("claude-sonnet-4-5").with_base_url(&first_server.base_url);
+    let events = anthropic::stream(
+        &first_model,
+        &Context::new([Message::user("Think")]),
+        &anthropic::Options::new("test-key"),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+    let response = done(&events).clone();
+
+    let completed = [
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let default_server = serve([Reply::sse(completed.clone())]).await;
+    let default_model =
+        anthropic::Model::new("claude-sonnet-4-5").with_base_url(&default_server.base_url);
+    anthropic::stream(
+        &default_model,
+        &Context::new([Message::assistant(response.clone())]),
+        &anthropic::Options::new("test-key"),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+    let default_request = default_server.requests().await.pop().unwrap();
+    let default_body: Value =
+        serde_json::from_str(default_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        default_body["messages"][0]["content"],
+        json!([
+            {"type": "text", "text": "unsigned"},
+            {"type": "thinking", "thinking": "", "signature": "signed"}
+        ])
+    );
+
+    let enabled_server = serve([Reply::sse(completed)]).await;
+    let enabled_model = anthropic::Model::new("claude-sonnet-4-5")
+        .with_base_url(&enabled_server.base_url)
+        .with_empty_thinking_signatures();
+    anthropic::stream(
+        &enabled_model,
+        &Context::new([Message::assistant(response)]),
+        &anthropic::Options::new("test-key"),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+    let enabled_request = enabled_server.requests().await.pop().unwrap();
+    let enabled_body: Value =
+        serde_json::from_str(enabled_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        enabled_body["messages"][0]["content"],
+        json!([
+            {"type": "thinking", "thinking": "unsigned", "signature": ""},
+            {"type": "thinking", "thinking": "", "signature": "signed"}
+        ])
+    );
 }
 
 #[tokio::test]

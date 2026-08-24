@@ -1,6 +1,7 @@
 mod http;
 mod json;
 mod retry;
+mod schema;
 mod sse;
 mod transport;
 mod types;

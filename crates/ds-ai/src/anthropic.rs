@@ -1,6 +1,6 @@
 use crate::{
     CacheRetention, Content, Context, Error, Event, InputContent, Message, Response,
-    ResponseStream, StopReason, ToolResult, Usage, http, json, retry, transport,
+    ResponseStream, StopReason, ToolResult, Usage, http, json, retry, schema, transport,
     types::AnthropicReasoning,
 };
 use async_stream::stream;
@@ -16,6 +16,9 @@ const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 pub struct Model {
     id: String,
     base_url: String,
+    eager_tool_input_streaming: bool,
+    strict_tools: bool,
+    empty_thinking_signatures: bool,
 }
 
 impl Model {
@@ -23,11 +26,29 @@ impl Model {
         Self {
             id: id.into(),
             base_url: DEFAULT_BASE_URL.into(),
+            eager_tool_input_streaming: true,
+            strict_tools: false,
+            empty_thinking_signatures: false,
         }
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    pub fn with_eager_tool_input_streaming(mut self, enabled: bool) -> Self {
+        self.eager_tool_input_streaming = enabled;
+        self
+    }
+
+    pub fn with_strict_tools(mut self) -> Self {
+        self.strict_tools = true;
+        self
+    }
+
+    pub fn with_empty_thinking_signatures(mut self) -> Self {
+        self.empty_thinking_signatures = true;
         self
     }
 }
@@ -190,7 +211,7 @@ struct Request<'a> {
     system: Vec<serde_json::Value>,
     messages: Vec<RequestMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<RequestTool<'a>>,
+    tools: Vec<RequestTool>,
     max_tokens: u64,
     stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -214,10 +235,14 @@ struct RequestMessage {
 }
 
 #[derive(Serialize)]
-struct RequestTool<'a> {
-    name: &'a str,
-    description: &'a str,
-    input_schema: &'a serde_json::Value,
+struct RequestTool {
+    name: String,
+    description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eager_input_streaming: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strict: Option<bool>,
+    input_schema: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
 }
@@ -341,7 +366,9 @@ pub async fn stream(
         .map(|timeout| Instant::now() + timeout);
     let cache_control = cache_control(options.cache_retention);
     let (thinking, output_config) = thinking(&options.thinking);
-    let tool_count = context.tools().len();
+    let tools =
+        request_tools(model, context, cache_control.as_ref()).map_err(Error::InvalidRequest)?;
+    let legacy_tool_streaming = !model.eager_tool_input_streaming && !tools.is_empty();
     let request = Request {
         model: &model.id,
         system: context
@@ -353,21 +380,7 @@ pub async fn stream(
             })
             .unwrap_or_default(),
         messages: messages(model, context, cache_control.as_ref()),
-        tools: context
-            .tools()
-            .iter()
-            .enumerate()
-            .map(|(index, tool)| RequestTool {
-                name: &tool.name,
-                description: &tool.description,
-                input_schema: &tool.parameters,
-                cache_control: if index + 1 == tool_count {
-                    cache_control.clone()
-                } else {
-                    None
-                },
-            })
-            .collect(),
+        tools,
         max_tokens: options.max_tokens,
         stream: true,
         stop_sequences: options.stop_sequences.clone(),
@@ -397,12 +410,16 @@ pub async fn stream(
                 cancellation: &options.cancellation,
             },
             || {
-                client
+                let builder = client
                     .post(&url)
                     .header("x-api-key", &options.api_key)
-                    .header("anthropic-version", "2023-06-01")
-                    .json(&request)
-                    .send()
+                    .header("anthropic-version", "2023-06-01");
+                let builder = if legacy_tool_streaming {
+                    builder.header("anthropic-beta", "fine-grained-tool-streaming-2025-05-14")
+                } else {
+                    builder
+                };
+                builder.json(&request).send()
             },
         ),
         options.connection_timeout,
@@ -649,6 +666,41 @@ fn messages(
     messages
 }
 
+fn request_tools(
+    model: &Model,
+    context: &Context,
+    cache_control: Option<&CacheControl>,
+) -> Result<Vec<RequestTool>, String> {
+    let tool_count = context.tools().len();
+    context
+        .tools()
+        .iter()
+        .enumerate()
+        .map(|(index, tool)| {
+            let strict = model.strict_tools && tool.strict();
+            let input_schema = if strict {
+                schema::strict(&tool.parameters).map_err(|error| {
+                    format!("tool {:?} has an invalid strict schema: {error}", tool.name)
+                })?
+            } else {
+                schema::object(&tool.parameters)
+            };
+            Ok(RequestTool {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                eager_input_streaming: model.eager_tool_input_streaming.then_some(true),
+                strict: strict.then_some(true),
+                input_schema,
+                cache_control: if index + 1 == tool_count {
+                    cache_control.cloned()
+                } else {
+                    None
+                },
+            })
+        })
+        .collect()
+}
+
 fn assistant_content(model: &Model, response: &Response) -> Vec<serde_json::Value> {
     let reasoning = response.anthropic_reasoning(&model.id);
     response
@@ -668,12 +720,18 @@ fn assistant_content(model: &Model, response: &Response) -> Vec<serde_json::Valu
                     AnthropicReasoning::Thinking {
                         content_index: index,
                         signature,
-                    } if *index == content_index && !signature.is_empty() => {
-                        Some(serde_json::json!({
-                            "type": "thinking",
-                            "thinking": text,
-                            "signature": signature
-                        }))
+                    } if *index == content_index => {
+                        if !signature.trim().is_empty() || model.empty_thinking_signatures {
+                            Some(serde_json::json!({
+                                "type": "thinking",
+                                "thinking": text,
+                                "signature": signature.trim()
+                            }))
+                        } else if text.trim().is_empty() {
+                            None
+                        } else {
+                            Some(serde_json::json!({"type": "text", "text": text}))
+                        }
                     }
                     AnthropicReasoning::Redacted {
                         content_index: index,

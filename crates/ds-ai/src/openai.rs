@@ -1,7 +1,7 @@
 use crate::{
     CacheRetention, Content, Context, Error, Event, InputContent, Message, Response,
     ResponseStream, StopReason, TimeoutPhase, ToolCall, ToolResult, Usage, http, json, retry,
-    transport, types::OpenAiReplay,
+    schema, transport, types::OpenAiReplay,
 };
 use async_stream::stream;
 use serde::{Deserialize, Serialize};
@@ -173,7 +173,7 @@ struct Request<'a> {
     model: &'a str,
     input: Vec<RequestItem<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<RequestTool<'a>>,
+    tools: Vec<RequestTool>,
     stream: bool,
     store: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -274,11 +274,11 @@ struct RequestFunctionOutput<'a> {
 }
 
 #[derive(Serialize)]
-struct RequestTool<'a> {
+struct RequestTool {
     r#type: &'static str,
-    name: &'a str,
-    description: &'a str,
-    parameters: &'a serde_json::Value,
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
     strict: bool,
 }
 
@@ -548,14 +548,23 @@ pub async fn stream(
     let tools = context
         .tools()
         .iter()
-        .map(|tool| RequestTool {
-            r#type: "function",
-            name: &tool.name,
-            description: &tool.description,
-            parameters: &tool.parameters,
-            strict: false,
+        .map(|tool| {
+            Ok(RequestTool {
+                r#type: "function",
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: if tool.strict() {
+                    schema::strict(&tool.parameters).map_err(|error| {
+                        format!("tool {:?} has an invalid strict schema: {error}", tool.name)
+                    })?
+                } else {
+                    tool.parameters.clone()
+                },
+                strict: tool.strict(),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(Error::InvalidRequest)?;
     let request = Request {
         model: &model.id,
         input,

@@ -119,6 +119,7 @@ pub struct Tool {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+    strict: bool,
 }
 
 impl Tool {
@@ -131,7 +132,17 @@ impl Tool {
             name: name.into(),
             description: description.into(),
             parameters,
+            strict: false,
         }
+    }
+
+    pub fn with_strict(mut self) -> Self {
+        self.strict = true;
+        self
+    }
+
+    pub(crate) fn strict(&self) -> bool {
+        self.strict
     }
 }
 
@@ -309,6 +320,8 @@ pub enum Event {
 pub enum Error {
     #[error("HTTP request failed: {0}")]
     Http(String),
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
     #[error("provider returned HTTP {status}: {message}")]
     Provider {
         status: u16,

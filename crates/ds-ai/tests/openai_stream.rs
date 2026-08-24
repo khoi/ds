@@ -625,7 +625,8 @@ async fn streams_and_replays_openai_tool_calls() {
             "required": ["path", "content"],
             "additionalProperties": false
         }),
-    )]);
+    )
+    .with_strict()]);
     let options = openai::Options::new("test-key");
 
     let first_events = openai::stream(&first_model, &first_context, &options)
@@ -676,7 +677,7 @@ async fn streams_and_replays_openai_tool_calls() {
                 "required": ["path", "content"],
                 "additionalProperties": false
             },
-            "strict": false
+            "strict": true
         }])
     );
 
@@ -712,6 +713,29 @@ async fn streams_and_replays_openai_tool_calls() {
             }
         ])
     );
+}
+
+#[tokio::test]
+async fn rejects_invalid_strict_tool_schemas_before_connecting() {
+    let model = openai::Model::new("gpt-5.6").with_base_url("http://127.0.0.1:9");
+    let context = Context::new([Message::user("Look up")]).with_tools([Tool::new(
+        "lookup",
+        "Look up a value",
+        json!({
+            "type": "object",
+            "properties": {"value": {"$ref": "#/$defs/value"}},
+            "$defs": {"value": {"type": "string"}}
+        }),
+    )
+    .with_strict()]);
+
+    let result = openai::stream(&model, &context, &openai::Options::new("test-key")).await;
+
+    assert!(matches!(
+        result,
+        Err(ds_ai::Error::InvalidRequest(message))
+            if message == "tool \"lookup\" has an invalid strict schema: $defs schemas are unsupported"
+    ));
 }
 
 #[tokio::test]
