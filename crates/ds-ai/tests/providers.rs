@@ -1,5 +1,7 @@
 #[path = "anthropic_stream.rs"]
 mod anthropic_stream;
+#[path = "auth.rs"]
+mod auth;
 #[path = "codex_auth.rs"]
 mod codex_auth;
 #[path = "codex_stream.rs"]

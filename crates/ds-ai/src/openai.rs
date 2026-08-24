@@ -20,6 +20,7 @@ pub struct Provider {
     id: crate::ProviderId,
     models: Vec<crate::Model>,
     headers: BTreeMap<String, Option<String>>,
+    auth: crate::ProviderAuth,
 }
 
 impl Provider {
@@ -28,6 +29,10 @@ impl Provider {
             id: crate::ProviderId::new("openai"),
             models: models.into_iter().collect(),
             headers: BTreeMap::new(),
+            auth: crate::ProviderAuth::api_key(crate::EnvApiKeyAuth::new(
+                "OpenAI API key",
+                ["OPENAI_API_KEY"],
+            )),
         }
     }
 
@@ -104,6 +109,10 @@ impl crate::Provider for Provider {
 
     fn headers(&self) -> &BTreeMap<String, Option<String>> {
         &self.headers
+    }
+
+    fn auth(&self) -> &crate::ProviderAuth {
+        &self.auth
     }
 
     fn models(&self) -> Vec<crate::Model> {

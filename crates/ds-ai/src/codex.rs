@@ -2,6 +2,7 @@ use crate::{
     CacheRetention, Context, Error, ResponseMetadata, ResponseStream, http, openai, retry, schema,
     transport,
 };
+use async_trait::async_trait;
 use base64::prelude::*;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -35,6 +36,7 @@ pub struct Provider {
     id: crate::ProviderId,
     models: Vec<crate::Model>,
     headers: BTreeMap<String, Option<String>>,
+    auth: crate::ProviderAuth,
 }
 
 impl Provider {
@@ -43,6 +45,9 @@ impl Provider {
             id: crate::ProviderId::new("openai-codex"),
             models: models.into_iter().collect(),
             headers: BTreeMap::new(),
+            auth: crate::ProviderAuth::oauth(CodexOAuthAuth {
+                client: auth::Client::new(),
+            }),
         }
     }
 
@@ -130,6 +135,10 @@ impl crate::Provider for Provider {
         &self.headers
     }
 
+    fn auth(&self) -> &crate::ProviderAuth {
+        &self.auth
+    }
+
     fn models(&self) -> Vec<crate::Model> {
         self.models.clone()
     }
@@ -172,6 +181,141 @@ fn reasoning_effort(level: crate::ThinkingLevel) -> Option<ReasoningEffort> {
         crate::ThinkingLevel::High => Some(ReasoningEffort::High),
         crate::ThinkingLevel::XHigh => Some(ReasoningEffort::XHigh),
         crate::ThinkingLevel::Max => Some(ReasoningEffort::Max),
+    }
+}
+
+struct CodexOAuthAuth {
+    client: auth::Client,
+}
+
+#[async_trait]
+impl crate::OAuthAuth for CodexOAuthAuth {
+    fn name(&self) -> &str {
+        "OpenAI Codex"
+    }
+
+    fn is_subscription(&self) -> bool {
+        true
+    }
+
+    async fn login(
+        &self,
+        interaction: &dyn crate::AuthInteraction,
+    ) -> Result<crate::Credential, crate::AuthError> {
+        let method = interaction
+            .prompt(crate::AuthPrompt::Select {
+                message: "Choose a sign-in method".into(),
+                options: vec![
+                    crate::AuthSelectOption {
+                        id: "browser".into(),
+                        label: "Browser".into(),
+                        description: None,
+                    },
+                    crate::AuthSelectOption {
+                        id: "device".into(),
+                        label: "Device code".into(),
+                        description: None,
+                    },
+                ],
+            })
+            .await?;
+        let adapter = CodexInteraction(interaction);
+        let credentials = match method.as_str() {
+            "browser" => {
+                self.client
+                    .login_browser(&adapter, interaction.cancellation())
+                    .await
+            }
+            "device" => {
+                self.client
+                    .login_device(&adapter, interaction.cancellation())
+                    .await
+            }
+            method => {
+                return Err(crate::AuthError::Authentication(format!(
+                    "unknown sign-in method {method}"
+                )));
+            }
+        }
+        .map_err(|error| crate::AuthError::OAuth(error.to_string()))?;
+        Ok(oauth_credential(credentials))
+    }
+
+    async fn refresh(
+        &self,
+        credential: &crate::Credential,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::Credential, crate::AuthError> {
+        let crate::Credential::OAuth { refresh, .. } = credential else {
+            return Err(crate::AuthError::OAuth("expected OAuth credential".into()));
+        };
+        self.client
+            .refresh(refresh, cancellation)
+            .await
+            .map(oauth_credential)
+            .map_err(|error| crate::AuthError::OAuth(error.to_string()))
+    }
+
+    async fn to_auth(
+        &self,
+        credential: &crate::Credential,
+    ) -> Result<crate::ModelAuth, crate::AuthError> {
+        let crate::Credential::OAuth { access, .. } = credential else {
+            return Err(crate::AuthError::OAuth("expected OAuth credential".into()));
+        };
+        Ok(crate::ModelAuth {
+            api_key: Some(access.clone()),
+            ..Default::default()
+        })
+    }
+}
+
+struct CodexInteraction<'a>(&'a dyn crate::AuthInteraction);
+
+#[async_trait]
+impl auth::Interaction for CodexInteraction<'_> {
+    fn notify(&self, notification: auth::Notification) {
+        let event = match notification {
+            auth::Notification::AuthorizationUrl { url } => crate::AuthEvent::AuthUrl {
+                url,
+                instructions: None,
+            },
+            auth::Notification::DeviceCode {
+                user_code,
+                verification_uri,
+                interval,
+                expires_in,
+            } => crate::AuthEvent::DeviceCode {
+                user_code,
+                verification_uri,
+                interval_seconds: Some(interval.as_secs()),
+                expires_in_seconds: Some(expires_in.as_secs()),
+            },
+        };
+        self.0.notify(event);
+    }
+
+    async fn manual_authorization(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<String, auth::Error> {
+        self.0
+            .prompt(crate::AuthPrompt::ManualCode {
+                message: "Paste the authorization redirect".into(),
+                placeholder: None,
+                cancellation,
+            })
+            .await
+            .map_err(|error| auth::Error::InvalidResponse(error.to_string()))
+    }
+}
+
+fn oauth_credential(credentials: auth::Credentials) -> crate::Credential {
+    crate::Credential::OAuth {
+        refresh: credentials.refresh_token,
+        access: credentials.access_token,
+        expires: credentials.expires_at,
+        extra: BTreeMap::new(),
     }
 }
 

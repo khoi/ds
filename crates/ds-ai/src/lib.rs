@@ -1,3 +1,4 @@
+mod auth;
 mod event_stream;
 mod frame;
 mod http;
@@ -15,6 +16,13 @@ mod types;
 pub mod anthropic;
 pub mod codex;
 pub mod openai;
+
+pub use auth::{
+    ApiKeyAuth, AuthCheck, AuthContext, AuthError, AuthEvent, AuthInfoLink, AuthInteraction,
+    AuthPrompt, AuthResolutionOverrides, AuthResult, AuthSelectOption, Credential, CredentialInfo,
+    CredentialMutation, CredentialStore, CredentialType, EnvApiKeyAuth, InMemoryCredentialStore,
+    ModelAuth, OAuthAuth, ProviderAuth, SystemAuthContext,
+};
 
 pub use event_stream::{AssistantMessageEventStream, AssistantMessageStreamError};
 pub use frame::{

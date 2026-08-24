@@ -5,6 +5,7 @@ use crate::{
     types::{AnthropicReasoning, normalize_id},
 };
 use async_stream::stream;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -21,6 +22,7 @@ pub struct Provider {
     id: crate::ProviderId,
     models: Vec<crate::Model>,
     headers: BTreeMap<String, Option<String>>,
+    auth: crate::ProviderAuth,
 }
 
 impl Provider {
@@ -29,6 +31,7 @@ impl Provider {
             id: crate::ProviderId::new("anthropic"),
             models: models.into_iter().collect(),
             headers: BTreeMap::new(),
+            auth: crate::ProviderAuth::api_key(AnthropicApiKeyAuth),
         }
     }
 
@@ -123,6 +126,10 @@ impl crate::Provider for Provider {
         &self.headers
     }
 
+    fn auth(&self) -> &crate::ProviderAuth {
+        &self.auth
+    }
+
     fn models(&self) -> Vec<crate::Model> {
         self.models.clone()
     }
@@ -179,6 +186,85 @@ fn anthropic_thinking(level: crate::ThinkingLevel) -> Thinking {
             effort: Effort::Max,
             display: ThinkingDisplay::Summarized,
         },
+    }
+}
+
+struct AnthropicApiKeyAuth;
+
+#[async_trait]
+impl crate::ApiKeyAuth for AnthropicApiKeyAuth {
+    fn name(&self) -> &str {
+        "Anthropic API key"
+    }
+
+    async fn login(
+        &self,
+        interaction: &dyn crate::AuthInteraction,
+    ) -> Result<crate::Credential, crate::AuthError> {
+        if interaction.cancellation().is_cancelled() {
+            return Err(crate::AuthError::Cancelled);
+        }
+        let key = interaction
+            .prompt(crate::AuthPrompt::Secret {
+                message: "Enter Anthropic API key".into(),
+                placeholder: None,
+            })
+            .await?;
+        Ok(crate::Credential::ApiKey {
+            key: Some(key),
+            env: BTreeMap::new(),
+        })
+    }
+
+    async fn resolve(
+        &self,
+        context: &dyn crate::AuthContext,
+        credential: Option<&crate::Credential>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::AuthResult>, crate::AuthError> {
+        if cancellation.is_cancelled() {
+            return Err(crate::AuthError::Cancelled);
+        }
+        if let Some(crate::Credential::ApiKey {
+            key: Some(key),
+            env,
+        }) = credential
+        {
+            return Ok(Some(crate::AuthResult {
+                auth: crate::ModelAuth {
+                    api_key: Some(key.clone()),
+                    ..Default::default()
+                },
+                env: env.clone(),
+                source: Some("stored credential".into()),
+            }));
+        }
+        if let Some(token) = context.env("ANTHROPIC_AUTH_TOKEN").await {
+            return Ok(Some(crate::AuthResult {
+                auth: crate::ModelAuth {
+                    headers: BTreeMap::from([(
+                        "Authorization".into(),
+                        Some(format!("Bearer {token}")),
+                    )]),
+                    ..Default::default()
+                },
+                source: Some("ANTHROPIC_AUTH_TOKEN".into()),
+                ..Default::default()
+            }));
+        }
+        for name in ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"] {
+            if let Some(key) = context.env(name).await {
+                return Ok(Some(crate::AuthResult {
+                    auth: crate::ModelAuth {
+                        api_key: Some(key),
+                        ..Default::default()
+                    },
+                    source: Some(name.into()),
+                    ..Default::default()
+                }));
+            }
+        }
+        Ok(None)
     }
 }
 

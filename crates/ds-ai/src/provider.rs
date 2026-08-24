@@ -3,8 +3,15 @@ use crate::{
     AssistantMessageStreamError, CacheRetention, Context, Model, ProviderId, StopReason,
     ThinkingLevel,
 };
-use futures_util::stream;
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use async_stream::stream;
+use async_trait::async_trait;
+use futures_util::{StreamExt, stream as futures_stream};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,6 +26,7 @@ pub enum Transport {
 pub struct StreamOptions {
     pub cancellation: CancellationToken,
     pub api_key: Option<String>,
+    pub env: BTreeMap<String, String>,
     pub headers: BTreeMap<String, Option<String>>,
     pub timeout: Option<Duration>,
     pub max_retries: Option<usize>,
@@ -38,6 +46,7 @@ impl Default for StreamOptions {
         Self {
             cancellation: CancellationToken::new(),
             api_key: None,
+            env: BTreeMap::new(),
             headers: BTreeMap::new(),
             timeout: None,
             max_retries: Some(2),
@@ -73,6 +82,7 @@ pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
     fn base_url(&self) -> Option<&str>;
     fn headers(&self) -> &BTreeMap<String, Option<String>>;
+    fn auth(&self) -> &crate::ProviderAuth;
     fn models(&self) -> Vec<Model>;
     fn stream(
         &self,
@@ -88,14 +98,40 @@ pub trait Provider: Send + Sync {
     ) -> AssistantMessageEventStream;
 }
 
-#[derive(Default)]
 pub struct Models {
     providers: Vec<Arc<dyn Provider>>,
+    credentials: Arc<dyn crate::CredentialStore>,
+    auth_context: Arc<dyn crate::AuthContext>,
+}
+
+impl Default for Models {
+    fn default() -> Self {
+        Self {
+            providers: Vec::new(),
+            credentials: Arc::new(crate::InMemoryCredentialStore::new()),
+            auth_context: Arc::new(crate::SystemAuthContext),
+        }
+    }
 }
 
 impl Models {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_auth(
+        credentials: Arc<dyn crate::CredentialStore>,
+        auth_context: Arc<dyn crate::AuthContext>,
+    ) -> Self {
+        Self {
+            providers: Vec::new(),
+            credentials,
+            auth_context,
+        }
+    }
+
+    pub fn credentials(&self) -> Arc<dyn crate::CredentialStore> {
+        self.credentials.clone()
     }
 
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
@@ -160,10 +196,37 @@ impl Models {
         context: &Context,
         options: &StreamOptions,
     ) -> AssistantMessageEventStream {
-        self.provider(model.provider.as_str()).map_or_else(
-            || error_stream(model, format!("Unknown provider {}", model.provider)),
-            |provider| provider.stream(model, context, options),
-        )
+        let Some(provider) = self.provider(model.provider.as_str()) else {
+            return error_stream(model, format!("Unknown provider {}", model.provider));
+        };
+        let model = model.clone();
+        let context = context.clone();
+        let options = options.clone();
+        let credentials = self.credentials.clone();
+        let auth_context = self.auth_context.clone();
+        lazy_stream(model.clone(), async move {
+            let resolution = resolve_auth(
+                provider.clone(),
+                credentials,
+                auth_context,
+                crate::AuthResolutionOverrides {
+                    api_key: options.api_key.clone(),
+                    env: options.env.clone(),
+                    cancellation: options.cancellation.clone(),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .ok_or_else(|| {
+                crate::AuthError::Authentication(format!(
+                    "Provider is not configured: {}",
+                    model.provider
+                ))
+            })?;
+            let (request_model, request_options) =
+                apply_auth(&provider, &model, options, resolution);
+            Ok(provider.stream(&request_model, &context, &request_options))
+        })
     }
 
     pub async fn complete(
@@ -181,10 +244,45 @@ impl Models {
         context: &Context,
         options: &SimpleStreamOptions,
     ) -> AssistantMessageEventStream {
-        self.provider(model.provider.as_str()).map_or_else(
-            || error_stream(model, format!("Unknown provider {}", model.provider)),
-            |provider| provider.stream_simple(model, context, options),
-        )
+        let Some(provider) = self.provider(model.provider.as_str()) else {
+            return error_stream(model, format!("Unknown provider {}", model.provider));
+        };
+        let model = model.clone();
+        let context = context.clone();
+        let options = options.clone();
+        let credentials = self.credentials.clone();
+        let auth_context = self.auth_context.clone();
+        lazy_stream(model.clone(), async move {
+            let resolution = resolve_auth(
+                provider.clone(),
+                credentials,
+                auth_context,
+                crate::AuthResolutionOverrides {
+                    api_key: options.stream.api_key.clone(),
+                    env: options.stream.env.clone(),
+                    cancellation: options.stream.cancellation.clone(),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .ok_or_else(|| {
+                crate::AuthError::Authentication(format!(
+                    "Provider is not configured: {}",
+                    model.provider
+                ))
+            })?;
+            let (request_model, stream_options) =
+                apply_auth(&provider, &model, options.stream, resolution);
+            Ok(provider.stream_simple(
+                &request_model,
+                &context,
+                &SimpleStreamOptions {
+                    stream: stream_options,
+                    thinking: options.thinking,
+                    tool_choice: options.tool_choice,
+                },
+            ))
+        })
     }
 
     pub async fn complete_simple(
@@ -195,9 +293,118 @@ impl Models {
     ) -> Result<AssistantMessage, AssistantMessageStreamError> {
         self.stream_simple(model, context, options).result().await
     }
+
+    pub async fn auth(
+        &self,
+        provider_id: &str,
+        overrides: crate::AuthResolutionOverrides,
+    ) -> Result<Option<crate::AuthResult>, crate::AuthError> {
+        let Some(provider) = self.provider(provider_id) else {
+            return Ok(None);
+        };
+        resolve_auth(
+            provider,
+            self.credentials.clone(),
+            self.auth_context.clone(),
+            overrides,
+        )
+        .await
+    }
+
+    pub async fn check_auth(
+        &self,
+        provider_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::AuthCheck>, crate::AuthError> {
+        let Some(provider) = self.provider(provider_id) else {
+            return Ok(None);
+        };
+        let credential = self.credentials.read(provider_id, cancellation).await?;
+        check_provider_auth(
+            &provider,
+            credential.as_ref(),
+            self.auth_context.as_ref(),
+            cancellation,
+        )
+        .await
+    }
+
+    pub async fn available_models(
+        &self,
+        provider_id: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Model>, crate::AuthError> {
+        let providers = match provider_id {
+            Some(provider_id) => self.provider(provider_id).into_iter().collect(),
+            None => self.providers(),
+        };
+        let mut models = Vec::new();
+        for provider in providers {
+            if self
+                .check_auth(provider.id().as_str(), cancellation)
+                .await?
+                .is_some()
+            {
+                models.extend(provider.models());
+            }
+        }
+        Ok(models)
+    }
+
+    pub async fn login(
+        &self,
+        provider_id: &str,
+        credential_type: crate::CredentialType,
+        interaction: &dyn crate::AuthInteraction,
+    ) -> Result<crate::Credential, crate::AuthError> {
+        let provider = self.provider(provider_id).ok_or_else(|| {
+            crate::AuthError::Authentication(format!("Unknown provider {provider_id}"))
+        })?;
+        let credential = match credential_type {
+            crate::CredentialType::ApiKey => {
+                provider
+                    .auth()
+                    .api_key
+                    .as_ref()
+                    .ok_or_else(|| crate::AuthError::Unsupported("API key login".into()))?
+                    .login(interaction)
+                    .await?
+            }
+            crate::CredentialType::OAuth => {
+                provider
+                    .auth()
+                    .oauth
+                    .as_ref()
+                    .ok_or_else(|| crate::AuthError::Unsupported("OAuth login".into()))?
+                    .login(interaction)
+                    .await?
+            }
+        };
+        let saved = credential.clone();
+        self.credentials
+            .modify(
+                provider_id,
+                Box::new(move |_| Box::pin(async move { Ok(Some(saved)) })),
+                interaction.cancellation(),
+            )
+            .await?;
+        Ok(credential)
+    }
+
+    pub async fn logout(
+        &self,
+        provider_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), crate::AuthError> {
+        self.credentials.delete(provider_id, cancellation).await
+    }
 }
 
 fn error_stream(model: &Model, message: String) -> AssistantMessageEventStream {
+    AssistantMessageEventStream::new(futures_stream::iter([error_event(model, message)]))
+}
+
+fn error_event(model: &Model, message: String) -> AssistantMessageEvent {
     let error = AssistantMessage {
         content: Vec::new(),
         api: model.api.clone(),
@@ -213,17 +420,268 @@ fn error_stream(model: &Model, message: String) -> AssistantMessageEventStream {
         end_turn: None,
         timestamp: timestamp(),
     };
-    AssistantMessageEventStream::new(stream::iter([AssistantMessageEvent::Error {
+    AssistantMessageEvent::Error {
         reason: StopReason::Error,
         error,
-    }]))
+    }
 }
 
 fn timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+fn lazy_stream(
+    model: Model,
+    setup: impl Future<Output = Result<AssistantMessageEventStream, crate::AuthError>> + Send + 'static,
+) -> AssistantMessageEventStream {
+    let output = stream! {
+        let mut source = match setup.await {
+            Ok(source) => source,
+            Err(error) => {
+                yield error_event(&model, error.to_string());
+                return;
+            }
+        };
+        let mut terminal = false;
+        while let Some(event) = source.next().await {
+            terminal = matches!(
+                event,
+                AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. }
+            );
+            yield event;
+        }
+        if !terminal {
+            yield error_event(&model, "Provider stream ended without a terminal event".into());
+        }
+    };
+    AssistantMessageEventStream::new(output)
+}
+
+fn apply_auth(
+    provider: &Arc<dyn Provider>,
+    model: &Model,
+    mut options: StreamOptions,
+    resolution: crate::AuthResult,
+) -> (Model, StreamOptions) {
+    let mut model = model.clone();
+    if let Some(base_url) = resolution.auth.base_url {
+        model.base_url = base_url;
+    }
+    options.api_key = options.api_key.or(resolution.auth.api_key);
+    options.env = resolution.env.into_iter().chain(options.env).collect();
+    options.headers = merge_headers(
+        provider.headers(),
+        &model.headers,
+        &resolution.auth.headers,
+        &options.headers,
+    );
+    (model, options)
+}
+
+fn merge_headers(
+    provider: &BTreeMap<String, Option<String>>,
+    model: &BTreeMap<String, String>,
+    auth: &BTreeMap<String, Option<String>>,
+    request: &BTreeMap<String, Option<String>>,
+) -> BTreeMap<String, Option<String>> {
+    let mut headers = BTreeMap::new();
+    for (name, value) in provider {
+        insert_header(&mut headers, name, value.clone());
+    }
+    for (name, value) in model {
+        insert_header(&mut headers, name, Some(value.clone()));
+    }
+    for (name, value) in auth {
+        insert_header(&mut headers, name, value.clone());
+    }
+    for (name, value) in request {
+        insert_header(&mut headers, name, value.clone());
+    }
+    headers
+}
+
+fn insert_header(
+    headers: &mut BTreeMap<String, Option<String>>,
+    name: &str,
+    value: Option<String>,
+) {
+    if let Some(existing) = headers
+        .keys()
+        .find(|existing| existing.eq_ignore_ascii_case(name))
+        .cloned()
+    {
+        headers.remove(&existing);
+    }
+    headers.insert(name.to_owned(), value);
+}
+
+async fn resolve_auth(
+    provider: Arc<dyn Provider>,
+    credentials: Arc<dyn crate::CredentialStore>,
+    auth_context: Arc<dyn crate::AuthContext>,
+    overrides: crate::AuthResolutionOverrides,
+) -> Result<Option<crate::AuthResult>, crate::AuthError> {
+    if overrides.cancellation.is_cancelled() {
+        return Err(crate::AuthError::Cancelled);
+    }
+    let context = OverlayAuthContext {
+        base: auth_context,
+        env: overrides.env.clone(),
+    };
+    if let (Some(api_key), Some(auth)) = (&overrides.api_key, &provider.auth().api_key) {
+        return auth
+            .resolve(
+                &context,
+                Some(&crate::Credential::ApiKey {
+                    key: Some(api_key.clone()),
+                    env: overrides.env,
+                }),
+                &overrides.cancellation,
+            )
+            .await;
+    }
+    let stored = credentials
+        .read(provider.id().as_str(), &overrides.cancellation)
+        .await?;
+    match stored {
+        Some(credential @ crate::Credential::OAuth { .. }) => {
+            let Some(oauth) = &provider.auth().oauth else {
+                return Ok(None);
+            };
+            resolve_oauth(
+                credentials,
+                provider.id().clone(),
+                oauth.clone(),
+                credential,
+                overrides,
+            )
+            .await
+        }
+        Some(mut credential @ crate::Credential::ApiKey { .. }) => {
+            let Some(auth) = &provider.auth().api_key else {
+                return Ok(None);
+            };
+            if let crate::Credential::ApiKey { env, .. } = &mut credential {
+                env.extend(overrides.env);
+            }
+            auth.resolve(&context, Some(&credential), &overrides.cancellation)
+                .await
+        }
+        None => match &provider.auth().api_key {
+            Some(auth) => auth.resolve(&context, None, &overrides.cancellation).await,
+            None => Ok(None),
+        },
+    }
+}
+
+async fn resolve_oauth(
+    credentials: Arc<dyn crate::CredentialStore>,
+    provider_id: ProviderId,
+    oauth: Arc<dyn crate::OAuthAuth>,
+    stored: crate::Credential,
+    overrides: crate::AuthResolutionOverrides,
+) -> Result<Option<crate::AuthResult>, crate::AuthError> {
+    let minimum = overrides
+        .minimum_oauth_validity
+        .unwrap_or(Duration::from_secs(5 * 60))
+        .max(Duration::from_secs(5 * 60));
+    let explicit_minimum = overrides.minimum_oauth_validity.is_some();
+    let mut credential = stored;
+    if expires_soon(&credential, minimum) {
+        let refresh = oauth.clone();
+        let cancellation = overrides.cancellation.clone();
+        credential = credentials
+            .modify(
+                provider_id.as_str(),
+                Box::new(move |current| {
+                    Box::pin(async move {
+                        let Some(current @ crate::Credential::OAuth { .. }) = current else {
+                            return Ok(None);
+                        };
+                        if !expires_soon(&current, minimum) {
+                            return Ok(None);
+                        }
+                        match tokio::time::timeout(
+                            Duration::from_secs(15),
+                            refresh.refresh(&current, &cancellation),
+                        )
+                        .await
+                        {
+                            Ok(result) => result.map(Some),
+                            Err(_) => Err(crate::AuthError::OAuth("refresh timed out".into())),
+                        }
+                    })
+                }),
+                &overrides.cancellation,
+            )
+            .await?
+            .ok_or_else(|| crate::AuthError::OAuth("credential was removed".into()))?;
+        if explicit_minimum && expires_soon(&credential, minimum) {
+            return Err(crate::AuthError::OAuth(
+                "refresh returned a token that expires too soon".into(),
+            ));
+        }
+    }
+    let auth = oauth.to_auth(&credential).await?;
+    Ok(Some(crate::AuthResult {
+        auth,
+        source: Some("OAuth".into()),
+        ..Default::default()
+    }))
+}
+
+fn expires_soon(credential: &crate::Credential, minimum: Duration) -> bool {
+    let crate::Credential::OAuth { expires, .. } = credential else {
+        return false;
+    };
+    timestamp().saturating_add(duration_millis(minimum)) >= *expires
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+async fn check_provider_auth(
+    provider: &Arc<dyn Provider>,
+    credential: Option<&crate::Credential>,
+    auth_context: &dyn crate::AuthContext,
+    cancellation: &CancellationToken,
+) -> Result<Option<crate::AuthCheck>, crate::AuthError> {
+    match credential {
+        Some(crate::Credential::OAuth { .. }) if provider.auth().oauth.is_some() => {
+            Ok(Some(crate::AuthCheck {
+                source: Some("OAuth".into()),
+                credential_type: crate::CredentialType::OAuth,
+            }))
+        }
+        Some(crate::Credential::ApiKey { .. }) | None => match &provider.auth().api_key {
+            Some(auth) => auth.check(auth_context, credential, cancellation).await,
+            None => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+struct OverlayAuthContext {
+    base: Arc<dyn crate::AuthContext>,
+    env: BTreeMap<String, String>,
+}
+
+#[async_trait]
+impl crate::AuthContext for OverlayAuthContext {
+    async fn env(&self, name: &str) -> Option<String> {
+        match self.env.get(name).filter(|value| !value.is_empty()) {
+            Some(value) => Some(value.clone()),
+            None => self.base.env(name).await,
+        }
+    }
+
+    async fn file_exists(&self, path: &str) -> bool {
+        self.base.file_exists(path).await
+    }
 }
