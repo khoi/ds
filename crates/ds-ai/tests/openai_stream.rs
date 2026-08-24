@@ -1210,6 +1210,66 @@ async fn encodes_openai_prompt_cache_retention_and_session_keys() {
     assert!(disabled_body.get("prompt_cache_retention").is_none());
 }
 
+#[tokio::test]
+async fn preserves_openai_http_error_and_response_metadata() {
+    let failure = Reply::json(
+        429,
+        json!({"error": {"code": "rate_limit_exceeded", "message": "Too many requests"}}),
+    )
+    .with_header("x-request-id", "req_failure")
+    .with_header("retry-after-ms", "250")
+    .with_header("x-ratelimit-limit-requests", "100")
+    .with_header("x-ratelimit-remaining-requests", "0")
+    .with_header("x-ratelimit-reset-requests", "1s");
+    let failure_server = serve([failure]).await;
+    let failure_model = openai::Model::new("gpt-5.6").with_base_url(&failure_server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options = openai::Options::new("test-key");
+
+    match openai::stream(&failure_model, &context, &options).await {
+        Err(ds_ai::Error::Provider {
+            status,
+            code,
+            message,
+            request_id,
+            retry_after,
+            rate_limits,
+        }) => {
+            assert_eq!(status, 429);
+            assert_eq!(code.as_deref(), Some("rate_limit_exceeded"));
+            assert_eq!(message, "Too many requests");
+            assert_eq!(request_id.as_deref(), Some("req_failure"));
+            assert_eq!(retry_after, Some(std::time::Duration::from_millis(250)));
+            assert_eq!(rate_limits.limit_requests, Some(100));
+            assert_eq!(rate_limits.remaining_requests, Some(0));
+            assert_eq!(rate_limits.reset_requests.as_deref(), Some("1s"));
+        }
+        _ => panic!("unexpected provider result"),
+    }
+
+    let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_metadata\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
+    let success = Reply::sse(sse)
+        .with_header("x-request-id", "req_success")
+        .with_header("x-ratelimit-limit-tokens", "1000")
+        .with_header("x-ratelimit-remaining-tokens", "900")
+        .with_header("x-ratelimit-reset-tokens", "2s");
+    let success_server = serve([success]).await;
+    let success_model = openai::Model::new("gpt-5.6").with_base_url(&success_server.base_url);
+    let events = openai::stream(&success_model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    let response = done(&events);
+    assert_eq!(response.metadata.request_id.as_deref(), Some("req_success"));
+    assert_eq!(response.metadata.rate_limits.limit_tokens, Some(1000));
+    assert_eq!(response.metadata.rate_limits.remaining_tokens, Some(900));
+    assert_eq!(
+        response.metadata.rate_limits.reset_tokens.as_deref(),
+        Some("2s")
+    );
+}
+
 fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {
     match events.last() {
         Some(Ok(Event::Done(response))) => response,

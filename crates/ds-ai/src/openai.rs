@@ -1,7 +1,7 @@
 use crate::{
-    CacheRetention, Content, Context, Error, Event, InputContent, Message, Response,
-    ResponseStream, StopReason, TimeoutPhase, ToolCall, ToolResult, Usage, retry, sse,
-    types::OpenAiReplay,
+    CacheRetention, Content, Context, Error, Event, InputContent, Message, RateLimits, Response,
+    ResponseMetadata, ResponseStream, StopReason, TimeoutPhase, ToolCall, ToolResult, Usage, retry,
+    sse, types::OpenAiReplay,
 };
 use async_stream::stream;
 use futures_util::StreamExt;
@@ -619,11 +619,36 @@ pub async fn stream(
         }
     };
     let status = response.status();
+    let metadata = response_metadata(response.headers());
     if !status.is_success() {
+        let retry_after = retry::requested_delay(response.headers());
         let body = response.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+        let code = parsed
+            .as_ref()
+            .and_then(|body| body.pointer("/error/code"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let message = parsed
+            .as_ref()
+            .and_then(|body| body.pointer("/error/message"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| {
+                if body.is_empty() {
+                    format!("provider returned HTTP {}", status.as_u16())
+                } else {
+                    body
+                }
+            });
         return Err(Error::Provider {
             status: status.as_u16(),
-            body,
+            code,
+            message,
+            request_id: metadata.request_id,
+            retry_after,
+            rate_limits: metadata.rate_limits,
         });
     }
 
@@ -635,6 +660,7 @@ pub async fn stream(
         let mut chunks = response.bytes_stream();
         let mut decoder = sse::Decoder::default();
         let mut result = Response::openai(response_model);
+        result.metadata = metadata;
         let mut slots = HashMap::new();
         let mut saw_event = false;
         let mut event_deadline = first_event_timeout.map(|timeout| Instant::now() + timeout);
@@ -863,7 +889,7 @@ pub async fn stream(
                             StopReason::Stop
                         };
                         result.raw_stop_reason = Some("completed".into());
-                        yield Ok(Event::Done(result));
+                        yield Ok(Event::Done(Box::new(result)));
                         return;
                     }
                     StreamEvent::Incomplete { response }
@@ -873,7 +899,7 @@ pub async fn stream(
                         result.usage = usage(response.usage);
                         result.stop_reason = StopReason::Length;
                         result.raw_stop_reason = Some("incomplete.max_output_tokens".into());
-                        yield Ok(Event::Done(result));
+                        yield Ok(Event::Done(Box::new(result)));
                         return;
                     }
                     StreamEvent::Incomplete { response } => {
@@ -939,6 +965,31 @@ fn parse_arguments(arguments: &str) -> serde_json::Value {
 
 fn clamp_cache_key(key: &str) -> String {
     key.chars().take(64).collect()
+}
+
+fn response_metadata(headers: &reqwest::header::HeaderMap) -> ResponseMetadata {
+    ResponseMetadata {
+        request_id: header(headers, "x-request-id"),
+        rate_limits: RateLimits {
+            limit_requests: header_u64(headers, "x-ratelimit-limit-requests"),
+            remaining_requests: header_u64(headers, "x-ratelimit-remaining-requests"),
+            reset_requests: header(headers, "x-ratelimit-reset-requests"),
+            limit_tokens: header_u64(headers, "x-ratelimit-limit-tokens"),
+            remaining_tokens: header_u64(headers, "x-ratelimit-remaining-tokens"),
+            reset_tokens: header(headers, "x-ratelimit-reset-tokens"),
+        },
+    }
+}
+
+fn header(headers: &reqwest::header::HeaderMap, name: &'static str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+fn header_u64(headers: &reqwest::header::HeaderMap, name: &'static str) -> Option<u64> {
+    header(headers, name).and_then(|value| value.parse().ok())
 }
 
 async fn wait_for(timeout: Option<Duration>) {

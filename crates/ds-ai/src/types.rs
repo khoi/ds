@@ -6,7 +6,7 @@ use thiserror::Error;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     User(Vec<InputContent>),
-    Assistant(Response),
+    Assistant(Box<Response>),
     ToolResult(ToolResult),
 }
 
@@ -20,7 +20,7 @@ impl Message {
     }
 
     pub fn assistant(response: Response) -> Self {
-        Self::Assistant(response)
+        Self::Assistant(Box::new(response))
     }
 
     pub fn tool_result(result: ToolResult) -> Self {
@@ -165,8 +165,25 @@ pub struct Response {
     pub usage: Usage,
     pub stop_reason: StopReason,
     pub raw_stop_reason: Option<String>,
+    pub metadata: ResponseMetadata,
     #[serde(default, rename = "_provider")]
     provider: ProviderState,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResponseMetadata {
+    pub request_id: Option<String>,
+    pub rate_limits: RateLimits,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RateLimits {
+    pub limit_requests: Option<u64>,
+    pub remaining_requests: Option<u64>,
+    pub reset_requests: Option<String>,
+    pub limit_tokens: Option<u64>,
+    pub remaining_tokens: Option<u64>,
+    pub reset_tokens: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -242,15 +259,22 @@ pub enum Event {
     TextDelta { content_index: usize, delta: String },
     ReasoningDelta { content_index: usize, delta: String },
     ToolCallDelta { content_index: usize, delta: String },
-    Done(Response),
+    Done(Box<Response>),
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum Error {
     #[error("HTTP request failed: {0}")]
     Http(String),
-    #[error("provider returned HTTP {status}: {body}")]
-    Provider { status: u16, body: String },
+    #[error("provider returned HTTP {status}: {message}")]
+    Provider {
+        status: u16,
+        code: Option<String>,
+        message: String,
+        request_id: Option<String>,
+        retry_after: Option<Duration>,
+        rate_limits: RateLimits,
+    },
     #[error("invalid provider stream: {0}")]
     Stream(String),
     #[error("provider stream ended before a terminal event")]

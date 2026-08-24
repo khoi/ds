@@ -70,26 +70,26 @@ fn is_retryable(response: &Response) -> bool {
 }
 
 fn delay(headers: &HeaderMap, retry_index: usize) -> Duration {
+    requested_delay(headers).unwrap_or_else(|| backoff(retry_index))
+}
+
+pub(crate) fn requested_delay(headers: &HeaderMap) -> Option<Duration> {
     if let Some(delay) = headers
         .get("retry-after-ms")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| parse_duration(value, 0.001))
     {
-        return delay;
+        return Some(delay);
     }
-    let Some(value) = headers
+    let value = headers
         .get("retry-after")
-        .and_then(|value| value.to_str().ok())
-    else {
-        return backoff(retry_index);
-    };
+        .and_then(|value| value.to_str().ok())?;
     if let Some(delay) = parse_duration(value, 1.0) {
-        return delay;
+        return Some(delay);
     }
     httpdate::parse_http_date(value)
         .ok()
         .and_then(|time| time.duration_since(SystemTime::now()).ok())
-        .unwrap_or_else(|| backoff(retry_index))
 }
 
 fn parse_duration(value: &str, seconds_per_unit: f64) -> Option<Duration> {
