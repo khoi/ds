@@ -704,6 +704,10 @@ fn output_slot(
             Slot::Text(content_index),
             crate::legacy::ProviderEvent::TextStart {
                 content_index,
+                content: crate::TextContent {
+                    text: String::new(),
+                    text_signature: None,
+                },
                 stop_reason: (item.phase.as_deref() == Some("final_answer"))
                     .then_some(StopReason::Stop),
             },
@@ -711,7 +715,14 @@ fn output_slot(
         "reasoning" => Some((
             Content::Reasoning(String::new()),
             Slot::Reasoning(content_index),
-            crate::legacy::ProviderEvent::ThinkingStart { content_index },
+            crate::legacy::ProviderEvent::ThinkingStart {
+                content_index,
+                content: crate::ThinkingContent {
+                    thinking: String::new(),
+                    thinking_signature: None,
+                    redacted: None,
+                },
+            },
         )),
         "function_call" => {
             let call_id = item.call_id.clone()?;

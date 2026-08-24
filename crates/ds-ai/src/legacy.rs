@@ -13,8 +13,10 @@ use std::{
 
 pub(crate) enum ProviderEvent {
     ResponseId(String),
+    ResponseModel(String),
     TextStart {
         content_index: usize,
+        content: TextContent,
         stop_reason: Option<StopReason>,
     },
     TextEnd {
@@ -28,6 +30,7 @@ pub(crate) enum ProviderEvent {
     },
     ThinkingStart {
         content_index: usize,
+        content: ThinkingContent,
     },
     ThinkingEnd {
         content_index: usize,
@@ -86,18 +89,19 @@ pub(crate) fn adapt_provider(
                 Ok(ProviderEvent::ResponseId(response_id)) => {
                     partial.response_id = Some(response_id);
                 }
+                Ok(ProviderEvent::ResponseModel(response_model)) => {
+                    partial.response_model = Some(response_model);
+                }
                 Ok(ProviderEvent::TextStart {
                     content_index,
+                    content,
                     stop_reason,
                 }) => {
                     if let Some(stop_reason) = stop_reason {
                         partial.stop_reason = stop_reason;
                     }
                     if started.insert(content_index) {
-                        partial.content.push(AssistantContent::Text(TextContent {
-                            text: String::new(),
-                            text_signature: None,
-                        }));
+                        partial.content.push(AssistantContent::Text(content));
                         yield AssistantMessageEvent::TextStart {
                             content_index,
                             partial: partial.clone(),
@@ -152,13 +156,12 @@ pub(crate) fn adapt_provider(
                         partial: partial.clone(),
                     };
                 }
-                Ok(ProviderEvent::ThinkingStart { content_index }) => {
+                Ok(ProviderEvent::ThinkingStart {
+                    content_index,
+                    content,
+                }) => {
                     if started.insert(content_index) {
-                        partial.content.push(AssistantContent::Thinking(ThinkingContent {
-                            thinking: String::new(),
-                            thinking_signature: None,
-                            redacted: None,
-                        }));
+                        partial.content.push(AssistantContent::Thinking(content));
                         yield AssistantMessageEvent::ThinkingStart {
                             content_index,
                             partial: partial.clone(),
@@ -321,12 +324,43 @@ pub(crate) fn response_stream(mut source: ProviderEventStream) -> ResponseStream
     Box::pin(stream! {
         while let Some(event) = source.next().await {
             match event {
-                Ok(ProviderEvent::ResponseId(_)
-                | ProviderEvent::TextStart { .. }
+                Ok(ProviderEvent::ResponseId(_) | ProviderEvent::ResponseModel(_)) => {}
+                Ok(ProviderEvent::TextStart {
+                    content_index,
+                    content,
+                    ..
+                }) if !content.text.is_empty() => {
+                    yield Ok(Event::TextDelta {
+                        content_index,
+                        delta: content.text,
+                    });
+                }
+                Ok(ProviderEvent::ThinkingStart {
+                    content_index,
+                    content,
+                }) if !content.thinking.is_empty() => {
+                    yield Ok(Event::ReasoningDelta {
+                        content_index,
+                        delta: content.thinking,
+                    });
+                }
+                Ok(ProviderEvent::ToolCallStart {
+                    content_index: _,
+                    tool_call,
+                }) if tool_call.arguments.as_object().is_none_or(serde_json::Map::is_empty) => {}
+                Ok(ProviderEvent::ToolCallStart {
+                    content_index,
+                    tool_call,
+                }) => {
+                    yield Ok(Event::ToolCallDelta {
+                        content_index,
+                        delta: tool_call.arguments.to_string(),
+                    });
+                }
+                Ok(ProviderEvent::TextStart { .. }
                 | ProviderEvent::TextEnd { .. }
                 | ProviderEvent::ThinkingStart { .. }
                 | ProviderEvent::ThinkingEnd { .. }
-                | ProviderEvent::ToolCallStart { .. }
                 | ProviderEvent::ToolCallEnd { .. }) => {}
                 Ok(ProviderEvent::TextDelta { content_index, delta }) => {
                     yield Ok(Event::TextDelta { content_index, delta });

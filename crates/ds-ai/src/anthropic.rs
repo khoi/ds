@@ -1,7 +1,8 @@
 use crate::{
-    AssistantContent, CacheRetention, Content, Context, Error, Event, InputContent, Message,
-    RateLimits, Response, ResponseMetadata, ResponseStream, StopReason, ToolResultMessage, Usage,
-    UserContent, constrained_sampling, http, json, retry, schema, transport,
+    AssistantContent, AssistantToolCall, CacheRetention, Content, Context, Error, InputContent,
+    Message, RateLimits, Response, ResponseMetadata, ResponseStream, StopReason, TextContent,
+    ThinkingContent, ToolResultMessage, Usage, UserContent, constrained_sampling, http, json,
+    retry, schema, transport,
     types::{AnthropicReasoning, normalize_id},
 };
 use async_stream::stream;
@@ -68,7 +69,7 @@ impl Provider {
         let requested_model = model.clone();
         let context = context.for_model(&requested_model);
         let options = options.clone();
-        crate::legacy::adapt(requested_model.clone(), async move {
+        crate::legacy::adapt_provider(requested_model.clone(), async move {
             let thinking = resolve_thinking(&requested_model, &options);
             let tool_choice = options.tool_choice;
             let stream_options = options.stream;
@@ -114,7 +115,7 @@ impl Provider {
             if let Some(tool_choice) = tool_choice {
                 provider_options = provider_options.with_tool_choice(tool_choice);
             }
-            stream(&provider_model, &context, &provider_options).await
+            response_events(&provider_model, &context, &provider_options).await
         })
     }
 }
@@ -850,7 +851,10 @@ enum Slot {
         content_index: usize,
         signature: String,
     },
-    Redacted,
+    Redacted {
+        content_index: usize,
+        data: String,
+    },
     ToolCall {
         content_index: usize,
         partial_json: String,
@@ -862,6 +866,16 @@ pub async fn stream(
     context: &Context,
     options: &Options,
 ) -> Result<ResponseStream, Error> {
+    response_events(model, context, options)
+        .await
+        .map(crate::legacy::response_stream)
+}
+
+async fn response_events(
+    model: &Model,
+    context: &Context,
+    options: &Options,
+) -> Result<crate::legacy::ProviderEventStream, Error> {
     let overall_deadline = options
         .overall_timeout
         .map(|timeout| Instant::now() + timeout);
@@ -1033,7 +1047,7 @@ pub async fn stream(
             idle_timeout,
             overall_deadline,
         );
-        let mut result = Response::anthropic(response_model);
+        let mut result = Response::anthropic(response_model.clone());
         result.metadata = metadata;
         let mut slots = HashMap::new();
         let mut terminal_error = None;
@@ -1079,8 +1093,12 @@ pub async fn stream(
             };
             match event {
                     StreamEvent::MessageStart { message } => {
-                        result.id = Some(message.id);
+                        result.id = Some(message.id.clone());
+                        yield Ok(crate::legacy::ProviderEvent::ResponseId(message.id));
                         if let Some(model) = message.model {
+                            if model != response_model {
+                                yield Ok(crate::legacy::ProviderEvent::ResponseModel(model.clone()));
+                            }
                             result.set_anthropic_model(model);
                         }
                         result.usage.cache_write_1h = Some(
@@ -1100,9 +1118,14 @@ pub async fn stream(
                         let text = content_block.text;
                         result.content.push(Content::Text(text.clone()));
                         slots.insert(index, Slot::Text(content_index));
-                        if !text.is_empty() {
-                            yield Ok(Event::TextDelta { content_index, delta: text });
-                        }
+                        yield Ok(crate::legacy::ProviderEvent::TextStart {
+                            content_index,
+                            content: TextContent {
+                                text,
+                                text_signature: None,
+                            },
+                            stop_reason: None,
+                        });
                     }
                     StreamEvent::ContentBlockStart { index, content_block }
                         if content_block.r#type == "thinking" =>
@@ -1112,28 +1135,38 @@ pub async fn stream(
                         result.content.push(Content::Reasoning(thinking.clone()));
                         slots.insert(index, Slot::Thinking {
                             content_index,
-                            signature: content_block.signature,
+                            signature: content_block.signature.clone(),
                         });
-                        if !thinking.is_empty() {
-                            yield Ok(Event::ReasoningDelta {
-                                content_index,
-                                delta: thinking,
-                            });
-                        }
+                        yield Ok(crate::legacy::ProviderEvent::ThinkingStart {
+                            content_index,
+                            content: ThinkingContent {
+                                thinking,
+                                thinking_signature: Some(content_block.signature),
+                                redacted: None,
+                            },
+                        });
                     }
                     StreamEvent::ContentBlockStart { index, content_block }
                         if content_block.r#type == "redacted_thinking" =>
                     {
                         let content_index = result.content.len();
                         result.content.push(Content::Reasoning("[Reasoning redacted]".into()));
+                        let data = content_block.data;
                         result.add_anthropic_reasoning(AnthropicReasoning::Redacted {
                             content_index,
-                            data: content_block.data,
+                            data: data.clone(),
                         });
-                        slots.insert(index, Slot::Redacted);
-                        yield Ok(Event::ReasoningDelta {
+                        slots.insert(index, Slot::Redacted {
                             content_index,
-                            delta: "[Reasoning redacted]".into(),
+                            data: data.clone(),
+                        });
+                        yield Ok(crate::legacy::ProviderEvent::ThinkingStart {
+                            content_index,
+                            content: ThinkingContent {
+                                thinking: "[Reasoning redacted]".into(),
+                                thinking_signature: Some(data),
+                                redacted: Some(true),
+                            },
                         });
                     }
                     StreamEvent::ContentBlockStart { index, content_block }
@@ -1150,24 +1183,25 @@ pub async fn stream(
                         }
                         let content_index = result.content.len();
                         let arguments = content_block.input.unwrap_or_else(|| serde_json::json!({}));
-                        let initial = (!arguments
-                            .as_object()
-                            .is_some_and(serde_json::Map::is_empty))
-                        .then(|| {
-                            serde_json::to_string(&arguments).expect("tool arguments serialize")
-                        });
                         result.content.push(Content::ToolCall(crate::ToolCall {
-                            id,
-                            name,
-                            arguments,
+                            id: id.clone(),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
                         }));
                         slots.insert(index, Slot::ToolCall {
                             content_index,
                             partial_json: String::new(),
                         });
-                        if let Some(delta) = initial {
-                            yield Ok(Event::ToolCallDelta { content_index, delta });
-                        }
+                        yield Ok(crate::legacy::ProviderEvent::ToolCallStart {
+                            content_index,
+                            tool_call: AssistantToolCall {
+                                id,
+                                name,
+                                arguments,
+                                thought_signature: None,
+                                namespace: None,
+                            },
+                        });
                     }
                     StreamEvent::ContentBlockDelta { index, delta } => {
                         match (delta.r#type.as_str(), slots.get_mut(&index)) {
@@ -1175,7 +1209,7 @@ pub async fn stream(
                                 if let Content::Text(text) = &mut result.content[*content_index] {
                                     text.push_str(&delta.text);
                                 }
-                                yield Ok(Event::TextDelta {
+                                yield Ok(crate::legacy::ProviderEvent::TextDelta {
                                     content_index: *content_index,
                                     delta: delta.text,
                                 });
@@ -1184,7 +1218,7 @@ pub async fn stream(
                                 if let Content::Reasoning(reasoning) = &mut result.content[*content_index] {
                                     reasoning.push_str(&delta.thinking);
                                 }
-                                yield Ok(Event::ReasoningDelta {
+                                yield Ok(crate::legacy::ProviderEvent::ReasoningDelta {
                                     content_index: *content_index,
                                     delta: delta.thinking,
                                 });
@@ -1197,7 +1231,7 @@ pub async fn stream(
                                 if let Content::ToolCall(call) = &mut result.content[*content_index] {
                                     call.arguments = parse_arguments(partial_json);
                                 }
-                                yield Ok(Event::ToolCallDelta {
+                                yield Ok(crate::legacy::ProviderEvent::ToolCallDelta {
                                     content_index: *content_index,
                                     delta: delta.partial_json,
                                 });
@@ -1207,11 +1241,45 @@ pub async fn stream(
                     }
                     StreamEvent::ContentBlockStop { index } => {
                         match slots.remove(&index) {
+                            Some(Slot::Text(content_index)) => {
+                                if let Content::Text(text) = &result.content[content_index] {
+                                    yield Ok(crate::legacy::ProviderEvent::TextEnd {
+                                        content_index,
+                                        content: TextContent {
+                                            text: text.clone(),
+                                            text_signature: None,
+                                        },
+                                        stop_reason: None,
+                                    });
+                                }
+                            }
                             Some(Slot::Thinking { content_index, signature }) => {
                                 result.add_anthropic_reasoning(AnthropicReasoning::Thinking {
                                     content_index,
-                                    signature,
+                                    signature: signature.clone(),
                                 });
+                                if let Content::Reasoning(thinking) = &result.content[content_index] {
+                                    yield Ok(crate::legacy::ProviderEvent::ThinkingEnd {
+                                        content_index,
+                                        content: ThinkingContent {
+                                            thinking: thinking.clone(),
+                                            thinking_signature: Some(signature),
+                                            redacted: None,
+                                        },
+                                    });
+                                }
+                            }
+                            Some(Slot::Redacted { content_index, data }) => {
+                                if let Content::Reasoning(thinking) = &result.content[content_index] {
+                                    yield Ok(crate::legacy::ProviderEvent::ThinkingEnd {
+                                        content_index,
+                                        content: ThinkingContent {
+                                            thinking: thinking.clone(),
+                                            thinking_signature: Some(data),
+                                            redacted: Some(true),
+                                        },
+                                    });
+                                }
                             }
                             Some(Slot::ToolCall { content_index, partial_json }) => {
                                 if let Content::ToolCall(call) = &mut result.content[content_index]
@@ -1219,8 +1287,20 @@ pub async fn stream(
                                 {
                                     call.arguments = parse_arguments(&partial_json);
                                 }
+                                if let Content::ToolCall(call) = &result.content[content_index] {
+                                    yield Ok(crate::legacy::ProviderEvent::ToolCallEnd {
+                                        content_index,
+                                        tool_call: AssistantToolCall {
+                                            id: call.id.clone(),
+                                            name: call.name.clone(),
+                                            arguments: call.arguments.clone(),
+                                            thought_signature: None,
+                                            namespace: None,
+                                        },
+                                    });
+                                }
                             }
-                            _ => {}
+                            None => {}
                         }
                     }
                     StreamEvent::MessageDelta { delta, usage } => {
@@ -1275,7 +1355,7 @@ pub async fn stream(
                                 partial: result,
                             });
                         } else {
-                            yield Ok(Event::Done(Box::new(result)));
+                            yield Ok(crate::legacy::ProviderEvent::Done(Box::new(result)));
                         }
                     return;
                 }

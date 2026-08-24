@@ -155,6 +155,99 @@ async fn emits_codex_content_events_with_partial_identity() {
 }
 
 #[tokio::test]
+async fn emits_anthropic_content_events_at_block_boundaries() {
+    let server = serve([Reply::sse(anthropic_blocks())]).await;
+    let mut model = builtin_model("anthropic", "claude-opus-4-5").unwrap();
+    model.base_url = server.base_url.clone();
+    let provider = ds_ai::anthropic::Provider::new([model.clone()]);
+    let mut stream = provider.stream(
+        &model,
+        &Context::new([Message::user("Hello")]),
+        &ApiStreamOptions::AnthropicMessages(AnthropicOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+    );
+    let mut events = Vec::new();
+
+    while let Some(event) = stream.next().await {
+        match event {
+            ds_ai::AssistantMessageEvent::TextStart { partial, .. } => {
+                events.push("text_start");
+                assert_eq!(partial.response_id.as_deref(), Some("msg_blocks"));
+                assert_eq!(partial.response_model.as_deref(), Some("claude-fallback"));
+                let AssistantContent::Text(content) = &partial.content[0] else {
+                    panic!("expected text content");
+                };
+                assert_eq!(content.text, "Hello");
+            }
+            ds_ai::AssistantMessageEvent::TextEnd {
+                content, partial, ..
+            } => {
+                events.push("text_end");
+                assert_eq!(content, "Hello");
+                assert_eq!(partial.stop_reason, StopReason::Pending);
+            }
+            ds_ai::AssistantMessageEvent::ThinkingStart {
+                content_index,
+                partial,
+            } => {
+                events.push("thinking_start");
+                let AssistantContent::Thinking(content) = &partial.content[content_index] else {
+                    panic!("expected thinking content");
+                };
+                if content_index == 1 {
+                    assert_eq!(content.thinking, "Think");
+                    assert_eq!(content.thinking_signature.as_deref(), Some("sig"));
+                    assert_eq!(content.redacted, None);
+                } else {
+                    assert_eq!(content.thinking, "[Reasoning redacted]");
+                    assert_eq!(content.thinking_signature.as_deref(), Some("sealed"));
+                    assert_eq!(content.redacted, Some(true));
+                }
+            }
+            ds_ai::AssistantMessageEvent::ThinkingEnd { partial, .. } => {
+                events.push("thinking_end");
+                assert_eq!(partial.stop_reason, StopReason::Pending);
+            }
+            ds_ai::AssistantMessageEvent::ToolCallStart { partial, .. } => {
+                events.push("toolcall_start");
+                let AssistantContent::ToolCall(tool_call) = &partial.content[3] else {
+                    panic!("expected tool call");
+                };
+                assert_eq!(tool_call.id, "toolu_1");
+                assert_eq!(tool_call.name, "lookup");
+                assert_eq!(tool_call.arguments, json!({"value": "x"}));
+            }
+            ds_ai::AssistantMessageEvent::ToolCallEnd { partial, .. } => {
+                events.push("toolcall_end");
+                assert_eq!(partial.stop_reason, StopReason::Pending);
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        events,
+        [
+            "text_start",
+            "text_end",
+            "thinking_start",
+            "thinking_end",
+            "thinking_start",
+            "thinking_end",
+            "toolcall_start",
+            "toolcall_end"
+        ]
+    );
+    assert_eq!(stream.result().await.unwrap().stop_reason, StopReason::Stop);
+    server.requests().await;
+}
+
+#[tokio::test]
 async fn tracks_openai_message_phases() {
     for (added, done, expected) in [
         (
@@ -1324,6 +1417,10 @@ fn openai_phased_done(added: &str, done: &str, incomplete: bool) -> String {
 
 fn anthropic_done() -> &'static str {
     "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+}
+
+fn anthropic_blocks() -> &'static str {
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_blocks\",\"model\":\"claude-fallback\",\"usage\":{}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"Hello\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"Think\",\"signature\":\"sig\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"sealed\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"lookup\",\"input\":{\"value\":\"x\"}}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 }
 
 fn token() -> String {
