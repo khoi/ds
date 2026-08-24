@@ -1287,6 +1287,10 @@ async fn encodes_openai_prompt_cache_retention_and_session_keys() {
         serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert!(disabled_body.get("prompt_cache_key").is_none());
     assert!(disabled_body.get("prompt_cache_retention").is_none());
+    assert_eq!(
+        disabled_body["prompt_cache_options"],
+        json!({"mode": "explicit"})
+    );
 }
 
 #[tokio::test]

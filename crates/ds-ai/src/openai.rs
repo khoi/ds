@@ -211,6 +211,13 @@ struct Request<'a> {
     prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_retention: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_options: Option<PromptCacheOptions>,
+}
+
+#[derive(Serialize)]
+struct PromptCacheOptions {
+    mode: &'static str,
 }
 
 #[derive(Serialize)]
@@ -436,6 +443,8 @@ pub async fn stream(
             CacheRetention::Long => Some("24h"),
             CacheRetention::None | CacheRetention::Short => None,
         },
+        prompt_cache_options: matches!(options.cache_retention, CacheRetention::None)
+            .then_some(PromptCacheOptions { mode: "explicit" }),
     };
     let client = reqwest::Client::new();
     let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
