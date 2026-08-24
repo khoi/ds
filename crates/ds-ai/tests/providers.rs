@@ -16,6 +16,9 @@ mod live;
 mod message_frame;
 #[path = "model.rs"]
 mod model;
+#[path = "models.rs"]
+mod models;
 #[path = "openai_stream.rs"]
 mod openai_stream;
 mod support;
+mod transcript;

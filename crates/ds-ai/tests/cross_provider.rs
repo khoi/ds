@@ -1,5 +1,7 @@
 use crate::support::{Reply, serve};
-use ds_ai::{CacheRetention, Context, Event, InputContent, Message, ToolResult, anthropic, openai};
+use ds_ai::{
+    CacheRetention, Context, Event, InputContent, Message, ToolResultMessage, anthropic, openai,
+};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
@@ -45,7 +47,7 @@ async fn normalizes_a_cross_provider_tool_transcript() {
     let target_context = Context::new([
         Message::user("Run"),
         Message::assistant(source_response),
-        Message::tool_result(ToolResult::new(
+        Message::tool_result(ToolResultMessage::new(
             "call_1|fc_1",
             "read",
             [InputContent::text("done")],
@@ -144,7 +146,7 @@ async fn replays_an_anthropic_transcript_to_openai() {
         &Context::new([
             Message::user("Run"),
             Message::assistant(source),
-            Message::tool_result(ToolResult::new(
+            Message::tool_result(ToolResultMessage::new(
                 "toolu/1|foreign",
                 "inspect",
                 [InputContent::text("done")],

@@ -6,7 +6,7 @@ use base64::prelude::*;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex as StdMutex, OnceLock},
     time::Duration,
 };
@@ -30,6 +30,150 @@ const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const WEBSOCKET_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 const WEBSOCKET_MAX_AGE: Duration = Duration::from_secs(55 * 60);
+
+pub struct Provider {
+    id: crate::ProviderId,
+    models: Vec<crate::Model>,
+    headers: BTreeMap<String, Option<String>>,
+}
+
+impl Provider {
+    pub fn new(models: impl IntoIterator<Item = crate::Model>) -> Self {
+        Self {
+            id: crate::ProviderId::new("openai-codex"),
+            models: models.into_iter().collect(),
+            headers: BTreeMap::new(),
+        }
+    }
+
+    fn request(
+        &self,
+        model: &crate::Model,
+        context: &Context,
+        options: &crate::StreamOptions,
+        thinking: Option<crate::ThinkingLevel>,
+        tool_choice: Option<crate::ToolChoice>,
+    ) -> crate::AssistantMessageEventStream {
+        if model.api != crate::Api::OpenAiCodexResponses {
+            let model = model.clone();
+            let api = model.api.clone();
+            return crate::legacy::adapt(model, async move {
+                Err(Error::InvalidRequest(format!(
+                    "Codex provider has no API implementation for {api}"
+                )))
+            });
+        }
+        let requested_model = model.clone();
+        let context = context.clone();
+        let options = options.clone();
+        crate::legacy::adapt(requested_model.clone(), async move {
+            let access_token = options
+                .api_key
+                .ok_or_else(|| Error::InvalidRequest("Codex access token is required".into()))?;
+            let provider_model =
+                Model::new(&requested_model.id).with_base_url(requested_model.base_url.clone());
+            let mut provider_options = Options::new(access_token)
+                .with_cancellation(options.cancellation)
+                .with_max_retries(options.max_retries.unwrap_or_default())
+                .with_max_retry_delay(options.max_retry_delay)
+                .with_cache_retention(options.cache_retention);
+            if let Some(temperature) = options.temperature {
+                provider_options = provider_options.with_temperature(temperature);
+            }
+            if let Some(timeout) = options.timeout {
+                provider_options = provider_options.with_overall_timeout(timeout);
+            }
+            if let Some(session_id) = options.session_id {
+                provider_options = provider_options.with_session_id(session_id);
+            }
+            if let Some(timeout) = options.websocket_connect_timeout {
+                provider_options = provider_options.with_websocket_connect_timeout(timeout);
+            }
+            if let Some(transport) = options.transport {
+                provider_options = provider_options.with_transport(match transport {
+                    crate::Transport::Sse => Transport::Sse,
+                    crate::Transport::WebSocket | crate::Transport::WebSocketCached => {
+                        Transport::WebSocket
+                    }
+                    crate::Transport::Auto => Transport::Auto,
+                });
+            }
+            if let Some(thinking) = thinking.and_then(reasoning_effort) {
+                provider_options =
+                    provider_options.with_reasoning(thinking, ReasoningSummary::Auto);
+            }
+            if let Some(tool_choice) = tool_choice {
+                provider_options = provider_options.with_tool_choice(match tool_choice {
+                    crate::ToolChoice::Auto => ToolChoice::Auto,
+                    crate::ToolChoice::None => ToolChoice::None,
+                });
+            }
+            stream(&provider_model, &context, &provider_options).await
+        })
+    }
+}
+
+impl crate::Provider for Provider {
+    fn id(&self) -> &crate::ProviderId {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        "OpenAI Codex"
+    }
+
+    fn base_url(&self) -> Option<&str> {
+        Some(DEFAULT_BASE_URL)
+    }
+
+    fn headers(&self) -> &BTreeMap<String, Option<String>> {
+        &self.headers
+    }
+
+    fn models(&self) -> Vec<crate::Model> {
+        self.models.clone()
+    }
+
+    fn stream(
+        &self,
+        model: &crate::Model,
+        context: &Context,
+        options: &crate::StreamOptions,
+    ) -> crate::AssistantMessageEventStream {
+        self.request(model, context, options, None, None)
+    }
+
+    fn stream_simple(
+        &self,
+        model: &crate::Model,
+        context: &Context,
+        options: &crate::SimpleStreamOptions,
+    ) -> crate::AssistantMessageEventStream {
+        self.request(
+            model,
+            context,
+            &options.stream,
+            options.thinking,
+            Some(options.tool_choice),
+        )
+    }
+}
+
+pub fn provider(models: impl IntoIterator<Item = crate::Model>) -> Arc<dyn crate::Provider> {
+    Arc::new(Provider::new(models))
+}
+
+fn reasoning_effort(level: crate::ThinkingLevel) -> Option<ReasoningEffort> {
+    match level {
+        crate::ThinkingLevel::Off => None,
+        crate::ThinkingLevel::Minimal => Some(ReasoningEffort::Minimal),
+        crate::ThinkingLevel::Low => Some(ReasoningEffort::Low),
+        crate::ThinkingLevel::Medium => Some(ReasoningEffort::Medium),
+        crate::ThinkingLevel::High => Some(ReasoningEffort::High),
+        crate::ThinkingLevel::XHigh => Some(ReasoningEffort::XHigh),
+        crate::ThinkingLevel::Max => Some(ReasoningEffort::Max),
+    }
+}
 
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 

@@ -1,52 +1,110 @@
+use crate::{
+    Api, AssistantContent, AssistantMessage, AssistantToolCall, ImageContent, ProviderId,
+    TextContent, ThinkingContent,
+};
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use std::{pin::Pin, time::Duration};
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum Message {
-    User(Vec<InputContent>),
-    Assistant(Box<Response>),
-    ToolResult(ToolResult),
+    User(UserMessage),
+    Assistant(Box<AssistantMessage>),
+    ToolResult(Box<ToolResultMessage>),
 }
 
 impl Message {
     pub fn user(content: impl Into<String>) -> Self {
-        Self::User(vec![InputContent::text(content)])
+        Self::User(UserMessage::new(content, timestamp()))
     }
 
     pub fn user_content(content: impl IntoIterator<Item = InputContent>) -> Self {
-        Self::User(content.into_iter().collect())
+        Self::User(UserMessage::with_blocks(content, timestamp()))
     }
 
-    pub fn assistant(response: Response) -> Self {
-        Self::Assistant(Box::new(response))
+    pub fn assistant(message: impl Into<AssistantMessage>) -> Self {
+        Self::Assistant(Box::new(message.into()))
     }
 
-    pub fn tool_result(result: ToolResult) -> Self {
-        Self::ToolResult(result)
+    pub fn tool_result(result: ToolResultMessage) -> Self {
+        Self::ToolResult(Box::new(result))
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ToolResult {
-    pub id: String,
-    pub name: String,
-    pub content: Vec<InputContent>,
-    pub is_error: bool,
+#[serde(rename_all = "camelCase")]
+pub struct UserMessage {
+    pub role: UserRole,
+    pub content: UserContent,
+    pub timestamp: u64,
 }
 
-impl ToolResult {
+impl UserMessage {
+    pub fn new(content: impl Into<String>, timestamp: u64) -> Self {
+        Self {
+            role: UserRole::User,
+            content: UserContent::Text(content.into()),
+            timestamp,
+        }
+    }
+
+    pub fn with_blocks(content: impl IntoIterator<Item = InputContent>, timestamp: u64) -> Self {
+        Self {
+            role: UserRole::User,
+            content: UserContent::Blocks(content.into_iter().collect()),
+            timestamp,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UserRole {
+    User,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UserContent {
+    Text(String),
+    Blocks(Vec<InputContent>),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolResultMessage {
+    pub role: ToolResultRole,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub content: Vec<InputContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added_tool_names: Option<Vec<String>>,
+    pub is_error: bool,
+    pub timestamp: u64,
+}
+
+impl ToolResultMessage {
     pub fn new(
         id: impl Into<String>,
         name: impl Into<String>,
         content: impl IntoIterator<Item = InputContent>,
     ) -> Self {
         Self {
-            id: id.into(),
-            name: name.into(),
+            role: ToolResultRole::ToolResult,
+            tool_call_id: id.into(),
+            tool_name: name.into(),
             content: content.into_iter().collect(),
+            details: None,
+            usage: None,
+            added_tool_names: None,
             is_error: false,
+            timestamp: timestamp(),
         }
     }
 
@@ -56,43 +114,56 @@ impl ToolResult {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolResultRole {
+    ToolResult,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
 pub enum InputContent {
-    Text(String),
-    Image { media_type: String, data: String },
+    Text(TextContent),
+    Image(ImageContent),
 }
 
 impl InputContent {
     pub fn text(text: impl Into<String>) -> Self {
-        Self::Text(text.into())
+        Self::Text(TextContent {
+            text: text.into(),
+            text_signature: None,
+        })
     }
 
     pub fn image(media_type: impl Into<String>, data: impl Into<String>) -> Self {
-        Self::Image {
-            media_type: media_type.into(),
+        Self::Image(ImageContent {
+            mime_type: media_type.into(),
             data: data.into(),
-        }
+        })
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Context {
-    system: Option<String>,
-    messages: Vec<Message>,
-    tools: Vec<Tool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    pub messages: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<Tool>,
 }
 
 impl Context {
     pub fn new(messages: impl IntoIterator<Item = Message>) -> Self {
         Self {
-            system: None,
+            system_prompt: None,
             messages: messages.into_iter().collect(),
             tools: Vec::new(),
         }
     }
 
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
-        self.system = Some(system.into());
+        self.system_prompt = Some(system.into());
         self
     }
 
@@ -106,7 +177,7 @@ impl Context {
     }
 
     pub(crate) fn system(&self) -> Option<&str> {
-        self.system.as_deref()
+        self.system_prompt.as_deref()
     }
 
     pub(crate) fn tools(&self) -> &[Tool] {
@@ -115,11 +186,13 @@ impl Context {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Tool {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
-    strict: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constrained_sampling: Option<ConstrainedSampling>,
 }
 
 impl Tool {
@@ -132,18 +205,97 @@ impl Tool {
             name: name.into(),
             description: description.into(),
             parameters,
-            strict: false,
+            constrained_sampling: None,
         }
     }
 
     pub fn with_strict(mut self) -> Self {
-        self.strict = true;
+        self.constrained_sampling = Some(ConstrainedSampling::JsonSchema {
+            strict: ConstrainedSamplingStrictness::Require,
+        });
         self
     }
 
     pub(crate) fn strict(&self) -> bool {
-        self.strict
+        matches!(
+            self.constrained_sampling,
+            Some(ConstrainedSampling::JsonSchema { .. })
+        )
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConstrainedSampling {
+    Disabled,
+    JsonSchema {
+        strict: ConstrainedSamplingStrictness,
+    },
+    Grammar {
+        variants: GrammarVariants,
+    },
+}
+
+impl Serialize for ConstrainedSampling {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Disabled => serializer.serialize_bool(false),
+            Self::JsonSchema { strict } => {
+                ConstrainedSamplingConfig::JsonSchema { strict: *strict }.serialize(serializer)
+            }
+            Self::Grammar { variants } => ConstrainedSamplingConfig::Grammar {
+                variants: variants.clone(),
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ConstrainedSampling {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::Bool(false) => Ok(Self::Disabled),
+            serde_json::Value::Bool(true) => Err(serde::de::Error::custom(
+                "constrained sampling boolean must be false",
+            )),
+            value => match serde_json::from_value(value).map_err(serde::de::Error::custom)? {
+                ConstrainedSamplingConfig::JsonSchema { strict } => Ok(Self::JsonSchema { strict }),
+                ConstrainedSamplingConfig::Grammar { variants } => Ok(Self::Grammar { variants }),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ConstrainedSamplingConfig {
+    JsonSchema {
+        strict: ConstrainedSamplingStrictness,
+    },
+    Grammar {
+        variants: GrammarVariants,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstrainedSamplingStrictness {
+    Prefer,
+    Require,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GrammarVariants {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai_lark: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai_regex: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -167,7 +319,9 @@ pub struct Usage {
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write_1h: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<u64>,
     pub total_tokens: u64,
     pub cost: UsageCost,
@@ -213,7 +367,7 @@ pub struct RateLimits {
     pub reset_tokens: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StopReason {
     #[default]
@@ -221,9 +375,9 @@ pub enum StopReason {
     Stop,
     Length,
     ToolUse,
-    Pause,
     Error,
     Aborted,
+    Deferred,
 }
 
 impl Response {
@@ -234,13 +388,6 @@ impl Response {
                 items: Vec::new(),
             }),
             ..Self::default()
-        }
-    }
-
-    pub(crate) fn openai_items(&self, model: &str) -> Option<&[OpenAiReplay]> {
-        match &self.provider {
-            ProviderState::OpenAi(state) if state.model == model => Some(&state.items),
-            _ => None,
         }
     }
 
@@ -283,17 +430,177 @@ impl Response {
         }
     }
 
-    pub(crate) fn anthropic_state(&self) -> Option<(&str, &[AnthropicReasoning])> {
-        match &self.provider {
-            ProviderState::Anthropic(state) => Some((&state.model, &state.reasoning)),
-            _ => None,
-        }
-    }
-
     pub(crate) fn add_anthropic_reasoning(&mut self, reasoning: AnthropicReasoning) {
         if let ProviderState::Anthropic(state) = &mut self.provider {
             state.reasoning.push(reasoning);
         }
+    }
+
+    pub fn into_assistant_message(self, timestamp: u64) -> AssistantMessage {
+        let (api, provider, model) = match &self.provider {
+            ProviderState::OpenAi(state) => (
+                Api::OpenAiResponses,
+                ProviderId::new("openai"),
+                state.model.clone(),
+            ),
+            ProviderState::Anthropic(state) => (
+                Api::AnthropicMessages,
+                ProviderId::new("anthropic"),
+                state.model.clone(),
+            ),
+            ProviderState::None => (
+                Api::Other("unknown".into()),
+                ProviderId::new("unknown"),
+                String::new(),
+            ),
+        };
+        let content = self
+            .content
+            .iter()
+            .enumerate()
+            .map(|(content_index, content)| self.assistant_content(content_index, content))
+            .collect();
+        AssistantMessage {
+            content,
+            api,
+            provider,
+            model,
+            response_model: None,
+            response_id: self.id,
+            diagnostics: None,
+            usage: self.usage,
+            stop_reason: self.stop_reason,
+            error_message: None,
+            raw_stop_reason: self.raw_stop_reason,
+            end_turn: self.end_turn,
+            timestamp,
+        }
+    }
+
+    fn assistant_content(&self, content_index: usize, content: &Content) -> AssistantContent {
+        match content {
+            Content::Text(text) => AssistantContent::Text(TextContent {
+                text: text.clone(),
+                text_signature: self.openai_text_signature(content_index),
+            }),
+            Content::Reasoning(thinking) => AssistantContent::Thinking(ThinkingContent {
+                thinking: thinking.clone(),
+                thinking_signature: self.thinking_signature(content_index, thinking),
+                redacted: self.anthropic_redacted(content_index),
+            }),
+            Content::ToolCall(call) => {
+                let (id, namespace) = self.openai_tool_identity(content_index, &call.id);
+                AssistantContent::ToolCall(AssistantToolCall {
+                    id,
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    thought_signature: None,
+                    namespace,
+                })
+            }
+        }
+    }
+
+    fn openai_text_signature(&self, content_index: usize) -> Option<String> {
+        let items = match &self.provider {
+            ProviderState::OpenAi(state) => &state.items,
+            _ => return None,
+        };
+        let OpenAiReplay::Message { id, phase, .. } = items.iter().find(|item| {
+            matches!(item, OpenAiReplay::Message { content_index: index, .. } if *index == content_index)
+        })?
+        else {
+            return None;
+        };
+        serde_json::to_string(&serde_json::json!({
+            "v": 1,
+            "id": id,
+            "phase": phase
+        }))
+        .ok()
+    }
+
+    fn thinking_signature(&self, content_index: usize, thinking: &str) -> Option<String> {
+        match &self.provider {
+            ProviderState::OpenAi(state) => {
+                let OpenAiReplay::Reasoning {
+                    id,
+                    encrypted_content,
+                    ..
+                } = state.items.iter().find(|item| {
+                    matches!(item, OpenAiReplay::Reasoning { content_index: index, .. } if *index == content_index)
+                })?
+                else {
+                    return None;
+                };
+                let mut item = serde_json::json!({
+                    "type": "reasoning",
+                    "id": id,
+                    "summary": [{"type": "summary_text", "text": thinking}]
+                });
+                if let Some(encrypted_content) = encrypted_content {
+                    item["encrypted_content"] = encrypted_content.clone().into();
+                }
+                serde_json::to_string(&item).ok()
+            }
+            ProviderState::Anthropic(state) => {
+                state
+                    .reasoning
+                    .iter()
+                    .find_map(|reasoning| match reasoning {
+                        AnthropicReasoning::Thinking {
+                            content_index: index,
+                            signature,
+                        } if *index == content_index => Some(signature.clone()),
+                        AnthropicReasoning::Redacted {
+                            content_index: index,
+                            data,
+                        } if *index == content_index => Some(data.clone()),
+                        _ => None,
+                    })
+            }
+            ProviderState::None => None,
+        }
+    }
+
+    fn anthropic_redacted(&self, content_index: usize) -> Option<bool> {
+        match &self.provider {
+            ProviderState::Anthropic(state)
+                if state.reasoning.iter().any(|reasoning| {
+                    matches!(reasoning, AnthropicReasoning::Redacted { content_index: index, .. } if *index == content_index)
+                }) => Some(true),
+            _ => None,
+        }
+    }
+
+    fn openai_tool_identity(
+        &self,
+        content_index: usize,
+        call_id: &str,
+    ) -> (String, Option<String>) {
+        let ProviderState::OpenAi(state) = &self.provider else {
+            return (call_id.to_owned(), None);
+        };
+        let Some(OpenAiReplay::ToolCall {
+            item_id, namespace, ..
+        }) = state.items.iter().find(|item| {
+            matches!(item, OpenAiReplay::ToolCall { content_index: index, .. } if *index == content_index)
+        })
+        else {
+            return (call_id.to_owned(), None);
+        };
+        let id = if call_id.contains('|') {
+            call_id.to_owned()
+        } else {
+            format!("{call_id}|{item_id}")
+        };
+        (id, namespace.clone())
+    }
+}
+
+impl From<Response> for AssistantMessage {
+    fn from(response: Response) -> Self {
+        response.into_assistant_message(0)
     }
 }
 
@@ -428,4 +735,13 @@ pub(crate) fn normalize_id(id: &str) -> String {
         .take(64)
         .collect::<String>();
     if id.is_empty() { "_".into() } else { id }
+}
+
+fn timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }

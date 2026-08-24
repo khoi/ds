@@ -1,7 +1,7 @@
 use crate::support::{Reply, serve};
 use ds_ai::{
-    CacheRetention, Context, Event, InputContent, Message, StopReason, Tool, ToolCall, ToolResult,
-    anthropic,
+    CacheRetention, Context, Event, InputContent, Message, StopReason, Tool, ToolCall,
+    ToolResultMessage, anthropic,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -221,7 +221,7 @@ async fn streams_and_replays_anthropic_thinking_and_tool_calls() {
         anthropic::Model::new("claude-sonnet-4-5").with_base_url(&second_server.base_url);
     let second_context = Context::new([
         Message::assistant(restored),
-        Message::tool_result(ToolResult::new(
+        Message::tool_result(ToolResultMessage::new(
             "toolu_1",
             "edit",
             [InputContent::text("done")],
@@ -433,7 +433,7 @@ async fn times_out_an_anthropic_stream_before_its_first_event() {
 }
 
 #[tokio::test]
-async fn preserves_anthropic_pause_turn_as_a_distinct_stop() {
+async fn maps_anthropic_pause_turn_to_stop() {
     let sse = [
         "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"pause_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
@@ -451,7 +451,7 @@ async fn preserves_anthropic_pause_turn_as_a_distinct_stop() {
         .await;
 
     let response = done(&events);
-    assert_eq!(response.stop_reason, StopReason::Pause);
+    assert_eq!(response.stop_reason, StopReason::Stop);
     assert_eq!(response.raw_stop_reason.as_deref(), Some("pause_turn"));
 }
 

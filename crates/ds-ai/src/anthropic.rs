@@ -1,13 +1,14 @@
 use crate::{
-    CacheRetention, Content, Context, Error, Event, InputContent, Message, RateLimits, Response,
-    ResponseMetadata, ResponseStream, StopReason, ToolResult, Usage, http, json, retry, schema,
-    transport,
+    AssistantContent, CacheRetention, Content, Context, Error, Event, InputContent, Message,
+    RateLimits, Response, ResponseMetadata, ResponseStream, StopReason, ToolResultMessage, Usage,
+    UserContent, http, json, retry, schema, transport,
     types::{AnthropicReasoning, normalize_id},
 };
 use async_stream::stream;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
     time::Duration,
 };
 use tokio::time::Instant;
@@ -15,6 +16,171 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+pub struct Provider {
+    id: crate::ProviderId,
+    models: Vec<crate::Model>,
+    headers: BTreeMap<String, Option<String>>,
+}
+
+impl Provider {
+    pub fn new(models: impl IntoIterator<Item = crate::Model>) -> Self {
+        Self {
+            id: crate::ProviderId::new("anthropic"),
+            models: models.into_iter().collect(),
+            headers: BTreeMap::new(),
+        }
+    }
+
+    fn request(
+        &self,
+        model: &crate::Model,
+        context: &Context,
+        options: &crate::StreamOptions,
+        thinking: Option<crate::ThinkingLevel>,
+        tool_choice: Option<crate::ToolChoice>,
+    ) -> crate::AssistantMessageEventStream {
+        if model.api != crate::Api::AnthropicMessages {
+            let model = model.clone();
+            let api = model.api.clone();
+            return crate::legacy::adapt(model, async move {
+                Err(Error::InvalidRequest(format!(
+                    "Anthropic provider has no API implementation for {api}"
+                )))
+            });
+        }
+        let requested_model = model.clone();
+        let context = context.clone();
+        let options = options.clone();
+        crate::legacy::adapt(requested_model.clone(), async move {
+            let api_key = options
+                .api_key
+                .ok_or_else(|| Error::InvalidRequest("Anthropic API key is required".into()))?;
+            let mut provider_model =
+                Model::new(&requested_model.id).with_base_url(requested_model.base_url.clone());
+            if let Some(crate::ModelCompatibility::Anthropic(compat)) = &requested_model.compat {
+                provider_model = provider_model.with_eager_tool_input_streaming(
+                    compat.supports_eager_tool_input_streaming.unwrap_or(true),
+                );
+                if compat.supports_strict_tools == Some(true) {
+                    provider_model = provider_model.with_strict_tools();
+                }
+                if compat.allow_empty_signature == Some(true) {
+                    provider_model = provider_model.with_empty_thinking_signatures();
+                }
+            }
+            let max_tokens = options
+                .max_tokens
+                .unwrap_or(requested_model.max_tokens)
+                .min(requested_model.max_tokens);
+            let mut provider_options = Options::new(api_key)
+                .with_max_tokens(max_tokens)
+                .with_cancellation(options.cancellation)
+                .with_max_retries(options.max_retries.unwrap_or_default())
+                .with_max_retry_delay(options.max_retry_delay)
+                .with_cache_retention(options.cache_retention);
+            if let Some(temperature) = options.temperature {
+                provider_options = provider_options.with_temperature(temperature);
+            }
+            if let Some(timeout) = options.timeout {
+                provider_options = provider_options.with_overall_timeout(timeout);
+            }
+            if let Some(user_id) = options
+                .metadata
+                .get("user_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                provider_options = provider_options.with_metadata_user_id(user_id);
+            }
+            if let Some(thinking) = thinking.map(anthropic_thinking) {
+                provider_options = provider_options.with_thinking(thinking);
+            }
+            if let Some(tool_choice) = tool_choice {
+                provider_options = provider_options.with_tool_choice(match tool_choice {
+                    crate::ToolChoice::Auto => ToolChoice::Auto,
+                    crate::ToolChoice::None => ToolChoice::None,
+                });
+            }
+            stream(&provider_model, &context, &provider_options).await
+        })
+    }
+}
+
+impl crate::Provider for Provider {
+    fn id(&self) -> &crate::ProviderId {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        "Anthropic"
+    }
+
+    fn base_url(&self) -> Option<&str> {
+        Some(DEFAULT_BASE_URL)
+    }
+
+    fn headers(&self) -> &BTreeMap<String, Option<String>> {
+        &self.headers
+    }
+
+    fn models(&self) -> Vec<crate::Model> {
+        self.models.clone()
+    }
+
+    fn stream(
+        &self,
+        model: &crate::Model,
+        context: &Context,
+        options: &crate::StreamOptions,
+    ) -> crate::AssistantMessageEventStream {
+        self.request(model, context, options, None, None)
+    }
+
+    fn stream_simple(
+        &self,
+        model: &crate::Model,
+        context: &Context,
+        options: &crate::SimpleStreamOptions,
+    ) -> crate::AssistantMessageEventStream {
+        self.request(
+            model,
+            context,
+            &options.stream,
+            options.thinking,
+            Some(options.tool_choice),
+        )
+    }
+}
+
+pub fn provider(models: impl IntoIterator<Item = crate::Model>) -> Arc<dyn crate::Provider> {
+    Arc::new(Provider::new(models))
+}
+
+fn anthropic_thinking(level: crate::ThinkingLevel) -> Thinking {
+    match level {
+        crate::ThinkingLevel::Off => Thinking::Disabled,
+        crate::ThinkingLevel::Minimal | crate::ThinkingLevel::Low => Thinking::Adaptive {
+            effort: Effort::Low,
+            display: ThinkingDisplay::Summarized,
+        },
+        crate::ThinkingLevel::Medium => Thinking::Adaptive {
+            effort: Effort::Medium,
+            display: ThinkingDisplay::Summarized,
+        },
+        crate::ThinkingLevel::High => Thinking::Adaptive {
+            effort: Effort::High,
+            display: ThinkingDisplay::Summarized,
+        },
+        crate::ThinkingLevel::XHigh => Thinking::Adaptive {
+            effort: Effort::XHigh,
+            display: ThinkingDisplay::Summarized,
+        },
+        crate::ThinkingLevel::Max => Thinking::Adaptive {
+            effort: Effort::Max,
+            display: ThinkingDisplay::Summarized,
+        },
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Model {
@@ -641,7 +807,7 @@ pub async fn stream(
                                 "end_turn" | "stop_sequence" => StopReason::Stop,
                                 "max_tokens" => StopReason::Length,
                                 "tool_use" => StopReason::ToolUse,
-                                "pause_turn" => StopReason::Pause,
+                                "pause_turn" => StopReason::Stop,
                                 "refusal" => {
                                     terminal_error = Some((
                                         reason.clone(),
@@ -731,13 +897,15 @@ fn messages(
     let mut tool_results = HashSet::new();
     for message in context.messages() {
         match message {
-            Message::User(content) => {
+            Message::User(message) => {
                 finish_tool_calls(&mut messages, &mut pending_tool_calls, &mut tool_results);
-                push_message(
-                    &mut messages,
-                    "user",
-                    content.iter().map(input_content).collect(),
-                );
+                let content = match &message.content {
+                    UserContent::Text(text) => {
+                        vec![serde_json::json!({"type": "text", "text": text})]
+                    }
+                    UserContent::Blocks(content) => content.iter().map(input_content).collect(),
+                };
+                push_message(&mut messages, "user", content);
             }
             Message::Assistant(response) => {
                 finish_tool_calls(&mut messages, &mut pending_tool_calls, &mut tool_results);
@@ -749,7 +917,7 @@ fn messages(
                 }
                 let content = assistant_content(model, response);
                 pending_tool_calls.extend(response.content.iter().filter_map(|content| {
-                    if let Content::ToolCall(call) = content {
+                    if let AssistantContent::ToolCall(call) = content {
                         Some(normalize_id(&call.id))
                     } else {
                         None
@@ -758,7 +926,7 @@ fn messages(
                 push_message(&mut messages, "assistant", content);
             }
             Message::ToolResult(result) => {
-                let id = normalize_id(&result.id);
+                let id = normalize_id(&result.tool_call_id);
                 tool_results.insert(id.clone());
                 push_message(&mut messages, "user", vec![tool_result(result, &id)]);
             }
@@ -850,60 +1018,52 @@ fn request_tools(
         .collect()
 }
 
-fn assistant_content(model: &Model, response: &Response) -> Vec<serde_json::Value> {
-    let source = response.anthropic_state();
-    response
+fn assistant_content(model: &Model, message: &crate::AssistantMessage) -> Vec<serde_json::Value> {
+    let same_model = message.model == model.id;
+    message
         .content
         .iter()
-        .enumerate()
-        .filter_map(|(content_index, content)| match content {
-            Content::Text(text) => Some(serde_json::json!({"type": "text", "text": text})),
-            Content::ToolCall(call) => Some(serde_json::json!({
+        .filter_map(|content| match content {
+            AssistantContent::Text(text) if !text.text.trim().is_empty() => {
+                Some(serde_json::json!({"type": "text", "text": text.text}))
+            }
+            AssistantContent::Text(_) => None,
+            AssistantContent::ToolCall(call) => Some(serde_json::json!({
                 "type": "tool_use",
                 "id": normalize_id(&call.id),
                 "name": call.name,
                 "input": call.arguments
             })),
-            Content::Reasoning(text) => {
-                let source_reasoning = source.and_then(|(_, reasoning)| {
-                    reasoning.iter().find(|reasoning| match reasoning {
-                        AnthropicReasoning::Thinking {
-                            content_index: index,
-                            ..
-                        }
-                        | AnthropicReasoning::Redacted {
-                            content_index: index,
-                            ..
-                        } => *index == content_index,
+            AssistantContent::Thinking(thinking) if thinking.redacted == Some(true) => thinking
+                .thinking_signature
+                .as_ref()
+                .filter(|_| same_model)
+                .map(|signature| {
+                    serde_json::json!({
+                        "type": "redacted_thinking",
+                        "data": signature
                     })
-                });
-                match source_reasoning {
-                    Some(AnthropicReasoning::Thinking { signature, .. })
-                        if source.is_some_and(|(source_model, _)| source_model == model.id) =>
-                    {
-                        if !signature.trim().is_empty() || model.empty_thinking_signatures {
-                            Some(serde_json::json!({
-                                "type": "thinking",
-                                "thinking": text,
-                                "signature": signature.trim()
-                            }))
-                        } else if text.trim().is_empty() {
-                            None
-                        } else {
-                            Some(serde_json::json!({"type": "text", "text": text}))
-                        }
-                    }
-                    Some(AnthropicReasoning::Redacted { data, .. })
-                        if source.is_some_and(|(source_model, _)| source_model == model.id) =>
-                    {
-                        Some(serde_json::json!({
-                            "type": "redacted_thinking",
-                            "data": data
-                        }))
-                    }
-                    Some(AnthropicReasoning::Redacted { .. }) => None,
-                    _ if text.trim().is_empty() => None,
-                    _ => Some(serde_json::json!({"type": "text", "text": text})),
+                }),
+            AssistantContent::Thinking(thinking) => {
+                let signature = thinking
+                    .thinking_signature
+                    .as_deref()
+                    .filter(|_| same_model);
+                if signature.is_some_and(|signature| !signature.trim().is_empty())
+                    || signature.is_some() && model.empty_thinking_signatures
+                {
+                    Some(serde_json::json!({
+                        "type": "thinking",
+                        "thinking": thinking.thinking,
+                        "signature": signature.unwrap_or_default().trim()
+                    }))
+                } else if thinking.thinking.trim().is_empty() {
+                    None
+                } else {
+                    Some(serde_json::json!({
+                        "type": "text",
+                        "text": thinking.thinking
+                    }))
                 }
             }
         })
@@ -916,10 +1076,14 @@ fn parse_arguments(arguments: &str) -> serde_json::Value {
 
 fn input_content(content: &InputContent) -> serde_json::Value {
     match content {
-        InputContent::Text(text) => serde_json::json!({"type": "text", "text": text}),
-        InputContent::Image { media_type, data } => serde_json::json!({
+        InputContent::Text(text) => serde_json::json!({"type": "text", "text": text.text}),
+        InputContent::Image(image) => serde_json::json!({
             "type": "image",
-            "source": {"type": "base64", "media_type": media_type, "data": data}
+            "source": {
+                "type": "base64",
+                "media_type": image.mime_type,
+                "data": image.data
+            }
         }),
     }
 }
@@ -979,7 +1143,7 @@ fn tool_choice(choice: &ToolChoice) -> serde_json::Value {
     }
 }
 
-fn tool_result(result: &ToolResult, id: &str) -> serde_json::Value {
+fn tool_result(result: &ToolResultMessage, id: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "tool_result",
         "tool_use_id": id,

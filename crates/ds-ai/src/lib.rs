@@ -2,8 +2,10 @@ mod event_stream;
 mod frame;
 mod http;
 mod json;
+mod legacy;
 mod message;
 mod model;
+mod provider;
 mod retry;
 mod schema;
 mod sse;
@@ -28,10 +30,12 @@ pub use model::{
     ModelCost, ModelCostRates, ModelCostTier, ModelInput, OpenAiResponsesCompatibility, ProviderId,
     SessionAffinityFormat, ThinkingLevel,
 };
+pub use provider::{Models, Provider, SimpleStreamOptions, StreamOptions, ToolChoice, Transport};
 pub use types::{
-    CacheRetention, Content, Context, Error, Event, InputContent, Message, RateLimits, Response,
-    ResponseMetadata, ResponseStream, StopReason, TimeoutPhase, Tool, ToolCall, ToolResult, Usage,
-    UsageCost,
+    CacheRetention, ConstrainedSampling, ConstrainedSamplingStrictness, Content, Context, Error,
+    Event, GrammarVariants, InputContent, Message, RateLimits, Response, ResponseMetadata,
+    ResponseStream, StopReason, TimeoutPhase, Tool, ToolCall, ToolResultMessage, ToolResultRole,
+    Usage, UsageCost, UserContent, UserMessage, UserRole,
 };
 
 pub async fn complete(mut stream: ResponseStream) -> Result<Response, Error> {

@@ -1,19 +1,155 @@
 use crate::{
-    CacheRetention, Content, Context, Error, Event, InputContent, Message, Response,
-    ResponseMetadata, ResponseStream, StopReason, TimeoutPhase, ToolCall, ToolResult, Usage, http,
-    json, retry, schema, transport,
+    AssistantContent, CacheRetention, Content, Context, Error, Event, InputContent, Message,
+    Response, ResponseMetadata, ResponseStream, StopReason, TimeoutPhase, ToolCall,
+    ToolResultMessage, Usage, UserContent, http, json, retry, schema, transport,
     types::{OpenAiReplay, normalize_id},
 };
 use async_stream::stream;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, sync::Arc};
 use std::{collections::HashMap, pin::Pin, time::Duration};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+pub struct Provider {
+    id: crate::ProviderId,
+    models: Vec<crate::Model>,
+    headers: BTreeMap<String, Option<String>>,
+}
+
+impl Provider {
+    pub fn new(models: impl IntoIterator<Item = crate::Model>) -> Self {
+        Self {
+            id: crate::ProviderId::new("openai"),
+            models: models.into_iter().collect(),
+            headers: BTreeMap::new(),
+        }
+    }
+
+    fn request(
+        &self,
+        model: &crate::Model,
+        context: &Context,
+        options: &crate::StreamOptions,
+        thinking: Option<crate::ThinkingLevel>,
+        tool_choice: Option<crate::ToolChoice>,
+    ) -> crate::AssistantMessageEventStream {
+        if model.api != crate::Api::OpenAiResponses {
+            let model = model.clone();
+            let api = model.api.clone();
+            return crate::legacy::adapt(model, async move {
+                Err(Error::InvalidRequest(format!(
+                    "OpenAI provider has no API implementation for {api}"
+                )))
+            });
+        }
+        let requested_model = model.clone();
+        let context = context.clone();
+        let options = options.clone();
+        crate::legacy::adapt(requested_model.clone(), async move {
+            let api_key = options
+                .api_key
+                .ok_or_else(|| Error::InvalidRequest("OpenAI API key is required".into()))?;
+            let provider_model =
+                Model::new(&requested_model.id).with_base_url(requested_model.base_url.clone());
+            let mut provider_options = Options::new(api_key)
+                .with_cancellation(options.cancellation)
+                .with_max_retries(options.max_retries.unwrap_or_default())
+                .with_max_retry_delay(options.max_retry_delay)
+                .with_cache_retention(options.cache_retention);
+            if let Some(max_tokens) = options.max_tokens {
+                provider_options = provider_options.with_max_output_tokens(max_tokens);
+            }
+            if let Some(temperature) = options.temperature {
+                provider_options = provider_options.with_temperature(temperature);
+            }
+            if let Some(timeout) = options.timeout {
+                provider_options = provider_options.with_overall_timeout(timeout);
+            }
+            if let Some(session_id) = options.session_id {
+                provider_options = provider_options.with_session_id(session_id);
+            }
+            if let Some(thinking) = thinking.and_then(reasoning_effort) {
+                provider_options =
+                    provider_options.with_reasoning(thinking, ReasoningSummary::Auto);
+            }
+            if let Some(tool_choice) = tool_choice {
+                provider_options = provider_options.with_tool_choice(match tool_choice {
+                    crate::ToolChoice::Auto => ToolChoice::Auto,
+                    crate::ToolChoice::None => ToolChoice::None,
+                });
+            }
+            stream(&provider_model, &context, &provider_options).await
+        })
+    }
+}
+
+impl crate::Provider for Provider {
+    fn id(&self) -> &crate::ProviderId {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        "OpenAI"
+    }
+
+    fn base_url(&self) -> Option<&str> {
+        Some(DEFAULT_BASE_URL)
+    }
+
+    fn headers(&self) -> &BTreeMap<String, Option<String>> {
+        &self.headers
+    }
+
+    fn models(&self) -> Vec<crate::Model> {
+        self.models.clone()
+    }
+
+    fn stream(
+        &self,
+        model: &crate::Model,
+        context: &Context,
+        options: &crate::StreamOptions,
+    ) -> crate::AssistantMessageEventStream {
+        self.request(model, context, options, None, None)
+    }
+
+    fn stream_simple(
+        &self,
+        model: &crate::Model,
+        context: &Context,
+        options: &crate::SimpleStreamOptions,
+    ) -> crate::AssistantMessageEventStream {
+        self.request(
+            model,
+            context,
+            &options.stream,
+            options.thinking,
+            Some(options.tool_choice),
+        )
+    }
+}
+
+pub fn provider(models: impl IntoIterator<Item = crate::Model>) -> Arc<dyn crate::Provider> {
+    Arc::new(Provider::new(models))
+}
+
+fn reasoning_effort(level: crate::ThinkingLevel) -> Option<ReasoningEffort> {
+    match level {
+        crate::ThinkingLevel::Off => None,
+        crate::ThinkingLevel::Minimal => Some(ReasoningEffort::Minimal),
+        crate::ThinkingLevel::Low => Some(ReasoningEffort::Low),
+        crate::ThinkingLevel::Medium => Some(ReasoningEffort::Medium),
+        crate::ThinkingLevel::High => Some(ReasoningEffort::High),
+        crate::ThinkingLevel::XHigh => Some(ReasoningEffort::XHigh),
+        crate::ThinkingLevel::Max => Some(ReasoningEffort::Max),
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Model {
@@ -520,84 +656,75 @@ pub(crate) fn response_input(
     }
     for (message_index, message) in context.messages().iter().enumerate() {
         match message {
-            Message::User(content) => input.push(serde_json::json!({
-                "role": "user",
-                "content": content.iter().map(response_input_content).collect::<Vec<_>>()
-            })),
-            Message::Assistant(response) => {
-                let items = response.openai_items(model).unwrap_or_default();
+            Message::User(message) => {
+                let content = match &message.content {
+                    UserContent::Text(text) => vec![serde_json::json!({
+                        "type": "input_text",
+                        "text": text
+                    })],
+                    UserContent::Blocks(content) => {
+                        content.iter().map(response_input_content).collect()
+                    }
+                };
+                if !content.is_empty() {
+                    input.push(serde_json::json!({"role": "user", "content": content}));
+                }
+            }
+            Message::Assistant(message) => {
                 let mut text_index = 0;
-                for (content_index, content) in response.content.iter().enumerate() {
-                    let replay = items.iter().find(|item| match item {
-                        OpenAiReplay::Reasoning {
-                            content_index: index,
-                            ..
-                        }
-                        | OpenAiReplay::Message {
-                            content_index: index,
-                            ..
-                        }
-                        | OpenAiReplay::ToolCall {
-                            content_index: index,
-                            ..
-                        } => *index == content_index,
-                    });
-                    match (content, replay) {
-                        (
-                            Content::Reasoning(text),
-                            Some(OpenAiReplay::Reasoning {
-                                id,
-                                encrypted_content,
-                                ..
-                            }),
-                        ) => {
-                            let mut item = serde_json::json!({
-                                "type": "reasoning",
-                                "id": id,
-                                "summary": [{"type": "summary_text", "text": text}]
-                            });
-                            if let Some(encrypted_content) = encrypted_content {
-                                item["encrypted_content"] = encrypted_content.clone().into();
+                for content in &message.content {
+                    match content {
+                        AssistantContent::Thinking(thinking) => {
+                            if let Some(signature) = &thinking.thinking_signature
+                                && let Ok(item) = serde_json::from_str(signature)
+                            {
+                                input.push(item);
                             }
-                            input.push(item);
                         }
-                        (Content::Reasoning(text) | Content::Text(text), _) if !text.is_empty() => {
+                        AssistantContent::Text(text) if !text.text.is_empty() => {
+                            let signature = text
+                                .text_signature
+                                .as_deref()
+                                .and_then(parse_text_signature);
                             let mut item = serde_json::json!({
                                 "type": "message",
                                 "role": "assistant",
                                 "content": [{
                                     "type": "output_text",
-                                    "text": text,
+                                    "text": text.text,
                                     "annotations": []
                                 }],
                                 "status": "completed",
                                 "id": fallback_message_id(message_index, text_index)
                             });
-                            if let Some(OpenAiReplay::Message { id, phase, .. }) = replay {
-                                item["id"] = id.clone().into();
+                            if let Some((id, phase)) = signature {
+                                item["id"] = id.into();
                                 if let Some(phase) = phase {
-                                    item["phase"] = phase.clone().into();
+                                    item["phase"] = phase.into();
                                 }
                             }
                             input.push(item);
                             text_index += 1;
                         }
-                        (Content::ToolCall(call), replay) => {
+                        AssistantContent::ToolCall(call) => {
+                            let mut ids = call.id.splitn(2, '|');
+                            let call_id = ids.next().unwrap_or(&call.id);
                             let mut item = serde_json::json!({
                                 "type": "function_call",
-                                "call_id": openai_call_id(&call.id),
+                                "call_id": openai_call_id(call_id),
                                 "name": call.name,
                                 "arguments": serde_json::to_string(&call.arguments)
                                     .expect("tool arguments serialize")
                             });
-                            if let Some(OpenAiReplay::ToolCall {
-                                item_id, namespace, ..
-                            }) = replay
+                            if let Some(item_id) = ids.next()
+                                && message.model == model
                             {
-                                item["id"] = item_id.clone().into();
-                                if let Some(namespace) = namespace {
-                                    item["namespace"] = namespace.clone().into();
-                                }
+                                item["id"] = item_id.into();
+                            }
+                            if message.model == model
+                                && let Some(namespace) = &call.namespace
+                            {
+                                item["namespace"] = namespace.clone().into();
                             }
                             input.push(item);
                         }
@@ -607,7 +734,7 @@ pub(crate) fn response_input(
             }
             Message::ToolResult(result) => input.push(serde_json::json!({
                 "type": "function_call_output",
-                "call_id": openai_call_id(&result.id),
+                "call_id": openai_call_id(&result.tool_call_id),
                 "output": tool_result_output(result)
             })),
         }
@@ -617,13 +744,26 @@ pub(crate) fn response_input(
 
 fn response_input_content(content: &InputContent) -> serde_json::Value {
     match content {
-        InputContent::Text(text) => serde_json::json!({"type": "input_text", "text": text}),
-        InputContent::Image { media_type, data } => serde_json::json!({
+        InputContent::Text(text) => serde_json::json!({"type": "input_text", "text": text.text}),
+        InputContent::Image(image) => serde_json::json!({
             "type": "input_image",
             "detail": "auto",
-            "image_url": format!("data:{media_type};base64,{data}")
+            "image_url": format!("data:{};base64,{}", image.mime_type, image.data)
         }),
     }
+}
+
+fn parse_text_signature(signature: &str) -> Option<(String, Option<String>)> {
+    let value: serde_json::Value = serde_json::from_str(signature).ok()?;
+    if value.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
+        return None;
+    }
+    let id = value.get("id")?.as_str()?.to_owned();
+    let phase = value
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Some((id, phase))
 }
 
 pub(crate) fn decode_stream(
@@ -1023,13 +1163,13 @@ fn usage(usage: CompletedUsage) -> Usage {
     }
 }
 
-pub(crate) fn tool_result_output(result: &ToolResult) -> serde_json::Value {
+pub(crate) fn tool_result_output(result: &ToolResultMessage) -> serde_json::Value {
     let text = result
         .content
         .iter()
         .filter_map(|content| match content {
-            InputContent::Text(text) => Some(text.as_str()),
-            InputContent::Image { .. } => None,
+            InputContent::Text(text) => Some(text.text.as_str()),
+            InputContent::Image(_) => None,
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1037,7 +1177,7 @@ pub(crate) fn tool_result_output(result: &ToolResult) -> serde_json::Value {
         .content
         .iter()
         .filter_map(|content| match content {
-            InputContent::Image { media_type, data } => Some((media_type, data)),
+            InputContent::Image(image) => Some((&image.mime_type, &image.data)),
             InputContent::Text(_) => None,
         })
         .collect::<Vec<_>>();

@@ -1,6 +1,7 @@
 use crate::support::{Reply, serve};
 use ds_ai::{
-    Context, Event, InputContent, Message, StopReason, Tool, ToolCall, ToolResult, openai,
+    Context, Event, InputContent, Message, Response, StopReason, Tool, ToolCall, ToolResultMessage,
+    openai,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -622,7 +623,7 @@ async fn replays_serialized_openai_reasoning_and_message_items() {
         .unwrap()
         .collect::<Vec<_>>()
         .await;
-    let response =
+    let response: Response =
         serde_json::from_value(serde_json::to_value(done(&first_events)).unwrap()).unwrap();
     first_server.requests().await;
 
@@ -864,7 +865,7 @@ async fn sends_openai_tool_result_text_images_and_empty_output() {
     let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
     let context = Context::new([
         Message::user("Inspect the image"),
-        Message::tool_result(ToolResult::new(
+        Message::tool_result(ToolResultMessage::new(
             "call_image",
             "inspect",
             [
@@ -872,7 +873,7 @@ async fn sends_openai_tool_result_text_images_and_empty_output() {
                 InputContent::image("image/png", "iVBORw0KGgo="),
             ],
         )),
-        Message::tool_result(ToolResult::new(
+        Message::tool_result(ToolResultMessage::new(
             "call_empty",
             "noop",
             [InputContent::text("")],
