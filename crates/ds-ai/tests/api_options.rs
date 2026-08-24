@@ -48,6 +48,136 @@ async fn routes_openai_specific_options() {
 }
 
 #[tokio::test]
+async fn maps_openai_reasoning_defaults_and_direct_options() {
+    for (reasoning_effort, reasoning_summary, mapping, expected, include) in [
+        (None, None, None, Some(json!({"effort": "none"})), None),
+        (
+            None,
+            None,
+            Some((ds_ai::ThinkingLevel::Off, None)),
+            None,
+            None,
+        ),
+        (
+            Some(ds_ai::openai::ReasoningEffort::Minimal),
+            None,
+            Some((ds_ai::ThinkingLevel::Minimal, Some("low".into()))),
+            Some(json!({"effort": "low", "summary": "auto"})),
+            Some(json!(["reasoning.encrypted_content"])),
+        ),
+        (
+            None,
+            Some(ds_ai::openai::ReasoningSummary::Detailed),
+            None,
+            Some(json!({"effort": "medium", "summary": "detailed"})),
+            Some(json!(["reasoning.encrypted_content"])),
+        ),
+    ] {
+        let server = serve([Reply::sse(openai_done())]).await;
+        let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+        model.base_url = server.base_url.clone();
+        if let Some((level, mapping)) = mapping {
+            model.thinking_level_map.insert(level, mapping);
+        }
+        let provider = ds_ai::openai::Provider::new([model.clone()]);
+
+        provider
+            .stream(
+                &model,
+                &Context::new([Message::user("Hello")]),
+                &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+                    stream: StreamOptions {
+                        api_key: Some("test-key".into()),
+                        ..Default::default()
+                    },
+                    reasoning_effort,
+                    reasoning_summary,
+                    ..Default::default()
+                }),
+            )
+            .result()
+            .await
+            .unwrap();
+
+        let request = server.requests().await.pop().unwrap();
+        let payload = request_json(&request);
+        assert_eq!(payload.get("reasoning").cloned(), expected);
+        assert_eq!(payload.get("include").cloned(), include);
+    }
+}
+
+#[tokio::test]
+async fn applies_openai_session_affinity_headers() {
+    for (retention, format, headers, expected_session, expected_request) in [
+        (
+            CacheRetention::Short,
+            None,
+            Default::default(),
+            Some("session"),
+            Some("session"),
+        ),
+        (
+            CacheRetention::Short,
+            Some(ds_ai::SessionAffinityFormat::OpenAiNoSession),
+            Default::default(),
+            None,
+            Some("session"),
+        ),
+        (
+            CacheRetention::Short,
+            None,
+            [
+                ("session_id".into(), Some("override-session".into())),
+                (
+                    "x-client-request-id".into(),
+                    Some("override-request".into()),
+                ),
+            ]
+            .into(),
+            Some("override-session"),
+            Some("override-request"),
+        ),
+        (CacheRetention::None, None, Default::default(), None, None),
+    ] {
+        let server = serve([Reply::sse(openai_done())]).await;
+        let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+        model.base_url = server.base_url.clone();
+        if let Some(format) = format {
+            model.compat = Some(ModelCompatibility::OpenAi(
+                ds_ai::OpenAiResponsesCompatibility {
+                    session_affinity_format: Some(format),
+                    ..Default::default()
+                },
+            ));
+        }
+        let provider = ds_ai::openai::Provider::new([model.clone()]);
+
+        provider
+            .stream(
+                &model,
+                &Context::new([Message::user("Hello")]),
+                &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+                    stream: StreamOptions {
+                        api_key: Some("test-key".into()),
+                        cache_retention: retention,
+                        session_id: Some("session".into()),
+                        headers,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            )
+            .result()
+            .await
+            .unwrap();
+
+        let request = server.requests().await.pop().unwrap().to_ascii_lowercase();
+        assert_eq!(header(&request, "session_id"), expected_session);
+        assert_eq!(header(&request, "x-client-request-id"), expected_request);
+    }
+}
+
+#[tokio::test]
 async fn routes_named_openai_tool_choices() {
     for (tool_choice, expected) in [
         (
@@ -866,6 +996,12 @@ async fn rejects_options_for_a_different_api() {
 
 fn request_json(request: &str) -> Value {
     serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+}
+
+fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+    request
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}: ")))
 }
 
 fn openai_done() -> &'static str {

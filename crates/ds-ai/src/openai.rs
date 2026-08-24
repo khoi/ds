@@ -90,11 +90,19 @@ impl Provider {
             if let Some(session_id) = stream_options.session_id {
                 provider_options = provider_options.with_session_id(session_id);
             }
-            if let Some(effort) = options.reasoning_effort {
-                provider_options = provider_options.with_reasoning(
-                    effort,
-                    options.reasoning_summary.unwrap_or(ReasoningSummary::Auto),
-                );
+            if requested_model.reasoning {
+                if options.reasoning_effort.is_some() || options.reasoning_summary.is_some() {
+                    let effort = options.reasoning_effort.map_or_else(
+                        || "medium".into(),
+                        |effort| mapped_reasoning_effort(&requested_model, effort),
+                    );
+                    provider_options = provider_options.with_reasoning_value(
+                        effort,
+                        Some(options.reasoning_summary.unwrap_or(ReasoningSummary::Auto)),
+                    );
+                } else if let Some(effort) = default_reasoning_effort(&requested_model) {
+                    provider_options = provider_options.with_reasoning_value(effort, None);
+                }
             }
             if let Some(service_tier) = options.service_tier {
                 provider_options = provider_options.with_service_tier(service_tier);
@@ -201,6 +209,22 @@ fn reasoning_effort(level: crate::ThinkingLevel) -> Option<ReasoningEffort> {
     }
 }
 
+fn mapped_reasoning_effort(model: &crate::Model, effort: ReasoningEffort) -> String {
+    model
+        .thinking_level_map
+        .get(&effort.thinking_level())
+        .and_then(Clone::clone)
+        .unwrap_or_else(|| effort.as_str().into())
+}
+
+fn default_reasoning_effort(model: &crate::Model) -> Option<String> {
+    model
+        .thinking_level_map
+        .get(&crate::ThinkingLevel::Off)
+        .cloned()
+        .unwrap_or_else(|| Some("none".into()))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Model {
     id: String,
@@ -238,6 +262,7 @@ pub struct Options {
     overall_timeout: Option<Duration>,
     session_id: Option<String>,
     cache_retention: CacheRetention,
+    session_affinity_format: crate::SessionAffinityFormat,
     deferred_tools_mode: Option<DeferredToolsMode>,
     supports_developer_role: bool,
     supports_long_cache_retention: bool,
@@ -320,10 +345,34 @@ impl ServiceTier {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+impl ReasoningEffort {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    fn thinking_level(self) -> crate::ThinkingLevel {
+        match self {
+            Self::Minimal => crate::ThinkingLevel::Minimal,
+            Self::Low => crate::ThinkingLevel::Low,
+            Self::Medium => crate::ThinkingLevel::Medium,
+            Self::High => crate::ThinkingLevel::High,
+            Self::XHigh => crate::ThinkingLevel::XHigh,
+            Self::Max => crate::ThinkingLevel::Max,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct Reasoning {
-    effort: ReasoningEffort,
-    summary: ReasoningSummary,
+    effort: String,
+    summary: Option<ReasoningSummary>,
 }
 
 impl Options {
@@ -345,6 +394,7 @@ impl Options {
             overall_timeout: None,
             session_id: None,
             cache_retention: CacheRetention::Short,
+            session_affinity_format: crate::SessionAffinityFormat::OpenAi,
             deferred_tools_mode: None,
             supports_developer_role: true,
             supports_long_cache_retention: true,
@@ -390,6 +440,14 @@ impl Options {
     }
 
     pub fn with_reasoning(mut self, effort: ReasoningEffort, summary: ReasoningSummary) -> Self {
+        self.reasoning = Some(Reasoning {
+            effort: effort.as_str().into(),
+            summary: Some(summary),
+        });
+        self
+    }
+
+    fn with_reasoning_value(mut self, effort: String, summary: Option<ReasoningSummary>) -> Self {
         self.reasoning = Some(Reasoning { effort, summary });
         self
     }
@@ -441,6 +499,9 @@ impl Options {
 
     fn with_compatibility(mut self, compat: &crate::OpenAiResponsesCompatibility) -> Self {
         self.supports_developer_role = compat.supports_developer_role.unwrap_or(true);
+        self.session_affinity_format = compat
+            .session_affinity_format
+            .unwrap_or(crate::SessionAffinityFormat::OpenAi);
         self.supports_long_cache_retention = compat.supports_long_cache_retention.unwrap_or(true);
         self.supports_strict_mode = compat.supports_strict_mode.unwrap_or(false);
         self.supports_grammar_tools = compat.supports_open_ai_grammar_tools.unwrap_or(false);
@@ -473,7 +534,7 @@ struct Request<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<RequestReasoningOptions>,
+    reasoning: Option<RequestReasoningOptions<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     include: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -523,10 +584,11 @@ struct RequestGrammarFormat {
     definition: String,
 }
 
-#[derive(Clone, Copy, Serialize)]
-struct RequestReasoningOptions {
-    effort: ReasoningEffort,
-    summary: ReasoningSummary,
+#[derive(Serialize)]
+struct RequestReasoningOptions<'a> {
+    effort: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<ReasoningSummary>,
 }
 
 #[derive(Deserialize)]
@@ -746,12 +808,17 @@ pub async fn stream(
         store: false,
         max_output_tokens: options.max_output_tokens,
         temperature: options.temperature,
-        reasoning: options.reasoning.map(|reasoning| RequestReasoningOptions {
-            effort: reasoning.effort,
-            summary: reasoning.summary,
-        }),
+        reasoning: options
+            .reasoning
+            .as_ref()
+            .map(|reasoning| RequestReasoningOptions {
+                effort: &reasoning.effort,
+                summary: reasoning.summary,
+            }),
         include: options
             .reasoning
+            .as_ref()
+            .filter(|reasoning| reasoning.summary.is_some())
             .map(|_| vec!["reasoning.encrypted_content"])
             .unwrap_or_default(),
         tool_choice: options.tool_choice.clone(),
@@ -783,17 +850,23 @@ pub async fn stream(
     };
     let body =
         serde_json::to_vec(&request).map_err(|error| Error::InvalidRequest(error.to_string()))?;
-    let headers = http::request_headers(
-        BTreeMap::from([
-            (
-                "authorization".into(),
-                format!("Bearer {}", options.api_key),
-            ),
-            ("content-type".into(), "application/json".into()),
-        ]),
-        &options.headers,
-    )
-    .map_err(Error::InvalidRequest)?;
+    let mut default_headers = BTreeMap::from([
+        (
+            "authorization".into(),
+            format!("Bearer {}", options.api_key),
+        ),
+        ("content-type".into(), "application/json".into()),
+    ]);
+    if options.cache_retention != CacheRetention::None
+        && let Some(session_id) = &options.session_id
+    {
+        if options.session_affinity_format == crate::SessionAffinityFormat::OpenAi {
+            default_headers.insert("session_id".into(), session_id.clone());
+        }
+        default_headers.insert("x-client-request-id".into(), session_id.clone());
+    }
+    let headers =
+        http::request_headers(default_headers, &options.headers).map_err(Error::InvalidRequest)?;
     let client = reqwest::Client::new();
     let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
     let response = transport::connect(
