@@ -1,4 +1,4 @@
-use crate::{Content, Context, Error, Event, Message, Response, ResponseStream, Usage};
+use crate::{Content, Context, Error, Event, Message, Response, ResponseStream, Usage, sse};
 use async_stream::stream;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -173,7 +173,7 @@ pub async fn stream(
 
     let output = stream! {
         let mut chunks = response.bytes_stream();
-        let mut buffer = Vec::new();
+        let mut decoder = sse::Decoder::default();
         let mut result = Response::default();
         let mut slots = HashMap::new();
 
@@ -185,21 +185,18 @@ pub async fn stream(
                     return;
                 }
             };
-            buffer.extend_from_slice(&chunk);
+            decoder.push(&chunk);
 
-            while let Some(end) = buffer.windows(2).position(|window| window == b"\n\n") {
-                let frame = buffer.drain(..end + 2).collect::<Vec<_>>();
-                let frame = match std::str::from_utf8(&frame[..end]) {
-                    Ok(frame) => frame,
+            loop {
+                let data = match decoder.next_data() {
+                    Ok(Some(data)) => data,
+                    Ok(None) => break,
                     Err(error) => {
-                        yield Err(Error::Stream(error.to_string()));
+                        yield Err(Error::Stream(error));
                         return;
                     }
                 };
-                let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) else {
-                    continue;
-                };
-                let event = match serde_json::from_str::<StreamEvent>(data) {
+                let event = match serde_json::from_str::<StreamEvent>(&data) {
                     Ok(event) => event,
                     Err(error) => {
                         yield Err(Error::Stream(error.to_string()));

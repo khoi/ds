@@ -1,3 +1,4 @@
+mod sse;
 mod types;
 
 pub mod openai;
