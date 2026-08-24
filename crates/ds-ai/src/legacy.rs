@@ -1,7 +1,6 @@
 use crate::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream,
-    AssistantToolCall, Error, Event, Model, Response, ResponseStream, StopReason, TextContent,
-    ThinkingContent, json,
+    AssistantToolCall, Error, Model, Response, StopReason, TextContent, ThinkingContent, json,
 };
 use async_stream::stream;
 use futures_util::StreamExt;
@@ -293,64 +292,6 @@ pub(crate) fn adapt_provider(
         yield error_event(&model, error, None);
     };
     AssistantMessageEventStream::new(output)
-}
-
-pub(crate) fn response_stream(mut source: ProviderEventStream) -> ResponseStream {
-    Box::pin(stream! {
-        while let Some(event) = source.next().await {
-            match event {
-                Ok(ProviderEvent::ResponseId(_) | ProviderEvent::ResponseModel(_)) => {}
-                Ok(ProviderEvent::TextStart {
-                    content_index,
-                    content,
-                    ..
-                }) if !content.text.is_empty() => {
-                    yield Ok(Event::TextDelta {
-                        content_index,
-                        delta: content.text,
-                    });
-                }
-                Ok(ProviderEvent::ThinkingStart {
-                    content_index,
-                    content,
-                }) if !content.thinking.is_empty() => {
-                    yield Ok(Event::ReasoningDelta {
-                        content_index,
-                        delta: content.thinking,
-                    });
-                }
-                Ok(ProviderEvent::ToolCallStart {
-                    content_index: _,
-                    tool_call,
-                }) if tool_call.arguments.as_object().is_none_or(serde_json::Map::is_empty) => {}
-                Ok(ProviderEvent::ToolCallStart {
-                    content_index,
-                    tool_call,
-                }) => {
-                    yield Ok(Event::ToolCallDelta {
-                        content_index,
-                        delta: tool_call.arguments.to_string(),
-                    });
-                }
-                Ok(ProviderEvent::TextStart { .. }
-                | ProviderEvent::TextEnd { .. }
-                | ProviderEvent::ThinkingStart { .. }
-                | ProviderEvent::ThinkingEnd { .. }
-                | ProviderEvent::ToolCallEnd { .. }) => {}
-                Ok(ProviderEvent::TextDelta { content_index, delta }) => {
-                    yield Ok(Event::TextDelta { content_index, delta });
-                }
-                Ok(ProviderEvent::ReasoningDelta { content_index, delta }) => {
-                    yield Ok(Event::ReasoningDelta { content_index, delta });
-                }
-                Ok(ProviderEvent::ToolCallDelta { content_index, delta }) => {
-                    yield Ok(Event::ToolCallDelta { content_index, delta });
-                }
-                Ok(ProviderEvent::Done(response)) => yield Ok(Event::Done(response)),
-                Err(error) => yield Err(error),
-            }
-        }
-    })
 }
 
 #[derive(Clone, Copy)]

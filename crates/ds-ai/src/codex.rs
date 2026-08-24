@@ -1,5 +1,5 @@
 use crate::{
-    CacheRetention, Context, Error, ResponseMetadata, ResponseStream,
+    CacheRetention, Context, Error, ResponseMetadata,
     deferred_tools::{DeferredToolsMode, ToolPlacement},
     http, openai, retry, transport,
 };
@@ -463,40 +463,35 @@ struct CachedWebSocketLookup {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Model {
+struct Model {
     id: String,
     base_url: String,
 }
 
 impl Model {
-    pub fn new(id: impl Into<String>) -> Self {
+    fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             base_url: DEFAULT_BASE_URL.into(),
         }
     }
 
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+    fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
 }
 
-pub struct Options {
+struct Options {
     access_token: String,
     max_retries: usize,
     max_retry_delay: Option<Duration>,
     cancellation: CancellationToken,
-    connection_timeout: Option<Duration>,
     timeout: Option<Duration>,
-    first_event_timeout: Option<Duration>,
-    idle_timeout: Option<Duration>,
-    overall_timeout: Option<Duration>,
     session_id: Option<String>,
     cache_retention: CacheRetention,
     transport: Transport,
     websocket_connect_timeout: Duration,
-    websocket_cache_ttl: Duration,
     temperature: Option<f64>,
     reasoning: Option<Reasoning>,
     service_tier: Option<ServiceTier>,
@@ -592,22 +587,17 @@ struct Reasoning {
 }
 
 impl Options {
-    pub fn new(access_token: impl Into<String>) -> Self {
+    fn new(access_token: impl Into<String>) -> Self {
         Self {
             access_token: access_token.into(),
             max_retries: 0,
             max_retry_delay: Some(DEFAULT_MAX_RETRY_DELAY),
             cancellation: CancellationToken::new(),
-            connection_timeout: None,
             timeout: None,
-            first_event_timeout: None,
-            idle_timeout: None,
-            overall_timeout: None,
             session_id: None,
             cache_retention: CacheRetention::Short,
             transport: Transport::Auto,
             websocket_connect_timeout: DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
-            websocket_cache_ttl: WEBSOCKET_IDLE_TTL,
             temperature: None,
             reasoning: None,
             service_tier: None,
@@ -621,81 +611,48 @@ impl Options {
         }
     }
 
-    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+    fn with_max_retries(mut self, max_retries: usize) -> Self {
         self.max_retries = max_retries;
         self
     }
 
-    pub fn with_max_retry_delay(mut self, max_retry_delay: Option<Duration>) -> Self {
+    fn with_max_retry_delay(mut self, max_retry_delay: Option<Duration>) -> Self {
         self.max_retry_delay = max_retry_delay;
         self
     }
 
-    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+    fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = cancellation;
         self
     }
 
-    pub fn with_connection_timeout(mut self, timeout: Duration) -> Self {
-        self.connection_timeout = Some(timeout);
-        self
-    }
-
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+    fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = (!timeout.is_zero()).then_some(timeout);
         self
     }
 
-    pub fn with_first_event_timeout(mut self, timeout: Duration) -> Self {
-        self.first_event_timeout = Some(timeout);
-        self
-    }
-
-    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
-        self.idle_timeout = Some(timeout);
-        self
-    }
-
-    pub fn with_overall_timeout(mut self, timeout: Duration) -> Self {
-        self.overall_timeout = Some(timeout);
-        self
-    }
-
-    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+    fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
         self
     }
 
-    pub fn with_cache_retention(mut self, retention: CacheRetention) -> Self {
+    fn with_cache_retention(mut self, retention: CacheRetention) -> Self {
         self.cache_retention = retention;
         self
     }
 
-    pub fn with_transport(mut self, transport: Transport) -> Self {
+    fn with_transport(mut self, transport: Transport) -> Self {
         self.transport = transport;
         self
     }
 
-    pub fn with_websocket_connect_timeout(mut self, timeout: Duration) -> Self {
+    fn with_websocket_connect_timeout(mut self, timeout: Duration) -> Self {
         self.websocket_connect_timeout = timeout;
         self
     }
 
-    pub fn with_websocket_cache_ttl(mut self, ttl: Duration) -> Self {
-        self.websocket_cache_ttl = ttl;
-        self
-    }
-
-    pub fn with_temperature(mut self, temperature: f64) -> Self {
+    fn with_temperature(mut self, temperature: f64) -> Self {
         self.temperature = Some(temperature);
-        self
-    }
-
-    pub fn with_reasoning(mut self, effort: ReasoningEffort, summary: ReasoningSummary) -> Self {
-        self.reasoning = Some(Reasoning {
-            effort: effort.as_str().into(),
-            summary,
-        });
         self
     }
 
@@ -704,17 +661,17 @@ impl Options {
         self
     }
 
-    pub fn with_service_tier(mut self, service_tier: ServiceTier) -> Self {
+    fn with_service_tier(mut self, service_tier: ServiceTier) -> Self {
         self.service_tier = Some(service_tier);
         self
     }
 
-    pub fn with_text_verbosity(mut self, verbosity: TextVerbosity) -> Self {
+    fn with_text_verbosity(mut self, verbosity: TextVerbosity) -> Self {
         self.text_verbosity = verbosity;
         self
     }
 
-    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+    fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = tool_choice;
         self
     }
@@ -796,25 +753,12 @@ struct SseRequest {
     request_hooks: Option<crate::provider::RequestHooks>,
 }
 
-#[doc(hidden)]
-pub async fn raw_stream(
-    model: &Model,
-    context: &Context,
-    options: &Options,
-) -> Result<ResponseStream, Error> {
-    response_events(model, context, options)
-        .await
-        .map(crate::legacy::response_stream)
-}
-
 async fn response_events(
     model: &Model,
     context: &Context,
     options: &Options,
 ) -> Result<crate::legacy::ProviderEventStream, Error> {
-    let overall_deadline = options
-        .overall_timeout
-        .map(|timeout| Instant::now() + timeout);
+    let overall_deadline: Option<Instant> = None;
     let account_id = account_id(&options.access_token).map_err(Error::InvalidRequest)?;
     let cache_session_id = match options.cache_retention {
         CacheRetention::None => None,
@@ -884,9 +828,9 @@ async fn response_events(
         max_retries: options.max_retries,
         max_retry_delay: options.max_retry_delay,
         cancellation: options.cancellation.clone(),
-        connection_timeout: options.timeout.or(options.connection_timeout),
-        first_event_timeout: options.first_event_timeout,
-        idle_timeout: options.idle_timeout,
+        connection_timeout: options.timeout,
+        first_event_timeout: None,
+        idle_timeout: None,
         overall_deadline,
         grammar_input_properties: grammar_input_properties.clone(),
         service_tier: options.service_tier,
@@ -1289,7 +1233,7 @@ async fn websocket_stream(
             connection: None,
             cacheable: true,
         },
-        |key| acquire_cached_websocket(key, options.websocket_cache_ttl),
+        |key| acquire_cached_websocket(key, WEBSOCKET_IDLE_TTL),
     );
     let (connection, reused, active_cache_key) = if let Some(cached) = lookup.connection {
         (cached, true, cache_key.clone())
@@ -1391,8 +1335,8 @@ async fn websocket_stream(
     }
     let cancellation = options.cancellation.clone();
     let websocket_connect_timeout = options.websocket_connect_timeout;
-    let first_event_timeout = options.timeout.or(options.first_event_timeout);
-    let idle_timeout = options.timeout.or(options.idle_timeout);
+    let first_event_timeout = options.timeout;
+    let idle_timeout = options.timeout;
     let events = async_stream::stream! {
         let mut continuation = continuation;
         let mut retried_socket = retried_socket;
@@ -1653,13 +1597,12 @@ async fn websocket_stream(
             codex: true,
         },
     );
-    let websocket_cache_ttl = options.websocket_cache_ttl;
     let output = async_stream::stream! {
         while let Some(event) = decoded.next().await {
             match event {
                 Ok(crate::legacy::ProviderEvent::Done(response)) => {
                     drop(decoded);
-                    lease.complete(websocket_cache_ttl);
+                    lease.complete(WEBSOCKET_IDLE_TTL);
                     yield Ok(crate::legacy::ProviderEvent::Done(response));
                     return;
                 }

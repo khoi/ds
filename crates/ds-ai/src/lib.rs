@@ -66,9 +66,9 @@ pub use retry::{RetryCallbacks, RetryPolicy, is_retryable_assistant_error, retry
 pub use text::{ContentText, content_text, content_text_with_separator};
 pub use types::{
     CacheRetention, ConstrainedSampling, ConstrainedSamplingStrictness, Content, Context, Error,
-    Event, GrammarVariants, InputContent, Message, RateLimits, Response, ResponseMetadata,
-    ResponseStream, StopReason, TimeoutPhase, Tool, ToolCall, ToolResultMessage, ToolResultRole,
-    Usage, UsageCost, UserContent, UserMessage, UserRole,
+    GrammarVariants, InputContent, Message, RateLimits, Response, ResponseMetadata, StopReason,
+    TimeoutPhase, Tool, ToolCall, ToolResultMessage, ToolResultRole, Usage, UsageCost, UserContent,
+    UserMessage, UserRole,
 };
 pub use uuid::{UuidV7Error, uuid_v7, uuid_v7_at};
 pub use validation::{ToolValidationError, validate_tool_arguments, validate_tool_call};

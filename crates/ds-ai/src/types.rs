@@ -2,9 +2,8 @@ use crate::{
     Api, AssistantContent, AssistantMessage, AssistantToolCall, ImageContent, ModelInput,
     ProviderId, TextContent, ThinkingContent,
 };
-use futures_core::Stream;
 use serde::{Deserialize, Serialize};
-use std::{pin::Pin, time::Duration};
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -738,14 +737,6 @@ pub(crate) enum AnthropicReasoning {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Event {
-    TextDelta { content_index: usize, delta: String },
-    ReasoningDelta { content_index: usize, delta: String },
-    ToolCallDelta { content_index: usize, delta: String },
-    Done(Box<Response>),
-}
-
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum Error {
     #[error("HTTP request failed: {0}")]
@@ -804,8 +795,6 @@ pub enum CacheRetention {
     Short,
     Long,
 }
-
-pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send>>;
 
 pub(crate) fn normalize_id(id: &str) -> String {
     let id = id
