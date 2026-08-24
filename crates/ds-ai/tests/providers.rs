@@ -6,6 +6,8 @@ mod codex_auth;
 mod codex_stream;
 #[path = "cross_provider.rs"]
 mod cross_provider;
+#[path = "live.rs"]
+mod live;
 #[path = "openai_stream.rs"]
 mod openai_stream;
 mod support;
