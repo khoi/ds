@@ -1,11 +1,8 @@
-use crate::{Content, Context, Error, Event, Message, Response, ResponseStream, Usage, sse};
+use crate::{Content, Context, Error, Event, Message, Response, ResponseStream, Usage, retry, sse};
 use async_stream::stream;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    time::{Duration, SystemTime},
-};
+use std::{collections::HashMap, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -180,49 +177,29 @@ pub async fn stream(
     };
     let client = reqwest::Client::new();
     let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
-    let mut retries = 0;
-    let response = loop {
-        let response = match client
-            .post(&url)
-            .bearer_auth(&options.api_key)
-            .json(&request)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(_) if retries < options.max_retries => {
-                let delay = retry_backoff(retries);
-                retries += 1;
-                wait_for_retry(delay, &options.cancellation).await?;
-                continue;
-            }
-            Err(error) => return Err(Error::Http(error.to_string())),
-        };
-        let status = response.status();
-        if status.is_success() {
-            break response;
-        }
-        if retries < options.max_retries && is_retryable(&response) {
-            let retry_index = retries;
-            retries += 1;
-            let delay = retry_delay(response.headers(), retry_index);
-            if let Some(maximum) = options.max_retry_delay
-                && delay > maximum
-            {
-                return Err(Error::RetryDelayExceeded {
-                    requested: delay,
-                    maximum,
-                });
-            }
-            wait_for_retry(delay, &options.cancellation).await?;
-            continue;
-        }
+    let response = retry::send(
+        retry::Policy {
+            max_retries: options.max_retries,
+            max_delay: options.max_retry_delay,
+            cancellation: &options.cancellation,
+        },
+        || {
+            client
+                .post(&url)
+                .bearer_auth(&options.api_key)
+                .json(&request)
+                .send()
+        },
+    )
+    .await?;
+    let status = response.status();
+    if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         return Err(Error::Provider {
             status: status.as_u16(),
             body,
         });
-    };
+    }
 
     let output = stream! {
         let mut chunks = response.bytes_stream();
@@ -311,54 +288,4 @@ pub async fn stream(
     };
 
     Ok(Box::pin(output))
-}
-
-fn is_retryable(response: &reqwest::Response) -> bool {
-    match response
-        .headers()
-        .get("x-should-retry")
-        .and_then(|value| value.to_str().ok())
-    {
-        Some("true") => true,
-        Some("false") => false,
-        _ => matches!(response.status().as_u16(), 408 | 409 | 429 | 500..=599),
-    }
-}
-
-fn retry_delay(headers: &reqwest::header::HeaderMap, retry_index: usize) -> Duration {
-    if let Some(milliseconds) = headers
-        .get("retry-after-ms")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        return Duration::from_millis(milliseconds);
-    }
-    let Some(value) = headers
-        .get("retry-after")
-        .and_then(|value| value.to_str().ok())
-    else {
-        return retry_backoff(retry_index);
-    };
-    if let Ok(seconds) = value.parse::<u64>() {
-        return Duration::from_secs(seconds);
-    }
-    httpdate::parse_http_date(value)
-        .ok()
-        .and_then(|time| time.duration_since(SystemTime::now()).ok())
-        .unwrap_or_else(|| retry_backoff(retry_index))
-}
-
-fn retry_backoff(retry_index: usize) -> Duration {
-    let base_seconds = (0.5 * 2_f64.powi(retry_index as i32)).min(8.0);
-    Duration::from_secs_f64(base_seconds * (1.0 - rand::random::<f64>() * 0.25))
-}
-
-async fn wait_for_retry(delay: Duration, cancellation: &CancellationToken) -> Result<(), Error> {
-    if delay.is_zero() {
-        return Ok(());
-    }
-    tokio::select! {
-        _ = tokio::time::sleep(delay) => Ok(()),
-        _ = cancellation.cancelled() => Err(Error::Cancelled),
-    }
 }

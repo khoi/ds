@@ -1,3 +1,4 @@
+mod retry;
 mod sse;
 mod types;
 
