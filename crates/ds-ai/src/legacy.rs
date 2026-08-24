@@ -201,6 +201,7 @@ fn end_event(
 }
 
 fn final_message(model: &Model, response: Response) -> AssistantMessage {
+    let service_tier = response.service_tier.clone();
     let mut message = response.into_assistant_message(timestamp());
     if message.model != model.id {
         message.response_model = Some(message.model.clone());
@@ -209,6 +210,16 @@ fn final_message(model: &Model, response: Response) -> AssistantMessage {
     message.provider = model.provider.clone();
     message.model = model.id.clone();
     model.calculate_cost(&mut message.usage);
+    if matches!(
+        model.api,
+        crate::Api::OpenAiResponses | crate::Api::OpenAiCodexResponses
+    ) {
+        crate::openai::apply_service_tier_pricing(
+            model,
+            &mut message.usage,
+            service_tier.as_deref(),
+        );
+    }
     message
 }
 

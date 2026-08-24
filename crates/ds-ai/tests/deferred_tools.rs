@@ -143,6 +143,37 @@ async fn selects_each_codex_tool_placement_mode() {
     assert!(item_opt(&immediate, "tool_search_output").is_none());
 }
 
+#[tokio::test]
+async fn drops_foreign_tool_identity_with_the_same_model_id() {
+    let target = model("openai", "gpt-5.4");
+    let assistant = AssistantMessage {
+        content: vec![AssistantContent::ToolCall(AssistantToolCall {
+            id: "call_1|fc_1".into(),
+            name: "lookup".into(),
+            arguments: json!({"value": "hello"}),
+            thought_signature: None,
+            namespace: Some("dynamic_tools".into()),
+        })],
+        api: Api::AnthropicMessages,
+        provider: ProviderId::new("anthropic"),
+        model: target.id.clone(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 1,
+    };
+    let payload = capture_openai(target, Context::new([Message::assistant(assistant)])).await;
+    let call = item(&payload, "function_call");
+
+    assert!(call.get("id").is_none());
+    assert!(call.get("namespace").is_none());
+}
+
 fn tool(name: &str) -> Tool {
     Tool::new(
         name,

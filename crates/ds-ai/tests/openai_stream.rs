@@ -156,7 +156,7 @@ async fn decodes_openai_sse_across_arbitrary_chunks() {
             cache_write: 0,
             cache_write_1h: None,
             reasoning: Some(0),
-            total_tokens: 4,
+            total_tokens: 0,
             cost: Default::default(),
         }
     );
@@ -546,7 +546,7 @@ async fn streams_openai_reasoning_and_text_in_content_order() {
             cache_write: 0,
             cache_write_1h: None,
             reasoning: Some(3),
-            total_tokens: 9,
+            total_tokens: 0,
             cost: Default::default(),
         }
     );
@@ -727,7 +727,7 @@ async fn streams_and_replays_openai_tool_calls() {
         "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"README.md\\\"\"}\n\n",
         "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\",\\\"content\\\":\\\"updated\\\"}\"}\n\n",
         "data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"{\\\"path\\\":\\\"README.md\\\",\\\"content\\\":\\\"updated\\\"}\"}\n\n",
-        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"fc_edit\",\"type\":\"function_call\",\"call_id\":\"call_edit\",\"name\":\"edit\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\",\\\"content\\\":\\\"updated\\\"}\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"fc_edit\",\"type\":\"function_call\",\"call_id\":\"call_edit\",\"name\":\"edit\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\",\\\"content\\\":\\\"updated\\\"}\",\"namespace\":\"dynamic_tools\"}}\n\n",
         "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool\",\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{},\"output_tokens\":2,\"output_tokens_details\":{}}}}\n\n",
     ]
     .concat();
@@ -825,7 +825,8 @@ async fn streams_and_replays_openai_tool_calls() {
                 "id": "fc_edit",
                 "call_id": "call_edit",
                 "name": "edit",
-                "arguments": "{\"content\":\"updated\",\"path\":\"README.md\"}"
+                "arguments": "{\"content\":\"updated\",\"path\":\"README.md\"}",
+                "namespace": "dynamic_tools"
             },
             {
                 "role": "user",
@@ -833,6 +834,54 @@ async fn streams_and_replays_openai_tool_calls() {
             }
         ])
     );
+}
+
+#[tokio::test]
+async fn uses_the_provider_terminal_token_total() {
+    let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_total\",\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":99}}}\n\n";
+    let server = serve([Reply::sse(sse)]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+
+    let events = openai::stream(
+        &model,
+        &Context::new([Message::user("Hello")]),
+        &openai::Options::new("test-key"),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+
+    assert_eq!(done(&events).usage.total_tokens, 99);
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn rejects_an_incomplete_response_without_a_reason() {
+    let sse = "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"incomplete_details\":null}}\n\n";
+    let server = serve([Reply::sse(sse)]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+
+    let events = openai::stream(
+        &model,
+        &Context::new([Message::user("Hello")]),
+        &openai::Options::new("test-key"),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+
+    match events.last() {
+        Some(Err(ds_ai::Error::Response {
+            message, partial, ..
+        })) => {
+            assert_eq!(message, "Response incomplete without a provider reason");
+            assert_eq!(partial.raw_stop_reason.as_deref(), Some("incomplete"));
+        }
+        event => panic!("unexpected terminal event: {event:?}"),
+    }
+    server.requests().await;
 }
 
 #[tokio::test]

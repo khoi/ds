@@ -27,7 +27,7 @@ use tokio_tungstenite::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub use crate::openai::{ReasoningEffort, ReasoningSummary, ServiceTier, ToolChoice};
+pub use crate::openai::{ReasoningEffort, ReasoningSummary, ServiceTier};
 
 pub mod auth;
 
@@ -476,6 +476,15 @@ pub enum TextVerbosity {
     High,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoice {
+    #[default]
+    Auto,
+    None,
+    Required,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Reasoning {
     effort: ReasoningEffort,
@@ -668,6 +677,7 @@ struct SseRequest {
     idle_timeout: Option<Duration>,
     overall_deadline: Option<Instant>,
     grammar_input_properties: BTreeMap<String, String>,
+    service_tier: Option<ServiceTier>,
     headers: BTreeMap<String, Option<String>>,
     request_hooks: Option<crate::provider::RequestHooks>,
 }
@@ -705,7 +715,7 @@ pub async fn stream(
         stream: true,
         instructions: context.system().unwrap_or("You are a helpful assistant."),
         input: openai::response_input(
-            &model.id,
+            openai::ResponseInputTarget::codex(&model.id),
             context,
             None,
             options.deferred_tools_mode.map(|mode| (&placement, mode)),
@@ -751,6 +761,7 @@ pub async fn stream(
         idle_timeout: options.idle_timeout,
         overall_deadline,
         grammar_input_properties: grammar_input_properties.clone(),
+        service_tier: options.service_tier,
         headers: options.headers.clone(),
         request_hooks: options.request_hooks.clone(),
     };
@@ -882,7 +893,13 @@ async fn sse_stream(request: &SseRequest) -> Result<ResponseStream, Error> {
         request.first_event_timeout,
         request.idle_timeout,
         request.overall_deadline,
-        request.grammar_input_properties.clone(),
+        openai::ResponseEventOptions {
+            grammar_input_properties: request.grammar_input_properties.clone(),
+            requested_service_tier: request
+                .service_tier
+                .map(|service_tier| service_tier.as_str().into()),
+            use_requested_for_default: true,
+        },
     ))
 }
 
@@ -1248,7 +1265,13 @@ async fn websocket_stream(
         Box::pin(events),
         request.model.to_owned(),
         metadata,
-        request.grammar_input_properties.clone(),
+        openai::ResponseEventOptions {
+            grammar_input_properties: request.grammar_input_properties.clone(),
+            requested_service_tier: options
+                .service_tier
+                .map(|service_tier| service_tier.as_str().into()),
+            use_requested_for_default: true,
+        },
     );
     let websocket_cache_ttl = options.websocket_cache_ttl;
     let output = async_stream::stream! {

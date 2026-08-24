@@ -10,7 +10,7 @@ use crate::{
 use async_stream::stream;
 use futures_core::Stream;
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 use std::{collections::BTreeMap, sync::Arc};
 use std::{collections::HashMap, pin::Pin, time::Duration};
 use tokio::time::Instant;
@@ -267,12 +267,37 @@ pub enum ReasoningSummary {
     Concise,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolChoice {
     Auto,
     None,
     Required,
+    Function(String),
+    Custom(String),
+}
+
+impl Serialize for ToolChoice {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::None => serializer.serialize_str("none"),
+            Self::Required => serializer.serialize_str("required"),
+            Self::Function(name) | Self::Custom(name) => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                let kind = if matches!(self, Self::Function(_)) {
+                    "function"
+                } else {
+                    "custom"
+                };
+                map.serialize_entry("type", kind)?;
+                map.serialize_entry("name", name)?;
+                map.end()
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -282,6 +307,17 @@ pub enum ServiceTier {
     Default,
     Flex,
     Priority,
+}
+
+impl ServiceTier {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Default => "default",
+            Self::Flex => "flex",
+            Self::Priority => "priority",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -608,7 +644,7 @@ struct CompletedResponse {
 struct IncompleteResponse {
     #[serde(flatten)]
     terminal: TerminalResponse,
-    incomplete_details: IncompleteDetails,
+    incomplete_details: Option<IncompleteDetails>,
 }
 
 #[derive(Deserialize)]
@@ -624,7 +660,7 @@ struct TerminalResponse {
 
 #[derive(Deserialize)]
 struct IncompleteDetails {
-    reason: String,
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -652,6 +688,8 @@ struct CompletedUsage {
     output_tokens: u64,
     #[serde(default)]
     output_tokens_details: OutputTokenDetails,
+    #[serde(default)]
+    total_tokens: u64,
 }
 
 #[derive(Default, Deserialize)]
@@ -687,7 +725,7 @@ pub async fn stream(
         grammar_input_properties(context.tools(), options.supports_grammar_tools)
             .map_err(Error::InvalidRequest)?;
     let input = response_input(
-        &model.id,
+        ResponseInputTarget::openai(&model.id),
         context,
         Some(if options.supports_developer_role {
             "developer"
@@ -716,7 +754,7 @@ pub async fn stream(
             .reasoning
             .map(|_| vec!["reasoning.encrypted_content"])
             .unwrap_or_default(),
-        tool_choice: options.tool_choice,
+        tool_choice: options.tool_choice.clone(),
         service_tier: options.service_tier,
         prompt_cache_key: match options.cache_retention {
             CacheRetention::None => None,
@@ -800,7 +838,13 @@ pub async fn stream(
         options.first_event_timeout,
         options.idle_timeout,
         overall_deadline,
-        grammar_input_properties,
+        ResponseEventOptions {
+            grammar_input_properties,
+            requested_service_tier: options
+                .service_tier
+                .map(|service_tier| service_tier.as_str().into()),
+            use_requested_for_default: false,
+        },
     ))
 }
 
@@ -812,8 +856,32 @@ fn openai_call_id(id: &str) -> String {
     normalize_id(id.split('|').next().unwrap_or(id))
 }
 
+pub(crate) struct ResponseInputTarget<'a> {
+    model: &'a str,
+    api: crate::Api,
+    provider: &'a str,
+}
+
+impl<'a> ResponseInputTarget<'a> {
+    fn openai(model: &'a str) -> Self {
+        Self {
+            model,
+            api: crate::Api::OpenAiResponses,
+            provider: "openai",
+        }
+    }
+
+    pub(crate) fn codex(model: &'a str) -> Self {
+        Self {
+            model,
+            api: crate::Api::OpenAiCodexResponses,
+            provider: "openai-codex",
+        }
+    }
+}
+
 pub(crate) fn response_input(
-    model: &str,
+    target: ResponseInputTarget<'_>,
     context: &Context,
     system_role: Option<&str>,
     deferred_tools: Option<(&ToolPlacement, DeferredToolsMode)>,
@@ -847,6 +915,9 @@ pub(crate) fn response_input(
                 }
             }
             Message::Assistant(message) => {
+                let same_api_provider =
+                    message.api == target.api && message.provider.as_str() == target.provider;
+                let same_model = same_api_provider && message.model == target.model;
                 let mut text_index = 0;
                 for content in &message.content {
                     match content {
@@ -908,13 +979,15 @@ pub(crate) fn response_input(
                                 })
                             };
                             if let Some(item_id) = ids.next()
-                                && message.model == model
+                                && same_model
                             {
                                 item["id"] = item_id.into();
                             }
-                            if message.model == model
-                                && let Some(namespace) = &call.namespace
-                            {
+                            let can_replay_namespace = same_model
+                                || deferred_tools.is_some_and(|(placement, _)| {
+                                    placement.deferred_tool(&call.name).is_some()
+                                });
+                            if can_replay_namespace && let Some(namespace) = &call.namespace {
                                 item["namespace"] = namespace.clone().into();
                             }
                             input.push(item);
@@ -1140,6 +1213,12 @@ fn parse_text_signature(signature: &str) -> Option<(String, Option<String>)> {
     Some((id, phase))
 }
 
+pub(crate) struct ResponseEventOptions {
+    pub(crate) grammar_input_properties: BTreeMap<String, String>,
+    pub(crate) requested_service_tier: Option<String>,
+    pub(crate) use_requested_for_default: bool,
+}
+
 pub(crate) fn decode_stream(
     response: reqwest::Response,
     response_model: String,
@@ -1147,7 +1226,7 @@ pub(crate) fn decode_stream(
     first_event_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     overall_deadline: Option<Instant>,
-    grammar_input_properties: BTreeMap<String, String>,
+    options: ResponseEventOptions,
 ) -> ResponseStream {
     let metadata = http::metadata(response.headers());
     let mut events = transport::EventStream::new(
@@ -1169,12 +1248,7 @@ pub(crate) fn decode_stream(
             }
         }
     };
-    decode_events(
-        Box::pin(events),
-        response_model,
-        metadata,
-        grammar_input_properties,
-    )
+    decode_events(Box::pin(events), response_model, metadata, options)
 }
 
 pub(crate) type ProviderEvents =
@@ -1184,12 +1258,17 @@ pub(crate) fn decode_events(
     mut events: ProviderEvents,
     response_model: String,
     metadata: ResponseMetadata,
-    grammar_input_properties: BTreeMap<String, String>,
+    options: ResponseEventOptions,
 ) -> ResponseStream {
     let output = stream! {
         let mut result = Response::openai(response_model);
         result.metadata = metadata;
         let mut slots = HashMap::new();
+        let ResponseEventOptions {
+            grammar_input_properties,
+            requested_service_tier,
+            use_requested_for_default,
+        } = options;
 
         loop {
             let data = match events.next().await {
@@ -1517,42 +1596,65 @@ pub(crate) fn decode_events(
                         }
                     }
                     StreamEvent::Completed { response } => {
-                        apply_terminal_response(&mut result, response.terminal);
-                        if response.status.as_deref() == Some("incomplete") {
-                            let reason = response
-                                .incomplete_details
-                                .map(|details| details.reason)
-                                .unwrap_or_else(|| "unknown".into());
-                            if reason == "max_output_tokens" {
-                                result.stop_reason = StopReason::Length;
-                                result.raw_stop_reason =
-                                    Some("incomplete.max_output_tokens".into());
-                                yield Ok(Event::Done(Box::new(result)));
-                            } else {
+                        apply_terminal_response(
+                            &mut result,
+                            response.terminal,
+                            requested_service_tier.as_deref(),
+                            use_requested_for_default,
+                        );
+                        match response.status.as_deref() {
+                            Some("incomplete") => {
+                                let reason = response
+                                    .incomplete_details
+                                    .and_then(|details| details.reason);
+                                if reason.as_deref() == Some("max_output_tokens") {
+                                    result.stop_reason = StopReason::Length;
+                                    result.raw_stop_reason =
+                                        Some("incomplete.max_output_tokens".into());
+                                    yield Ok(Event::Done(Box::new(result)));
+                                } else {
+                                    result.stop_reason = StopReason::Error;
+                                    result.raw_stop_reason = Some(reason.as_ref().map_or_else(
+                                        || "incomplete".into(),
+                                        |reason| format!("incomplete.{reason}"),
+                                    ));
+                                    yield Err(Error::Response {
+                                        code: None,
+                                        message: reason.map_or_else(
+                                            || "Response incomplete without a provider reason".into(),
+                                            |reason| format!("Response incomplete: {reason}"),
+                                        ),
+                                        partial: result,
+                                    });
+                                }
+                                return;
+                            }
+                            Some("failed" | "cancelled") => {
+                                let code = response.error.as_ref().and_then(|error| error.code.clone());
+                                let message = response
+                                    .error
+                                    .and_then(|error| error.message)
+                                    .unwrap_or_else(|| "Provider response failed".into());
                                 result.stop_reason = StopReason::Error;
-                                result.raw_stop_reason = Some(format!("incomplete.{reason}"));
+                                result.raw_stop_reason = response.status;
                                 yield Err(Error::Response {
-                                    code: None,
-                                    message: format!("Response incomplete: {reason}"),
+                                    code,
+                                    message,
                                     partial: result,
                                 });
+                                return;
                             }
-                            return;
-                        }
-                        if matches!(response.status.as_deref(), Some("failed" | "cancelled")) {
-                            let code = response.error.as_ref().and_then(|error| error.code.clone());
-                            let message = response
-                                .error
-                                .and_then(|error| error.message)
-                                .unwrap_or_else(|| "Provider response failed".into());
-                            result.stop_reason = StopReason::Error;
-                            result.raw_stop_reason = response.status;
-                            yield Err(Error::Response {
-                                code,
-                                message,
-                                partial: result,
-                            });
-                            return;
+                            Some("completed" | "in_progress" | "queued") | None => {}
+                            Some(status) => {
+                                result.stop_reason = StopReason::Error;
+                                result.raw_stop_reason = Some(status.into());
+                                yield Err(Error::Response {
+                                    code: None,
+                                    message: format!("Unhandled stop reason: {status}"),
+                                    partial: result,
+                                });
+                                return;
+                            }
                         }
                         result.stop_reason = if result
                             .content
@@ -1563,24 +1665,38 @@ pub(crate) fn decode_events(
                         } else {
                             StopReason::Stop
                         };
-                        result.raw_stop_reason = Some("completed".into());
+                        result.raw_stop_reason = response.status;
                         yield Ok(Event::Done(Box::new(result)));
                         return;
                     }
                     StreamEvent::Incomplete { response } => {
-                        let reason = response.incomplete_details.reason;
-                        apply_terminal_response(&mut result, response.terminal);
-                        if reason == "max_output_tokens" {
-                            result.stop_reason = StopReason::Length;
-                            result.raw_stop_reason = Some("incomplete.max_output_tokens".into());
-                            yield Ok(Event::Done(Box::new(result)));
+                        let reason = response
+                            .incomplete_details
+                            .and_then(|details| details.reason);
+                        apply_terminal_response(
+                            &mut result,
+                            response.terminal,
+                            requested_service_tier.as_deref(),
+                            use_requested_for_default,
+                        );
+                        if reason.as_deref() == Some("max_output_tokens") {
+                                result.stop_reason = StopReason::Length;
+                                result.raw_stop_reason =
+                                    Some("incomplete.max_output_tokens".into());
+                                yield Ok(Event::Done(Box::new(result)));
                             return;
                         }
                         result.stop_reason = StopReason::Error;
-                        result.raw_stop_reason = Some(format!("incomplete.{reason}"));
+                        result.raw_stop_reason = Some(reason.as_ref().map_or_else(
+                            || "incomplete".into(),
+                            |reason| format!("incomplete.{reason}"),
+                        ));
                         yield Err(Error::Response {
                             code: None,
-                            message: format!("Response incomplete: {reason}"),
+                            message: reason.map_or_else(
+                                || "Response incomplete without a provider reason".into(),
+                                |reason| format!("Response incomplete: {reason}"),
+                            ),
                             partial: result,
                         });
                         return;
@@ -1593,13 +1709,18 @@ pub(crate) fn decode_events(
                             .or_else(|| {
                                 response
                                     .incomplete_details
-                                    .map(|details| format!("Response incomplete: {}", details.reason))
+                                    .and_then(|details| details.reason)
+                                    .map(|reason| format!("Response incomplete: {reason}"))
                             })
                             .unwrap_or_else(|| "Unknown provider error".into());
                         if response.id.is_some() {
                             result.id = response.id;
                         }
-                        result.service_tier = response.service_tier;
+                        result.service_tier = resolve_service_tier(
+                            response.service_tier,
+                            requested_service_tier.as_deref(),
+                            use_requested_for_default,
+                        );
                         result.end_turn = response.end_turn;
                         result.stop_reason = StopReason::Error;
                         result.raw_stop_reason = Some("failed".into());
@@ -1645,14 +1766,54 @@ fn backfill_reasoning(result: &mut Response, output: &[OutputItem]) {
     }
 }
 
-fn apply_terminal_response(result: &mut Response, response: TerminalResponse) {
+fn apply_terminal_response(
+    result: &mut Response,
+    response: TerminalResponse,
+    requested_service_tier: Option<&str>,
+    use_requested_for_default: bool,
+) {
     backfill_reasoning(result, &response.output);
     if response.id.is_some() {
         result.id = response.id;
     }
-    result.service_tier = response.service_tier;
+    result.service_tier = resolve_service_tier(
+        response.service_tier,
+        requested_service_tier,
+        use_requested_for_default,
+    );
     result.end_turn = response.end_turn;
     result.usage = usage(response.usage);
+}
+
+fn resolve_service_tier(
+    response: Option<String>,
+    requested: Option<&str>,
+    use_requested_for_default: bool,
+) -> Option<String> {
+    match response.as_deref() {
+        None => requested.map(str::to_owned),
+        Some("default") if use_requested_for_default => requested.map(str::to_owned).or(response),
+        Some(_) => response,
+    }
+}
+
+pub(crate) fn apply_service_tier_pricing(
+    model: &crate::Model,
+    usage: &mut Usage,
+    service_tier: Option<&str>,
+) {
+    let multiplier = match service_tier {
+        Some("flex") => 0.5,
+        Some("priority") if model.id == "gpt-5.5" => 2.5,
+        Some("priority") => 2.0,
+        _ => return,
+    };
+    usage.cost.input *= multiplier;
+    usage.cost.output *= multiplier;
+    usage.cost.cache_read *= multiplier;
+    usage.cost.cache_write *= multiplier;
+    usage.cost.total =
+        usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
 pub(crate) fn clamp_cache_key(key: &str) -> String {
@@ -1670,7 +1831,7 @@ fn usage(usage: CompletedUsage) -> Usage {
         cache_write: usage.input_tokens_details.cache_write_tokens,
         cache_write_1h: None,
         reasoning: Some(usage.output_tokens_details.reasoning_tokens),
-        total_tokens: usage.input_tokens + usage.output_tokens,
+        total_tokens: usage.total_tokens,
         cost: Default::default(),
     }
 }
