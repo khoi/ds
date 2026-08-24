@@ -194,8 +194,9 @@ pub async fn stream(
             break response;
         }
         if retries < options.max_retries && is_retryable(&response) {
+            let retry_index = retries;
             retries += 1;
-            let delay = retry_delay(response.headers());
+            let delay = retry_delay(response.headers(), retry_index);
             if delay > DEFAULT_MAX_RETRY_DELAY {
                 return Err(Error::RetryDelayExceeded {
                     requested: delay,
@@ -318,7 +319,7 @@ fn is_retryable(response: &reqwest::Response) -> bool {
     }
 }
 
-fn retry_delay(headers: &reqwest::header::HeaderMap) -> Duration {
+fn retry_delay(headers: &reqwest::header::HeaderMap, retry_index: usize) -> Duration {
     if let Some(milliseconds) = headers
         .get("retry-after-ms")
         .and_then(|value| value.to_str().ok())
@@ -330,7 +331,7 @@ fn retry_delay(headers: &reqwest::header::HeaderMap) -> Duration {
         .get("retry-after")
         .and_then(|value| value.to_str().ok())
     else {
-        return Duration::default();
+        return retry_backoff(retry_index);
     };
     if let Ok(seconds) = value.parse::<u64>() {
         return Duration::from_secs(seconds);
@@ -338,5 +339,10 @@ fn retry_delay(headers: &reqwest::header::HeaderMap) -> Duration {
     httpdate::parse_http_date(value)
         .ok()
         .and_then(|time| time.duration_since(SystemTime::now()).ok())
-        .unwrap_or_default()
+        .unwrap_or_else(|| retry_backoff(retry_index))
+}
+
+fn retry_backoff(retry_index: usize) -> Duration {
+    let base_seconds = (0.5 * 2_f64.powi(retry_index as i32)).min(8.0);
+    Duration::from_secs_f64(base_seconds * (1.0 - rand::random::<f64>() * 0.25))
 }
