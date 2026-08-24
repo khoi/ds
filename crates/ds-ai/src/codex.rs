@@ -1,6 +1,7 @@
 use crate::{
-    CacheRetention, Context, Error, ResponseMetadata, ResponseStream, http, openai, retry, schema,
-    transport,
+    CacheRetention, Context, Error, ResponseMetadata, ResponseStream,
+    deferred_tools::{DeferredToolsMode, ToolPlacement},
+    http, openai, retry, transport,
 };
 use async_trait::async_trait;
 use base64::prelude::*;
@@ -82,6 +83,16 @@ impl Provider {
                 .with_max_retries(options.max_retries.unwrap_or_default())
                 .with_max_retry_delay(options.max_retry_delay)
                 .with_cache_retention(options.cache_retention);
+            if let Some(crate::ModelCompatibility::OpenAi(compat)) = &requested_model.compat {
+                let mode = if compat.supports_additional_tools == Some(true) {
+                    Some(DeferredToolsMode::AdditionalTools)
+                } else if compat.supports_tool_search == Some(true) {
+                    Some(DeferredToolsMode::ToolSearch)
+                } else {
+                    None
+                };
+                provider_options = provider_options.with_deferred_tools_mode(mode);
+            }
             if let Some(temperature) = options.temperature {
                 provider_options = provider_options.with_temperature(temperature);
             }
@@ -412,6 +423,7 @@ pub struct Options {
     service_tier: Option<ServiceTier>,
     text_verbosity: TextVerbosity,
     tool_choice: ToolChoice,
+    deferred_tools_mode: Option<DeferredToolsMode>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -458,6 +470,7 @@ impl Options {
             service_tier: None,
             text_verbosity: TextVerbosity::Low,
             tool_choice: ToolChoice::Auto,
+            deferred_tools_mode: None,
         }
     }
 
@@ -545,6 +558,11 @@ impl Options {
         self.tool_choice = tool_choice;
         self
     }
+
+    fn with_deferred_tools_mode(mut self, mode: Option<DeferredToolsMode>) -> Self {
+        self.deferred_tools_mode = mode;
+        self
+    }
 }
 
 #[derive(Serialize)]
@@ -613,13 +631,24 @@ pub async fn stream(
             options.session_id.as_deref().map(openai::clamp_cache_key)
         }
     };
+    let placement = crate::deferred_tools::split(
+        context,
+        options.deferred_tools_mode.is_some(),
+        str::to_owned,
+    );
     let request = Request {
         model: &model.id,
         store: false,
         stream: true,
         instructions: context.system().unwrap_or("You are a helpful assistant."),
-        input: openai::response_input(&model.id, context, false),
-        tools: tools(context).map_err(Error::InvalidRequest)?,
+        input: openai::response_input(
+            &model.id,
+            context,
+            false,
+            options.deferred_tools_mode.map(|mode| (&placement, mode)),
+        )
+        .map_err(Error::InvalidRequest)?,
+        tools: tools(&placement).map_err(Error::InvalidRequest)?,
         text: TextOptions {
             verbosity: options.text_verbosity,
         },
@@ -1507,25 +1536,6 @@ fn websocket_url(base_url: &str) -> String {
         .replacen("http://", "ws://", 1)
 }
 
-fn tools(context: &Context) -> Result<Vec<serde_json::Value>, String> {
-    context
-        .tools()
-        .iter()
-        .map(|tool| {
-            let parameters = if tool.strict() {
-                schema::strict(&tool.parameters).map_err(|error| {
-                    format!("tool {:?} has an invalid strict schema: {error}", tool.name)
-                })?
-            } else {
-                tool.parameters.clone()
-            };
-            Ok(serde_json::json!({
-                "type": "function",
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": parameters,
-                "strict": tool.strict()
-            }))
-        })
-        .collect()
+fn tools(placement: &ToolPlacement) -> Result<Vec<serde_json::Value>, String> {
+    openai::response_tools(&placement.immediate, false)
 }

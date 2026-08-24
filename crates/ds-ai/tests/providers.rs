@@ -12,6 +12,8 @@ mod codex_stream;
 mod complete;
 #[path = "cross_provider.rs"]
 mod cross_provider;
+#[path = "deferred_tools.rs"]
+mod deferred_tools;
 #[path = "event_stream.rs"]
 mod event_stream;
 #[path = "helpers.rs"]

@@ -1,5 +1,6 @@
 mod auth;
 mod catalog;
+mod deferred_tools;
 mod estimate;
 mod event_stream;
 mod frame;

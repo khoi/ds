@@ -8,7 +8,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -59,8 +59,9 @@ impl Provider {
             let api_key = options
                 .api_key
                 .ok_or_else(|| Error::InvalidRequest("Anthropic API key is required".into()))?;
-            let mut provider_model =
-                Model::new(&requested_model.id).with_base_url(requested_model.base_url.clone());
+            let mut provider_model = Model::new(&requested_model.id)
+                .with_base_url(requested_model.base_url.clone())
+                .with_tool_references(default_supports_tool_references(&requested_model));
             if let Some(crate::ModelCompatibility::Anthropic(compat)) = &requested_model.compat {
                 provider_model = provider_model.with_eager_tool_input_streaming(
                     compat.supports_eager_tool_input_streaming.unwrap_or(true),
@@ -71,6 +72,11 @@ impl Provider {
                 if compat.allow_empty_signature == Some(true) {
                     provider_model = provider_model.with_empty_thinking_signatures();
                 }
+                provider_model = provider_model.with_tool_references(
+                    compat
+                        .supports_tool_references
+                        .unwrap_or_else(|| default_supports_tool_references(&requested_model)),
+                );
             }
             let max_tokens = options
                 .max_tokens
@@ -193,6 +199,26 @@ fn anthropic_thinking(level: crate::ThinkingLevel) -> Thinking {
     }
 }
 
+fn default_supports_tool_references(model: &crate::Model) -> bool {
+    if model.provider.as_str() != "anthropic" || model.id.contains("haiku") {
+        return false;
+    }
+    let mut parts = model.id.split('-');
+    if parts.next() != Some("claude") || !matches!(parts.next(), Some("opus" | "sonnet" | "fable"))
+    {
+        return false;
+    }
+    let Some(major) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+        return false;
+    };
+    let minor = parts
+        .next()
+        .filter(|value| value.len() < 8)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    major > 4 || major == 4 && minor >= 5
+}
+
 struct AnthropicApiKeyAuth;
 
 #[async_trait]
@@ -279,6 +305,7 @@ pub struct Model {
     eager_tool_input_streaming: bool,
     strict_tools: bool,
     empty_thinking_signatures: bool,
+    tool_references: bool,
 }
 
 impl Model {
@@ -289,6 +316,7 @@ impl Model {
             eager_tool_input_streaming: true,
             strict_tools: false,
             empty_thinking_signatures: false,
+            tool_references: false,
         }
     }
 
@@ -309,6 +337,11 @@ impl Model {
 
     pub fn with_empty_thinking_signatures(mut self) -> Self {
         self.empty_thinking_signatures = true;
+        self
+    }
+
+    pub(crate) fn with_tool_references(mut self, enabled: bool) -> Self {
+        self.tool_references = enabled;
         self
     }
 }
@@ -504,6 +537,8 @@ struct RequestTool {
     strict: Option<bool>,
     input_schema: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
+    defer_loading: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
 }
 
@@ -632,8 +667,12 @@ pub async fn stream(
         .map(|timeout| Instant::now() + timeout);
     let cache_control = cache_control(options.cache_retention);
     let (thinking, output_config) = thinking(&options.thinking);
+    let mut placement = crate::deferred_tools::split(context, model.tool_references, str::to_owned);
+    if placement.immediate.is_empty() && !placement.deferred.is_empty() {
+        placement.immediate = placement.deferred.drain(..).map(|(_, tool)| tool).collect();
+    }
     let tools =
-        request_tools(model, context, cache_control.as_ref()).map_err(Error::InvalidRequest)?;
+        request_tools(model, &placement, cache_control.as_ref()).map_err(Error::InvalidRequest)?;
     let legacy_tool_streaming = !model.eager_tool_input_streaming && !tools.is_empty();
     let request = Request {
         model: &model.id,
@@ -645,7 +684,7 @@ pub async fn stream(
                 vec![block]
             })
             .unwrap_or_default(),
-        messages: messages(model, context, cache_control.as_ref()),
+        messages: messages(model, context, cache_control.as_ref(), &placement),
         tools,
         max_tokens: options.max_tokens,
         stream: true,
@@ -981,10 +1020,12 @@ fn messages(
     model: &Model,
     context: &Context,
     cache_control: Option<&CacheControl>,
+    placement: &crate::deferred_tools::ToolPlacement,
 ) -> Vec<RequestMessage> {
     let mut messages = Vec::new();
     let mut pending_tool_calls = Vec::new();
     let mut tool_results = HashSet::new();
+    let mut loaded_tools = BTreeSet::new();
     for message in context.messages() {
         match message {
             Message::User(message) => {
@@ -1018,7 +1059,11 @@ fn messages(
             Message::ToolResult(result) => {
                 let id = normalize_id(&result.tool_call_id);
                 tool_results.insert(id.clone());
-                push_message(&mut messages, "user", vec![tool_result(result, &id)]);
+                push_message(
+                    &mut messages,
+                    "user",
+                    tool_result(result, &id, placement, &mut loaded_tools),
+                );
             }
         }
     }
@@ -1075,15 +1120,17 @@ fn finish_tool_calls(
 
 fn request_tools(
     model: &Model,
-    context: &Context,
+    placement: &crate::deferred_tools::ToolPlacement,
     cache_control: Option<&CacheControl>,
 ) -> Result<Vec<RequestTool>, String> {
-    let tool_count = context.tools().len();
-    context
-        .tools()
+    let immediate_count = placement.immediate.len();
+    placement
+        .immediate
         .iter()
+        .map(|tool| (tool, false))
+        .chain(placement.deferred.iter().map(|(_, tool)| (tool, true)))
         .enumerate()
-        .map(|(index, tool)| {
+        .map(|(index, (tool, deferred))| {
             let strict = model.strict_tools && tool.strict();
             let input_schema = if strict {
                 schema::strict(&tool.parameters).map_err(|error| {
@@ -1098,7 +1145,8 @@ fn request_tools(
                 eager_input_streaming: model.eager_tool_input_streaming.then_some(true),
                 strict: strict.then_some(true),
                 input_schema,
-                cache_control: if index + 1 == tool_count {
+                defer_loading: deferred.then_some(true),
+                cache_control: if !deferred && index + 1 == immediate_count {
                     cache_control.cloned()
                 } else {
                     None
@@ -1233,13 +1281,35 @@ fn tool_choice(choice: &ToolChoice) -> serde_json::Value {
     }
 }
 
-fn tool_result(result: &ToolResultMessage, id: &str) -> serde_json::Value {
-    serde_json::json!({
+fn tool_result(
+    result: &ToolResultMessage,
+    id: &str,
+    placement: &crate::deferred_tools::ToolPlacement,
+    loaded_tools: &mut BTreeSet<String>,
+) -> Vec<serde_json::Value> {
+    let references = result
+        .added_tool_names
+        .iter()
+        .flatten()
+        .filter_map(|name| {
+            let tool = placement.deferred_tool(name)?;
+            loaded_tools
+                .insert(name.clone())
+                .then(|| serde_json::json!({"type": "tool_reference", "tool_name": tool.name}))
+        })
+        .collect::<Vec<_>>();
+    let content = result.content.iter().map(input_content).collect::<Vec<_>>();
+    let loaded = !references.is_empty();
+    let mut blocks = vec![serde_json::json!({
         "type": "tool_result",
         "tool_use_id": id,
-        "content": result.content.iter().map(input_content).collect::<Vec<_>>(),
+        "content": if loaded { references } else { content.clone() },
         "is_error": result.is_error
-    })
+    })];
+    if loaded {
+        blocks.extend(content);
+    }
+    blocks
 }
 
 fn apply_usage(usage: &mut Usage, update: AnthropicUsage) {

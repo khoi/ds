@@ -1,7 +1,9 @@
 use crate::{
     AssistantContent, CacheRetention, Content, Context, Error, Event, InputContent, Message,
     Response, ResponseMetadata, ResponseStream, StopReason, TimeoutPhase, ToolCall,
-    ToolResultMessage, Usage, UserContent, http, json, retry, schema, transport,
+    ToolResultMessage, Usage, UserContent,
+    deferred_tools::{DeferredToolsMode, ToolPlacement},
+    http, json, retry, schema, transport,
     types::{OpenAiReplay, normalize_id},
 };
 use async_stream::stream;
@@ -67,6 +69,16 @@ impl Provider {
                 .with_max_retries(options.max_retries.unwrap_or_default())
                 .with_max_retry_delay(options.max_retry_delay)
                 .with_cache_retention(options.cache_retention);
+            if let Some(crate::ModelCompatibility::OpenAi(compat)) = &requested_model.compat {
+                let mode = if compat.supports_additional_tools == Some(true) {
+                    Some(DeferredToolsMode::AdditionalTools)
+                } else if compat.supports_tool_search == Some(true) {
+                    Some(DeferredToolsMode::ToolSearch)
+                } else {
+                    None
+                };
+                provider_options = provider_options.with_deferred_tools_mode(mode);
+            }
             if let Some(max_tokens) = options.max_tokens {
                 provider_options = provider_options.with_max_output_tokens(max_tokens);
             }
@@ -202,6 +214,7 @@ pub struct Options {
     overall_timeout: Option<Duration>,
     session_id: Option<String>,
     cache_retention: CacheRetention,
+    deferred_tools_mode: Option<DeferredToolsMode>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -265,6 +278,7 @@ impl Options {
             overall_timeout: None,
             session_id: None,
             cache_retention: CacheRetention::Short,
+            deferred_tools_mode: None,
         }
     }
 
@@ -345,6 +359,11 @@ impl Options {
         self.cache_retention = retention;
         self
     }
+
+    pub(crate) fn with_deferred_tools_mode(mut self, mode: Option<DeferredToolsMode>) -> Self {
+        self.deferred_tools_mode = mode;
+        self
+    }
 }
 
 #[derive(Serialize)]
@@ -387,6 +406,8 @@ struct RequestTool {
     description: String,
     parameters: serde_json::Value,
     strict: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    defer_loading: Option<bool>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -565,27 +586,19 @@ pub async fn stream(
     let overall_deadline = options
         .overall_timeout
         .map(|timeout| Instant::now() + timeout);
-    let input = response_input(&model.id, context, true);
-    let tools = context
-        .tools()
-        .iter()
-        .map(|tool| {
-            Ok(RequestTool {
-                r#type: "function",
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters: if tool.strict() {
-                    schema::strict(&tool.parameters).map_err(|error| {
-                        format!("tool {:?} has an invalid strict schema: {error}", tool.name)
-                    })?
-                } else {
-                    tool.parameters.clone()
-                },
-                strict: tool.strict(),
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(Error::InvalidRequest)?;
+    let placement = crate::deferred_tools::split(
+        context,
+        options.deferred_tools_mode.is_some(),
+        str::to_owned,
+    );
+    let input = response_input(
+        &model.id,
+        context,
+        true,
+        options.deferred_tools_mode.map(|mode| (&placement, mode)),
+    )
+    .map_err(Error::InvalidRequest)?;
+    let tools = request_tools(&placement.immediate, false).map_err(Error::InvalidRequest)?;
     let request = Request {
         model: &model.id,
         input,
@@ -676,8 +689,10 @@ pub(crate) fn response_input(
     model: &str,
     context: &Context,
     include_system: bool,
-) -> Vec<serde_json::Value> {
+    deferred_tools: Option<(&ToolPlacement, DeferredToolsMode)>,
+) -> Result<Vec<serde_json::Value>, String> {
     let mut input = Vec::new();
+    let mut loaded_tools = std::collections::BTreeSet::new();
     if include_system && let Some(system) = context.system() {
         input.push(serde_json::json!({
             "role": "developer",
@@ -762,14 +777,125 @@ pub(crate) fn response_input(
                     }
                 }
             }
-            Message::ToolResult(result) => input.push(serde_json::json!({
-                "type": "function_call_output",
-                "call_id": openai_call_id(&result.tool_call_id),
-                "output": tool_result_output(result)
-            })),
+            Message::ToolResult(result) => {
+                input.push(serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": openai_call_id(&result.tool_call_id),
+                    "output": tool_result_output(result)
+                }));
+                let Some((placement, mode)) = deferred_tools else {
+                    continue;
+                };
+                let tools = result
+                    .added_tool_names
+                    .iter()
+                    .flatten()
+                    .filter_map(|name| {
+                        let tool = placement.deferred_tool(name)?;
+                        loaded_tools.insert(name.clone()).then_some(tool.clone())
+                    })
+                    .collect::<Vec<_>>();
+                if tools.is_empty() {
+                    continue;
+                }
+                match mode {
+                    DeferredToolsMode::AdditionalTools => input.push(serde_json::json!({
+                        "type": "additional_tools",
+                        "role": "developer",
+                        "tools": request_tools(&tools, false)?
+                    })),
+                    DeferredToolsMode::ToolSearch => {
+                        let names = tools
+                            .iter()
+                            .map(|tool| tool.name.as_str())
+                            .collect::<Vec<_>>();
+                        let call_id = format!(
+                            "pi_tool_load_{}",
+                            short_hash(&format!("{}:{}", result.tool_call_id, names.join(",")))
+                        );
+                        input.push(serde_json::json!({
+                            "type": "tool_search_call",
+                            "call_id": call_id,
+                            "execution": "client",
+                            "status": "completed",
+                            "arguments": {"query": names.join(" "), "limit": names.len()}
+                        }));
+                        input.push(serde_json::json!({
+                            "type": "tool_search_output",
+                            "call_id": call_id,
+                            "execution": "client",
+                            "status": "completed",
+                            "tools": request_tools(&tools, true)?
+                        }));
+                    }
+                }
+            }
         }
     }
-    input
+    Ok(input)
+}
+
+pub(crate) fn response_tools(
+    tools: &[crate::Tool],
+    defer_loading: bool,
+) -> Result<Vec<serde_json::Value>, String> {
+    request_tools(tools, defer_loading)?
+        .into_iter()
+        .map(|tool| serde_json::to_value(tool).map_err(|error| error.to_string()))
+        .collect()
+}
+
+fn request_tools(tools: &[crate::Tool], defer_loading: bool) -> Result<Vec<RequestTool>, String> {
+    tools
+        .iter()
+        .map(|tool| {
+            Ok(RequestTool {
+                r#type: "function",
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: if tool.strict() {
+                    schema::strict(&tool.parameters).map_err(|error| {
+                        format!("tool {:?} has an invalid strict schema: {error}", tool.name)
+                    })?
+                } else {
+                    tool.parameters.clone()
+                },
+                strict: tool.strict(),
+                defer_loading: defer_loading.then_some(true),
+            })
+        })
+        .collect()
+}
+
+fn short_hash(value: &str) -> String {
+    let mut h1 = 0xdead_beefu32;
+    let mut h2 = 0x41c6_ce57u32;
+    for code_unit in value.encode_utf16() {
+        h1 = (h1 ^ u32::from(code_unit)).wrapping_mul(2_654_435_761);
+        h2 = (h2 ^ u32::from(code_unit)).wrapping_mul(1_597_334_677);
+    }
+    h1 = (h1 ^ (h1 >> 16)).wrapping_mul(2_246_822_507)
+        ^ (h2 ^ (h2 >> 13)).wrapping_mul(3_266_489_909);
+    h2 = (h2 ^ (h2 >> 16)).wrapping_mul(2_246_822_507)
+        ^ (h1 ^ (h1 >> 13)).wrapping_mul(3_266_489_909);
+    format!("{}{}", base36(h2), base36(h1))
+}
+
+fn base36(mut value: u32) -> String {
+    if value == 0 {
+        return "0".into();
+    }
+    let mut digits = Vec::new();
+    while value > 0 {
+        let digit = value % 36;
+        digits.push(if digit < 10 {
+            char::from(b'0' + digit as u8)
+        } else {
+            char::from(b'a' + (digit - 10) as u8)
+        });
+        value /= 36;
+    }
+    digits.into_iter().rev().collect()
 }
 
 fn response_input_content(content: &InputContent) -> serde_json::Value {
