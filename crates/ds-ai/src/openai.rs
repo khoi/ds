@@ -191,13 +191,7 @@ pub async fn stream(
         }
         if retries < options.max_retries && is_retryable(&response) {
             retries += 1;
-            let delay = response
-                .headers()
-                .get("retry-after-ms")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .map(Duration::from_millis)
-                .unwrap_or_default();
+            let delay = retry_delay(response.headers());
             if !delay.is_zero() {
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
@@ -312,4 +306,20 @@ fn is_retryable(response: &reqwest::Response) -> bool {
         Some("false") => false,
         _ => matches!(response.status().as_u16(), 408 | 409 | 429 | 500..=599),
     }
+}
+
+fn retry_delay(headers: &reqwest::header::HeaderMap) -> Duration {
+    if let Some(milliseconds) = headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(milliseconds);
+    }
+    headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_default()
 }

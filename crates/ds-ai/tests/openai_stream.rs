@@ -191,39 +191,42 @@ async fn retries_openai_before_streaming_starts() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn waits_for_openai_retry_after_milliseconds() {
-    let completed = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_delayed\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
-    let server = serve([
-        Reply::json(
-            429,
-            json!({"error": {"type": "rate_limit_error", "message": "retry"}}),
-        )
-        .with_header("retry-after-ms", "1500"),
-        Reply::sse(completed),
-    ])
-    .await;
-    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
-    let context = Context::new([Message::user("Hello")]);
-    let options = openai::Options::new("test-key").with_max_retries(1);
-    let task = tokio::spawn(async move {
-        openai::stream(&model, &context, &options)
-            .await
-            .unwrap()
-            .collect::<Vec<_>>()
-            .await
-    });
+async fn waits_for_openai_retry_headers() {
+    for (header, value, delay_ms) in [("retry-after-ms", "1500", 1500), ("retry-after", "2", 2000)]
+    {
+        let completed = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_delayed\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
+        let server = serve([
+            Reply::json(
+                429,
+                json!({"error": {"type": "rate_limit_error", "message": "retry"}}),
+            )
+            .with_header(header, value),
+            Reply::sse(completed),
+        ])
+        .await;
+        let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+        let context = Context::new([Message::user("Hello")]);
+        let options = openai::Options::new("test-key").with_max_retries(1);
+        let task = tokio::spawn(async move {
+            openai::stream(&model, &context, &options)
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await
+        });
 
-    server.wait_for_requests(1).await;
-    tokio::time::advance(std::time::Duration::from_millis(1499)).await;
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
+        server.wait_for_requests(1).await;
+        tokio::time::advance(std::time::Duration::from_millis(delay_ms - 1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(server.request_count(), 1);
+
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        let events = task.await.unwrap();
+        assert!(matches!(events.as_slice(), [Ok(Event::Done(_))]));
+        assert_eq!(server.requests().await.len(), 2);
     }
-    assert_eq!(server.request_count(), 1);
-
-    tokio::time::advance(std::time::Duration::from_millis(1)).await;
-    let events = task.await.unwrap();
-    assert!(matches!(events.as_slice(), [Ok(Event::Done(_))]));
-    assert_eq!(server.requests().await.len(), 2);
 }
 
 #[tokio::test(start_paused = true)]
