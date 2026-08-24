@@ -43,6 +43,7 @@ pub struct Options {
     temperature: Option<f64>,
     reasoning: Option<Reasoning>,
     tool_choice: Option<ToolChoice>,
+    service_tier: Option<ServiceTier>,
     connection_timeout: Option<Duration>,
     first_event_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
@@ -78,6 +79,15 @@ pub enum ToolChoice {
     Required,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceTier {
+    Auto,
+    Default,
+    Flex,
+    Priority,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Reasoning {
     effort: ReasoningEffort,
@@ -95,6 +105,7 @@ impl Options {
             temperature: None,
             reasoning: None,
             tool_choice: None,
+            service_tier: None,
             connection_timeout: None,
             first_event_timeout: None,
             idle_timeout: None,
@@ -136,6 +147,11 @@ impl Options {
 
     pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = Some(tool_choice);
+        self
+    }
+
+    pub fn with_service_tier(mut self, service_tier: ServiceTier) -> Self {
+        self.service_tier = Some(service_tier);
         self
     }
 
@@ -188,6 +204,8 @@ struct Request<'a> {
     include: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<ServiceTier>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -593,6 +611,7 @@ pub async fn stream(
             .map(|_| vec!["reasoning.encrypted_content"])
             .unwrap_or_default(),
         tool_choice: options.tool_choice,
+        service_tier: options.service_tier,
         prompt_cache_key: match options.cache_retention {
             CacheRetention::None => None,
             CacheRetention::Short | CacheRetention::Long => {

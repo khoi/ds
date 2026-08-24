@@ -966,7 +966,8 @@ async fn encodes_openai_multimodal_context_and_generation_options() {
             openai::ReasoningEffort::High,
             openai::ReasoningSummary::Concise,
         )
-        .with_tool_choice(openai::ToolChoice::Required);
+        .with_tool_choice(openai::ToolChoice::Required)
+        .with_service_tier(openai::ServiceTier::Priority);
 
     openai::stream(&model, &context, &options)
         .await
@@ -1014,7 +1015,8 @@ async fn encodes_openai_multimodal_context_and_generation_options() {
             "temperature": 0.2,
             "reasoning": {"effort": "high", "summary": "concise"},
             "include": ["reasoning.encrypted_content"],
-            "tool_choice": "required"
+            "tool_choice": "required",
+            "service_tier": "priority"
         })
     );
 }

@@ -163,6 +163,46 @@ async fn streams_a_codex_websocket_request() {
 }
 
 #[tokio::test]
+async fn encodes_codex_generation_options() {
+    let (base_url, capture) =
+        serve_websocket([text_events("resp_options", "msg_options", "Configured")]).await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let events = codex::stream(
+        &model,
+        &Context::new([Message::user("Configure")]),
+        &codex::Options::new(token("acc_options"))
+            .with_cache_retention(ds_ai::CacheRetention::None)
+            .with_temperature(0.25)
+            .with_reasoning(
+                codex::ReasoningEffort::High,
+                codex::ReasoningSummary::Concise,
+            )
+            .with_service_tier(codex::ServiceTier::Priority)
+            .with_text_verbosity(codex::TextVerbosity::High)
+            .with_tool_choice(codex::ToolChoice::Required)
+            .with_transport(codex::Transport::WebSocket),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+
+    assert_eq!(
+        done(&events).content,
+        [ds_ai::Content::Text("Configured".into())]
+    );
+    let body = &capture.await.unwrap().bodies[0];
+    assert_eq!(body["temperature"], 0.25);
+    assert_eq!(
+        body["reasoning"],
+        json!({"effort": "high", "summary": "concise"})
+    );
+    assert_eq!(body["service_tier"], "priority");
+    assert_eq!(body["text"], json!({"verbosity": "high"}));
+    assert_eq!(body["tool_choice"], "required");
+}
+
+#[tokio::test]
 async fn reuses_a_codex_websocket_with_an_input_delta() {
     let (base_url, capture) = serve_websocket([
         text_events("resp_first", "msg_first", "First"),

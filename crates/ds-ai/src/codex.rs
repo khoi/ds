@@ -21,6 +21,8 @@ use tokio_tungstenite::{
 };
 use tokio_util::sync::CancellationToken;
 
+pub use crate::openai::{ReasoningEffort, ReasoningSummary, ServiceTier, ToolChoice};
+
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -80,6 +82,11 @@ pub struct Options {
     transport: Transport,
     websocket_connect_timeout: Duration,
     websocket_cache_ttl: Duration,
+    temperature: Option<f64>,
+    reasoning: Option<Reasoning>,
+    service_tier: Option<ServiceTier>,
+    text_verbosity: TextVerbosity,
+    tool_choice: ToolChoice,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -88,6 +95,21 @@ pub enum Transport {
     Auto,
     Sse,
     WebSocket,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextVerbosity {
+    #[default]
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Reasoning {
+    effort: ReasoningEffort,
+    summary: ReasoningSummary,
 }
 
 impl Options {
@@ -106,6 +128,11 @@ impl Options {
             transport: Transport::Auto,
             websocket_connect_timeout: DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
             websocket_cache_ttl: WEBSOCKET_IDLE_TTL,
+            temperature: None,
+            reasoning: None,
+            service_tier: None,
+            text_verbosity: TextVerbosity::Low,
+            tool_choice: ToolChoice::Auto,
         }
     }
 
@@ -168,6 +195,31 @@ impl Options {
         self.websocket_cache_ttl = ttl;
         self
     }
+
+    pub fn with_temperature(mut self, temperature: f64) -> Self {
+        self.temperature = Some(temperature);
+        self
+    }
+
+    pub fn with_reasoning(mut self, effort: ReasoningEffort, summary: ReasoningSummary) -> Self {
+        self.reasoning = Some(Reasoning { effort, summary });
+        self
+    }
+
+    pub fn with_service_tier(mut self, service_tier: ServiceTier) -> Self {
+        self.service_tier = Some(service_tier);
+        self
+    }
+
+    pub fn with_text_verbosity(mut self, verbosity: TextVerbosity) -> Self {
+        self.text_verbosity = verbosity;
+        self
+    }
+
+    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+        self.tool_choice = tool_choice;
+        self
+    }
 }
 
 #[derive(Serialize)]
@@ -180,16 +232,28 @@ struct Request<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<serde_json::Value>,
     text: TextOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<RequestReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<ServiceTier>,
     include: [&'static str; 1],
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<String>,
-    tool_choice: &'static str,
+    tool_choice: ToolChoice,
     parallel_tool_calls: bool,
 }
 
 #[derive(Serialize)]
 struct TextOptions {
-    verbosity: &'static str,
+    verbosity: TextVerbosity,
+}
+
+#[derive(Serialize)]
+struct RequestReasoning {
+    effort: ReasoningEffort,
+    summary: ReasoningSummary,
 }
 
 pub async fn stream(
@@ -214,10 +278,18 @@ pub async fn stream(
         instructions: context.system().unwrap_or("You are a helpful assistant."),
         input: input(model, context),
         tools: tools(context).map_err(Error::InvalidRequest)?,
-        text: TextOptions { verbosity: "low" },
+        text: TextOptions {
+            verbosity: options.text_verbosity,
+        },
+        temperature: options.temperature,
+        reasoning: options.reasoning.map(|reasoning| RequestReasoning {
+            effort: reasoning.effort,
+            summary: reasoning.summary,
+        }),
+        service_tier: options.service_tier,
         include: ["reasoning.encrypted_content"],
         prompt_cache_key: session_id.clone(),
-        tool_choice: "auto",
+        tool_choice: options.tool_choice,
         parallel_tool_calls: true,
     };
     let value =
