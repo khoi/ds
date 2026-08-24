@@ -1,5 +1,5 @@
 use crate::support::{Reply, serve};
-use ds_ai::{Context, Event, Message, StopReason, anthropic};
+use ds_ai::{Context, Event, InputContent, Message, StopReason, ToolCall, ToolResult, anthropic};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
@@ -63,6 +63,123 @@ async fn streams_anthropic_text_until_message_stop() {
             "max_tokens": 1024,
             "stream": true
         })
+    );
+}
+
+#[tokio::test]
+async fn streams_and_replays_anthropic_thinking_and_tool_calls() {
+    let first_sse = [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_thinking\",\"usage\":{\"input_tokens\":4,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"I\",\"signature\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" think\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_1\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"encrypted\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"edit\",\"input\":{}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"README.md\\\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"}\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":8,\"output_tokens_details\":{\"thinking_tokens\":3}}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let first_server = serve([Reply::sse(first_sse)]).await;
+    let first_model =
+        anthropic::Model::new("claude-sonnet-4-5").with_base_url(&first_server.base_url);
+    let first_context = Context::new([Message::user("Edit")]);
+    let options = anthropic::Options::new("test-key");
+
+    let first_events = anthropic::stream(&first_model, &first_context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert_eq!(
+        first_events.first(),
+        Some(&Ok(Event::ReasoningDelta {
+            content_index: 0,
+            delta: " think".into(),
+        }))
+    );
+    assert_eq!(
+        first_events.get(1),
+        Some(&Ok(Event::ToolCallDelta {
+            content_index: 2,
+            delta: "{\"path\":\"README.md\"".into(),
+        }))
+    );
+    let response = done(&first_events);
+    assert_eq!(response.stop_reason, StopReason::ToolUse);
+    assert_eq!(response.usage.reasoning, 3);
+    assert_eq!(
+        response.content,
+        [
+            ds_ai::Content::Reasoning("I think".into()),
+            ds_ai::Content::Reasoning("[Reasoning redacted]".into()),
+            ds_ai::Content::ToolCall(ToolCall {
+                id: "toolu_1".into(),
+                name: "edit".into(),
+                arguments: json!({"path": "README.md"}),
+            }),
+        ]
+    );
+    let restored: ds_ai::Response =
+        serde_json::from_value(serde_json::to_value(response).unwrap()).unwrap();
+    first_server.requests().await;
+
+    let second_sse = [
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let second_server = serve([Reply::sse(second_sse)]).await;
+    let second_model =
+        anthropic::Model::new("claude-sonnet-4-5").with_base_url(&second_server.base_url);
+    let second_context = Context::new([
+        Message::assistant(restored),
+        Message::tool_result(ToolResult::new(
+            "toolu_1",
+            "edit",
+            [InputContent::text("done")],
+        )),
+    ]);
+
+    anthropic::stream(&second_model, &second_context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    let request = second_server.requests().await.pop().unwrap();
+    let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        body["messages"],
+        json!([
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "I think", "signature": "sig_1"},
+                    {"type": "redacted_thinking", "data": "encrypted"},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "edit",
+                        "input": {"path": "README.md"}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [{"type": "text", "text": "done"}],
+                    "is_error": false
+                }]
+            }
+        ])
     );
 }
 

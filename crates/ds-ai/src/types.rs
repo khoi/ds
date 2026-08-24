@@ -223,8 +223,24 @@ impl Response {
 
     pub(crate) fn anthropic(model: String) -> Self {
         Self {
-            provider: ProviderState::Anthropic { model },
+            provider: ProviderState::Anthropic(AnthropicState {
+                model,
+                reasoning: Vec::new(),
+            }),
             ..Self::default()
+        }
+    }
+
+    pub(crate) fn anthropic_reasoning(&self, model: &str) -> Option<&[AnthropicReasoning]> {
+        match &self.provider {
+            ProviderState::Anthropic(state) if state.model == model => Some(&state.reasoning),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn add_anthropic_reasoning(&mut self, reasoning: AnthropicReasoning) {
+        if let ProviderState::Anthropic(state) = &mut self.provider {
+            state.reasoning.push(reasoning);
         }
     }
 }
@@ -234,9 +250,7 @@ enum ProviderState {
     #[default]
     None,
     OpenAi(OpenAiState),
-    Anthropic {
-        model: String,
-    },
+    Anthropic(AnthropicState),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -261,6 +275,24 @@ pub(crate) enum OpenAiReplay {
         content_index: usize,
         item_id: String,
         namespace: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct AnthropicState {
+    model: String,
+    reasoning: Vec<AnthropicReasoning>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum AnthropicReasoning {
+    Thinking {
+        content_index: usize,
+        signature: String,
+    },
+    Redacted {
+        content_index: usize,
+        data: String,
     },
 }
 

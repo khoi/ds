@@ -1,6 +1,6 @@
 use crate::{
     Content, Context, Error, Event, InputContent, Message, Response, ResponseStream, StopReason,
-    ToolResult, Usage, http, retry, sse,
+    ToolResult, Usage, http, retry, sse, types::AnthropicReasoning,
 };
 use async_stream::stream;
 use futures_util::StreamExt;
@@ -89,6 +89,8 @@ enum StreamEvent {
     },
     #[serde(rename = "content_block_delta")]
     ContentBlockDelta { index: usize, delta: ContentDelta },
+    #[serde(rename = "content_block_stop")]
+    ContentBlockStop { index: usize },
     #[serde(rename = "message_delta")]
     MessageDelta {
         delta: MessageDelta,
@@ -113,6 +115,15 @@ struct ContentBlock {
     r#type: String,
     #[serde(default)]
     text: String,
+    #[serde(default)]
+    thinking: String,
+    #[serde(default)]
+    signature: String,
+    #[serde(default)]
+    data: String,
+    id: Option<String>,
+    name: Option<String>,
+    input: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -120,6 +131,12 @@ struct ContentDelta {
     r#type: String,
     #[serde(default)]
     text: String,
+    #[serde(default)]
+    thinking: String,
+    #[serde(default)]
+    signature: String,
+    #[serde(default)]
+    partial_json: String,
 }
 
 #[derive(Deserialize)]
@@ -141,6 +158,19 @@ struct OutputTokenDetails {
     thinking_tokens: Option<u64>,
 }
 
+enum Slot {
+    Text(usize),
+    Thinking {
+        content_index: usize,
+        signature: String,
+    },
+    Redacted,
+    ToolCall {
+        content_index: usize,
+        partial_json: String,
+    },
+}
+
 pub async fn stream(
     model: &Model,
     context: &Context,
@@ -149,7 +179,7 @@ pub async fn stream(
     let request = Request {
         model: &model.id,
         system: context.system(),
-        messages: messages(context),
+        messages: messages(model, context),
         tools: context
             .tools()
             .iter()
@@ -228,21 +258,99 @@ pub async fn stream(
                     {
                         let content_index = result.content.len();
                         result.content.push(Content::Text(content_block.text));
-                        slots.insert(index, content_index);
+                        slots.insert(index, Slot::Text(content_index));
                     }
-                    StreamEvent::ContentBlockDelta { index, delta }
-                        if delta.r#type == "text_delta" =>
+                    StreamEvent::ContentBlockStart { index, content_block }
+                        if content_block.r#type == "thinking" =>
                     {
-                        let Some(content_index) = slots.get(&index) else {
+                        let content_index = result.content.len();
+                        result.content.push(Content::Reasoning(content_block.thinking));
+                        slots.insert(index, Slot::Thinking {
+                            content_index,
+                            signature: content_block.signature,
+                        });
+                    }
+                    StreamEvent::ContentBlockStart { index, content_block }
+                        if content_block.r#type == "redacted_thinking" =>
+                    {
+                        let content_index = result.content.len();
+                        result.content.push(Content::Reasoning("[Reasoning redacted]".into()));
+                        result.add_anthropic_reasoning(AnthropicReasoning::Redacted {
+                            content_index,
+                            data: content_block.data,
+                        });
+                        slots.insert(index, Slot::Redacted);
+                    }
+                    StreamEvent::ContentBlockStart { index, content_block }
+                        if content_block.r#type == "tool_use" =>
+                    {
+                        let (Some(id), Some(name)) = (content_block.id, content_block.name) else {
                             continue;
                         };
-                        if let Content::Text(text) = &mut result.content[*content_index] {
-                            text.push_str(&delta.text);
-                        }
-                        yield Ok(Event::TextDelta {
-                            content_index: *content_index,
-                            delta: delta.text,
+                        let content_index = result.content.len();
+                        result.content.push(Content::ToolCall(crate::ToolCall {
+                            id,
+                            name,
+                            arguments: content_block.input.unwrap_or_else(|| serde_json::json!({})),
+                        }));
+                        slots.insert(index, Slot::ToolCall {
+                            content_index,
+                            partial_json: String::new(),
                         });
+                    }
+                    StreamEvent::ContentBlockDelta { index, delta } => {
+                        match (delta.r#type.as_str(), slots.get_mut(&index)) {
+                            ("text_delta", Some(Slot::Text(content_index))) => {
+                                if let Content::Text(text) = &mut result.content[*content_index] {
+                                    text.push_str(&delta.text);
+                                }
+                                yield Ok(Event::TextDelta {
+                                    content_index: *content_index,
+                                    delta: delta.text,
+                                });
+                            }
+                            ("thinking_delta", Some(Slot::Thinking { content_index, .. })) => {
+                                if let Content::Reasoning(reasoning) = &mut result.content[*content_index] {
+                                    reasoning.push_str(&delta.thinking);
+                                }
+                                yield Ok(Event::ReasoningDelta {
+                                    content_index: *content_index,
+                                    delta: delta.thinking,
+                                });
+                            }
+                            ("signature_delta", Some(Slot::Thinking { signature, .. })) => {
+                                signature.push_str(&delta.signature);
+                            }
+                            ("input_json_delta", Some(Slot::ToolCall { content_index, partial_json })) => {
+                                partial_json.push_str(&delta.partial_json);
+                                if let Content::ToolCall(call) = &mut result.content[*content_index] {
+                                    call.arguments = parse_arguments(partial_json);
+                                }
+                                yield Ok(Event::ToolCallDelta {
+                                    content_index: *content_index,
+                                    delta: delta.partial_json,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                    StreamEvent::ContentBlockStop { index } => {
+                        match slots.remove(&index) {
+                            Some(Slot::Thinking { content_index, signature }) => {
+                                result.add_anthropic_reasoning(AnthropicReasoning::Thinking {
+                                    content_index,
+                                    signature,
+                                });
+                            }
+                            Some(Slot::ToolCall { content_index, partial_json }) => {
+                                if let Content::ToolCall(call) = &mut result.content[content_index]
+                                    && !partial_json.is_empty()
+                                {
+                                    call.arguments = parse_arguments(&partial_json);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     StreamEvent::MessageDelta { delta, usage } => {
                         apply_usage(&mut result.usage, usage);
@@ -273,7 +381,7 @@ pub async fn stream(
     Ok(Box::pin(output))
 }
 
-fn messages(context: &Context) -> Vec<RequestMessage> {
+fn messages(model: &Model, context: &Context) -> Vec<RequestMessage> {
     context
         .messages()
         .iter()
@@ -284,22 +392,7 @@ fn messages(context: &Context) -> Vec<RequestMessage> {
             },
             Message::Assistant(response) => RequestMessage {
                 role: "assistant",
-                content: response
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        Content::Text(text) => {
-                            Some(serde_json::json!({"type": "text", "text": text}))
-                        }
-                        Content::ToolCall(call) => Some(serde_json::json!({
-                            "type": "tool_use",
-                            "id": call.id,
-                            "name": call.name,
-                            "input": call.arguments
-                        })),
-                        Content::Reasoning(_) => None,
-                    })
-                    .collect(),
+                content: assistant_content(model, response),
             },
             Message::ToolResult(result) => RequestMessage {
                 role: "user",
@@ -307,6 +400,50 @@ fn messages(context: &Context) -> Vec<RequestMessage> {
             },
         })
         .collect()
+}
+
+fn assistant_content(model: &Model, response: &Response) -> Vec<serde_json::Value> {
+    let reasoning = response.anthropic_reasoning(&model.id);
+    response
+        .content
+        .iter()
+        .enumerate()
+        .filter_map(|(content_index, content)| match content {
+            Content::Text(text) => Some(serde_json::json!({"type": "text", "text": text})),
+            Content::ToolCall(call) => Some(serde_json::json!({
+                "type": "tool_use",
+                "id": call.id,
+                "name": call.name,
+                "input": call.arguments
+            })),
+            Content::Reasoning(text) => reasoning.and_then(|reasoning| {
+                reasoning.iter().find_map(|reasoning| match reasoning {
+                    AnthropicReasoning::Thinking {
+                        content_index: index,
+                        signature,
+                    } if *index == content_index && !signature.is_empty() => {
+                        Some(serde_json::json!({
+                            "type": "thinking",
+                            "thinking": text,
+                            "signature": signature
+                        }))
+                    }
+                    AnthropicReasoning::Redacted {
+                        content_index: index,
+                        data,
+                    } if *index == content_index => Some(serde_json::json!({
+                        "type": "redacted_thinking",
+                        "data": data
+                    })),
+                    _ => None,
+                })
+            }),
+        })
+        .collect()
+}
+
+fn parse_arguments(arguments: &str) -> serde_json::Value {
+    serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
 }
 
 fn input_content(content: &InputContent) -> serde_json::Value {
