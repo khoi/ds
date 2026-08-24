@@ -146,6 +146,8 @@ enum StreamEvent {
     },
     #[serde(rename = "message_stop")]
     MessageStop,
+    #[serde(rename = "error")]
+    Error { error: ErrorDetail },
     #[serde(other)]
     Unknown,
 }
@@ -203,6 +205,12 @@ struct AnthropicUsage {
 #[derive(Deserialize)]
 struct OutputTokenDetails {
     thinking_tokens: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ErrorDetail {
+    r#type: String,
+    message: String,
 }
 
 enum Slot {
@@ -434,12 +442,13 @@ pub async fn stream(
                             result.stop_reason = match reason.as_str() {
                                 "max_tokens" => StopReason::Length,
                                 "tool_use" => StopReason::ToolUse,
+                                "pause_turn" => StopReason::Pause,
                                 _ => StopReason::Stop,
                             };
                             result.raw_stop_reason = Some(reason);
                         }
                     }
-                    StreamEvent::MessageStop => {
+                StreamEvent::MessageStop => {
                         if result.stop_reason == StopReason::Pending {
                             yield Err(Error::Stream {
                                 message: "message_stop arrived without a stop reason".into(),
@@ -448,8 +457,18 @@ pub async fn stream(
                         } else {
                             yield Ok(Event::Done(Box::new(result)));
                         }
-                        return;
-                    }
+                    return;
+                }
+                StreamEvent::Error { error } => {
+                    result.stop_reason = StopReason::Error;
+                    result.raw_stop_reason = Some(format!("error.{}", error.r#type));
+                    yield Err(Error::Response {
+                        code: Some(error.r#type),
+                        message: error.message,
+                        partial: result,
+                    });
+                    return;
+                }
                 _ => {}
             }
         }

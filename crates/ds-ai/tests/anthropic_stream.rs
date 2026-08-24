@@ -269,6 +269,97 @@ async fn times_out_an_anthropic_stream_before_its_first_event() {
     }
 }
 
+#[tokio::test]
+async fn preserves_anthropic_pause_turn_as_a_distinct_stop() {
+    let sse = [
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"pause_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options = anthropic::Options::new("test-key");
+
+    let events = anthropic::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    let response = done(&events);
+    assert_eq!(response.stop_reason, StopReason::Pause);
+    assert_eq!(response.raw_stop_reason.as_deref(), Some("pause_turn"));
+}
+
+#[tokio::test]
+async fn rejects_anthropic_stream_closure_before_message_stop() {
+    let sse = [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_partial\",\"usage\":{}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Partial\"}}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options = anthropic::Options::new("test-key");
+
+    let events = anthropic::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    match events.last() {
+        Some(Err(ds_ai::Error::IncompleteStream { partial })) => {
+            assert_eq!(partial.id.as_deref(), Some("msg_partial"));
+            assert_eq!(partial.content, [ds_ai::Content::Text("Partial".into())]);
+            assert_eq!(partial.raw_stop_reason.as_deref(), Some("end_turn"));
+        }
+        event => panic!("unexpected terminal event: {event:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rejects_an_anthropic_error_event_with_partial_content() {
+    let sse = [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_error\",\"usage\":{}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"Visible\"}}\n\n",
+        "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options = anthropic::Options::new("test-key");
+
+    let events = anthropic::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    match events.last() {
+        Some(Err(ds_ai::Error::Response {
+            code,
+            message,
+            partial,
+        })) => {
+            assert_eq!(code.as_deref(), Some("overloaded_error"));
+            assert_eq!(message, "busy");
+            assert_eq!(partial.stop_reason, StopReason::Error);
+            assert_eq!(
+                partial.raw_stop_reason.as_deref(),
+                Some("error.overloaded_error")
+            );
+            assert_eq!(partial.content, [ds_ai::Content::Text("Visible".into())]);
+        }
+        event => panic!("unexpected error event: {event:?}"),
+    }
+}
+
 fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {
     match events.last() {
         Some(Ok(Event::Done(response))) => response,

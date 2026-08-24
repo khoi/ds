@@ -193,6 +193,7 @@ pub enum StopReason {
     Stop,
     Length,
     ToolUse,
+    Pause,
     Error,
     Aborted,
 }
