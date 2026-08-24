@@ -9,6 +9,91 @@ use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
 #[tokio::test]
+async fn uses_a_custom_http_client_for_each_api() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-custom-client",
+        reqwest::header::HeaderValue::from_static("present"),
+    );
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap();
+
+    let openai_server = serve([Reply::sse(openai_done())]).await;
+    let mut openai_model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    openai_model.base_url = openai_server.base_url.clone();
+    ds_ai::openai::stream(
+        &openai_model,
+        &Context::new([Message::user("Hello")]),
+        &OpenAiResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                http_client: Some(client.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .result()
+    .await
+    .unwrap();
+
+    let anthropic_server = serve([Reply::sse(anthropic_done())]).await;
+    let mut anthropic_model = builtin_model("anthropic", "claude-opus-4-5").unwrap();
+    anthropic_model.base_url = anthropic_server.base_url.clone();
+    ds_ai::anthropic::stream(
+        &anthropic_model,
+        &Context::new([Message::user("Hello")]),
+        &AnthropicOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                http_client: Some(client.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .result()
+    .await
+    .unwrap();
+
+    let codex_server = serve([Reply::sse(openai_done())]).await;
+    let mut codex_model = builtin_model("openai-codex", "gpt-5.6-sol").unwrap();
+    codex_model.base_url = codex_server.base_url.clone();
+    ds_ai::codex::stream(
+        &codex_model,
+        &Context::new([Message::user("Hello")]),
+        &OpenAiCodexResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some(token()),
+                http_client: Some(client),
+                transport: Some(Transport::Sse),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .result()
+    .await
+    .unwrap();
+
+    for request in [
+        &openai_server.requests().await[0],
+        &anthropic_server.requests().await[0],
+    ] {
+        assert!(request.contains("x-custom-client: present\r\n"));
+    }
+    let request = codex_server.request_bytes().await.pop().unwrap();
+    let header_end = request
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .unwrap();
+    let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+    assert!(headers.contains("x-custom-client: present\r\n"));
+}
+
+#[tokio::test]
 async fn transforms_one_payload_and_observes_each_retry_response() {
     let server = serve([
         Reply::json(429, json!({"error": {"message": "retry"}}))

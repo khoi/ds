@@ -2,7 +2,7 @@ use ds_ai::{
     Api, AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantToolCall,
     ConstrainedSampling, ConstrainedSamplingStrictness, Context, GrammarVariants, InputContent,
     Message, ProviderId, StopReason, TextContent, ThinkingContent, Tool, ToolResultMessage, Usage,
-    UsageCost, UserContent, UserMessage, UserRole,
+    UsageCost, UserContent, UserMessage,
 };
 
 #[test]
@@ -44,7 +44,6 @@ fn serializes_user_messages_with_pi_roles_and_content_shapes() {
 #[test]
 fn serializes_tool_results_with_optional_execution_data() {
     let message = ToolResultMessage {
-        role: ds_ai::ToolResultRole::ToolResult,
         tool_call_id: "call_1".into(),
         tool_name: "read".into(),
         content: vec![InputContent::text("done")],
@@ -227,7 +226,6 @@ fn serializes_context_and_constrained_sampling() {
     let context = Context {
         system_prompt: Some("Be brief".into()),
         messages: vec![Message::User(UserMessage {
-            role: UserRole::User,
             content: UserContent::Text("Hello".into()),
             timestamp: 42,
         })],

@@ -128,6 +128,7 @@ pub enum Transport {
 pub struct StreamOptions {
     pub cancellation: CancellationToken,
     pub api_key: Option<String>,
+    pub http_client: Option<reqwest::Client>,
     pub env: BTreeMap<String, String>,
     pub headers: BTreeMap<String, Option<String>>,
     pub on_payload: Option<PayloadHook>,
@@ -150,6 +151,7 @@ impl Default for StreamOptions {
         Self {
             cancellation: CancellationToken::new(),
             api_key: None,
+            http_client: None,
             env: BTreeMap::new(),
             headers: BTreeMap::new(),
             on_payload: None,
@@ -197,7 +199,7 @@ pub struct ThinkingBudgets {
 #[derive(Clone, Debug, Default)]
 pub struct SimpleStreamOptions {
     pub stream: StreamOptions,
-    pub thinking: Option<ThinkingLevel>,
+    pub reasoning: Option<ThinkingLevel>,
     pub thinking_budgets: Option<ThinkingBudgets>,
     pub tool_choice: ToolChoice,
 }
@@ -471,7 +473,7 @@ impl Models {
                 &context,
                 &SimpleStreamOptions {
                     stream: stream_options,
-                    thinking: options.thinking,
+                    reasoning: options.reasoning,
                     thinking_budgets: options.thinking_budgets,
                     tool_choice: options.tool_choice,
                 },

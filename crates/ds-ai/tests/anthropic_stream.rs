@@ -82,7 +82,7 @@ async fn streams_anthropic_text_until_message_stop() {
 }
 
 #[tokio::test]
-async fn preserves_anthropic_http_error_rate_limits() {
+async fn exposes_anthropic_error_headers_to_the_response_hook() {
     let server = serve([Reply::json(
         429,
         json!({"error": {"type": "rate_limit_error", "message": "Too many requests"}}),

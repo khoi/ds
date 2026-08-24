@@ -1,8 +1,11 @@
 use crate::support::{Reply, serve};
 use async_trait::async_trait;
 use base64::prelude::*;
-use ds_ai::codex::auth::{Client, CredentialManager, Credentials, Interaction, Notification};
-use ds_ai::{AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthSelectOption, Provider as _};
+use ds_ai::codex::auth::OAuth;
+use ds_ai::{
+    AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthSelectOption, Credential, OAuthAuth,
+    Provider as _,
+};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
@@ -23,17 +26,23 @@ async fn refreshes_codex_credentials() {
         }),
     )])
     .await;
-    let client = Client::new().with_base_url(&server.base_url);
+    let oauth = OAuth::new().with_base_url(&server.base_url);
     let before = now_millis();
+    let credential = credential("acc_old", "refresh_old", 0);
 
-    let credentials = client
-        .refresh("refresh_old", &CancellationToken::new())
+    let credentials = oauth
+        .refresh(&credential, &CancellationToken::new())
         .await
         .unwrap();
 
-    assert_eq!(credentials.refresh_token, "refresh_next");
-    assert_eq!(credentials.account_id().unwrap(), "acc_refreshed");
-    assert!(credentials.expires_at >= before + 3_600_000);
+    assert!(matches!(
+        credentials,
+        Credential::OAuth { refresh, access, expires, extra }
+            if refresh == "refresh_next"
+                && access == token("acc_refreshed")
+                && expires >= before + 3_600_000
+                && extra.is_empty()
+    ));
     let request = server.requests().await.pop().unwrap();
     assert!(request.starts_with("POST /oauth/token HTTP/1.1\r\n"));
     let body = request.split("\r\n\r\n").nth(1).unwrap();
@@ -43,97 +52,58 @@ async fn refreshes_codex_credentials() {
 }
 
 #[tokio::test]
-async fn serializes_concurrent_codex_refreshes() {
-    let server = serve([Reply::json(
-        200,
-        json!({
-            "access_token": token("acc_concurrent"),
-            "refresh_token": "refresh_new",
-            "expires_in": 3600
-        }),
-    )])
-    .await;
-    let manager = CredentialManager::new(
-        Client::new().with_base_url(&server.base_url),
-        Credentials {
-            access_token: token("acc_expired"),
-            refresh_token: "refresh_old".into(),
-            expires_at: 0,
-        },
-    );
-    let first = manager.clone();
-    let second = manager.clone();
-    let first = tokio::spawn(async move { first.access_token(&CancellationToken::new()).await });
-    let second = tokio::spawn(async move { second.access_token(&CancellationToken::new()).await });
-
-    let (first, second) = tokio::join!(first, second);
-
-    assert_eq!(first.unwrap().unwrap(), second.unwrap().unwrap());
-    assert_eq!(manager.snapshot().await.refresh_token, "refresh_new");
-    assert_eq!(server.requests().await.len(), 1);
-}
-
-#[tokio::test]
 async fn preserves_codex_refresh_failure_details() {
     let server = serve([Reply::json(
         500,
         json!({"error": {"code": "invalid_grant", "message": "expired"}}),
     )])
     .await;
-    let client = Client::new().with_base_url(&server.base_url);
+    let oauth = OAuth::new().with_base_url(&server.base_url);
+    let credential = credential("acc_old", "refresh_bad", 0);
 
-    let error = client
-        .refresh("refresh_bad", &CancellationToken::new())
+    let error = oauth
+        .refresh(&credential, &CancellationToken::new())
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
 
-    assert!(matches!(
-        error,
-        ds_ai::codex::auth::Error::Server {
-            operation: "refresh",
-            status: 500,
-            body,
-        } if body.contains("invalid_grant") && body.contains("expired")
-    ));
+    assert!(error.contains("refresh"));
+    assert!(error.contains("HTTP 500"));
+    assert!(error.contains("invalid_grant"));
+    assert!(error.contains("expired"));
     server.requests().await;
 }
 
 #[tokio::test]
 async fn cancels_an_active_codex_refresh() {
     let server = serve([Reply::pending()]).await;
-    let client = Client::new().with_base_url(&server.base_url);
+    let oauth = OAuth::new().with_base_url(&server.base_url);
+    let credential = credential("acc_old", "refresh_wait", 0);
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
-    let refresh =
-        tokio::spawn(async move { client.refresh("refresh_wait", &task_cancellation).await });
+    let refresh = tokio::spawn(async move { oauth.refresh(&credential, &task_cancellation).await });
     server.wait_for_requests(1).await;
 
     cancellation.cancel();
 
-    assert!(matches!(
-        refresh.await.unwrap(),
-        Err(ds_ai::codex::auth::Error::Cancelled)
-    ));
+    assert!(matches!(refresh.await.unwrap(), Err(AuthError::Cancelled)));
     server.requests().await;
 }
 
 #[tokio::test]
 async fn cancels_a_codex_refresh_while_reading_the_token_body() {
     let server = serve([Reply::open_json(200, json!({"access_token": "unfinished"}))]).await;
-    let client = Client::new().with_base_url(&server.base_url);
+    let oauth = OAuth::new().with_base_url(&server.base_url);
+    let credential = credential("acc_old", "refresh_wait", 0);
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
-    let refresh =
-        tokio::spawn(async move { client.refresh("refresh_wait", &task_cancellation).await });
+    let refresh = tokio::spawn(async move { oauth.refresh(&credential, &task_cancellation).await });
     server.wait_for_requests(1).await;
     tokio::task::yield_now().await;
 
     cancellation.cancel();
 
-    assert!(matches!(
-        refresh.await.unwrap(),
-        Err(ds_ai::codex::auth::Error::Cancelled)
-    ));
+    assert!(matches!(refresh.await.unwrap(), Err(AuthError::Cancelled)));
     server.requests().await;
 }
 
@@ -149,16 +119,15 @@ async fn logs_in_with_a_manual_codex_redirect() {
     )])
     .await;
     let interaction = ManualInteraction::default();
-    let client = Client::new()
+    let oauth = OAuth::new()
         .with_base_url(&server.base_url)
         .with_callback_address(local_address());
 
-    let credentials = client
-        .login_browser(&interaction, &CancellationToken::new())
-        .await
-        .unwrap();
+    let credentials = oauth.login(&interaction).await.unwrap();
 
-    assert_eq!(credentials.account_id().unwrap(), "acc_manual");
+    assert!(
+        matches!(credentials, Credential::OAuth { access, .. } if access == token("acc_manual"))
+    );
     let authorization_url = interaction.authorization_url();
     let authorization_url = url::Url::parse(&authorization_url).unwrap();
     assert_eq!(authorization_url.path(), "/oauth/authorize");
@@ -192,17 +161,16 @@ async fn logs_in_through_the_codex_browser_callback() {
         }),
     )])
     .await;
-    let interaction = CallbackInteraction;
-    let client = Client::new()
+    let interaction = CallbackInteraction::default();
+    let oauth = OAuth::new()
         .with_base_url(&server.base_url)
         .with_callback_address(local_address());
 
-    let credentials = client
-        .login_browser(&interaction, &CancellationToken::new())
-        .await
-        .unwrap();
+    let credentials = oauth.login(&interaction).await.unwrap();
 
-    assert_eq!(credentials.account_id().unwrap(), "acc_callback");
+    assert!(
+        matches!(credentials, Credential::OAuth { access, .. } if access == token("acc_callback"))
+    );
     let request = server.requests().await.pop().unwrap();
     let body = request.split("\r\n\r\n").nth(1).unwrap();
     assert!(body.contains("code=callback_code"));
@@ -244,21 +212,20 @@ async fn logs_in_with_the_codex_device_flow() {
     ])
     .await;
     let interaction = DeviceInteraction::default();
-    let client = Client::new().with_base_url(&server.base_url);
+    let oauth = OAuth::new().with_base_url(&server.base_url);
 
-    let credentials = client
-        .login_device(&interaction, &CancellationToken::new())
-        .await
-        .unwrap();
+    let credentials = oauth.login(&interaction).await.unwrap();
 
-    assert_eq!(credentials.account_id().unwrap(), "acc_device");
+    assert!(
+        matches!(credentials, Credential::OAuth { access, .. } if access == token("acc_device"))
+    );
     assert_eq!(
-        interaction.notification.lock().unwrap().clone(),
-        Some(Notification::DeviceCode {
+        interaction.event.lock().unwrap().clone(),
+        Some(AuthEvent::DeviceCode {
             user_code: "ABCD-EFGH".into(),
             verification_uri: format!("{}/codex/device", server.base_url),
-            interval: Duration::ZERO,
-            expires_in: Duration::from_secs(15 * 60),
+            interval_seconds: Some(0),
+            expires_in_seconds: Some(15 * 60),
         })
     );
     let device_redirect = format!("{}/deviceauth/callback", server.base_url);
@@ -289,22 +256,18 @@ async fn cancels_the_codex_device_poll_wait() {
         Reply::json(403, json!({"error": "authorization_pending"})),
     ])
     .await;
-    let client = Client::new().with_base_url(&server.base_url);
+    let oauth = OAuth::new().with_base_url(&server.base_url);
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
     let login = tokio::spawn(async move {
-        client
-            .login_device(&DeviceInteraction::default(), &task_cancellation)
-            .await
+        let interaction = DeviceInteraction::with_cancellation(task_cancellation);
+        oauth.login(&interaction).await
     });
     server.wait_for_requests(2).await;
 
     cancellation.cancel();
 
-    assert!(matches!(
-        login.await.unwrap(),
-        Err(ds_ai::codex::auth::Error::Cancelled)
-    ));
+    assert!(matches!(login.await.unwrap(), Err(AuthError::Cancelled)));
     server.requests().await;
 }
 
@@ -322,15 +285,13 @@ async fn times_out_the_codex_device_flow() {
         Reply::json(403, json!({"error": "authorization_pending"})),
     ])
     .await;
-    let client = Client::new()
+    let oauth = OAuth::new()
         .with_base_url(&server.base_url)
         .with_device_timeout(Duration::from_millis(10));
 
-    let result = client
-        .login_device(&DeviceInteraction::default(), &CancellationToken::new())
-        .await;
+    let result = oauth.login(&DeviceInteraction::default()).await;
 
-    assert!(matches!(result, Err(ds_ai::codex::auth::Error::Timeout)));
+    assert!(matches!(result, Err(AuthError::OAuth(message)) if message.contains("timed out")));
     assert_eq!(server.requests().await.len(), 2);
 }
 
@@ -351,20 +312,15 @@ async fn preserves_codex_device_poll_failure_details() {
         ),
     ])
     .await;
-    let client = Client::new().with_base_url(&server.base_url);
+    let oauth = OAuth::new().with_base_url(&server.base_url);
 
-    let result = client
-        .login_device(&DeviceInteraction::default(), &CancellationToken::new())
-        .await;
+    let result = oauth.login(&DeviceInteraction::default()).await;
 
-    assert!(matches!(
-        result,
-        Err(ds_ai::codex::auth::Error::Server {
-            operation: "device poll",
-            status: 500,
-            body,
-        }) if body.contains("server_error") && body.contains("broken")
-    ));
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("device poll"));
+    assert!(error.contains("HTTP 500"));
+    assert!(error.contains("server_error"));
+    assert!(error.contains("broken"));
     server.requests().await;
 }
 
@@ -508,6 +464,7 @@ impl AuthInteraction for BrowserSelectionInteraction {
 #[derive(Default)]
 struct ManualInteraction {
     authorization_url: Arc<Mutex<Option<String>>>,
+    cancellation: CancellationToken,
 }
 
 impl ManualInteraction {
@@ -517,36 +474,58 @@ impl ManualInteraction {
 }
 
 #[async_trait]
-impl Interaction for ManualInteraction {
-    fn notify(&self, notification: Notification) {
-        match notification {
-            Notification::AuthorizationUrl { url } => {
-                *self.authorization_url.lock().unwrap() = Some(url);
+impl AuthInteraction for ManualInteraction {
+    fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    async fn prompt(&self, prompt: AuthPrompt) -> Result<String, AuthError> {
+        match prompt {
+            AuthPrompt::Select { .. } => Ok("browser".into()),
+            AuthPrompt::ManualCode { .. } => {
+                let authorization_url = url::Url::parse(&self.authorization_url()).unwrap();
+                Ok(format!(
+                    "{}?code=manual_code&state={}",
+                    query(&authorization_url, "redirect_uri"),
+                    query(&authorization_url, "state")
+                ))
             }
-            Notification::DeviceCode { .. } => panic!("unexpected device notification"),
+            _ => Err(AuthError::Authentication("unexpected prompt".into())),
         }
     }
 
-    async fn manual_authorization(
-        &self,
-        _cancellation: CancellationToken,
-    ) -> Result<String, ds_ai::codex::auth::Error> {
-        let authorization_url = url::Url::parse(&self.authorization_url()).unwrap();
-        Ok(format!(
-            "{}?code=manual_code&state={}",
-            query(&authorization_url, "redirect_uri"),
-            query(&authorization_url, "state")
-        ))
+    fn notify(&self, event: AuthEvent) {
+        if let AuthEvent::AuthUrl { url, .. } = event {
+            *self.authorization_url.lock().unwrap() = Some(url);
+        }
     }
 }
 
-struct CallbackInteraction;
+#[derive(Default)]
+struct CallbackInteraction {
+    cancellation: CancellationToken,
+}
 
 #[async_trait]
-impl Interaction for CallbackInteraction {
-    fn notify(&self, notification: Notification) {
-        let Notification::AuthorizationUrl { url } = notification else {
-            panic!("unexpected device notification");
+impl AuthInteraction for CallbackInteraction {
+    fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    async fn prompt(&self, prompt: AuthPrompt) -> Result<String, AuthError> {
+        match prompt {
+            AuthPrompt::Select { .. } => Ok("browser".into()),
+            AuthPrompt::ManualCode { cancellation, .. } => {
+                cancellation.cancelled().await;
+                Err(AuthError::Cancelled)
+            }
+            _ => Err(AuthError::Authentication("unexpected prompt".into())),
+        }
+    }
+
+    fn notify(&self, event: AuthEvent) {
+        let AuthEvent::AuthUrl { url, .. } = event else {
+            return;
         };
         let authorization_url = url::Url::parse(&url).unwrap();
         let callback = format!(
@@ -562,32 +541,38 @@ impl Interaction for CallbackInteraction {
                 .unwrap();
         });
     }
-
-    async fn manual_authorization(
-        &self,
-        cancellation: CancellationToken,
-    ) -> Result<String, ds_ai::codex::auth::Error> {
-        cancellation.cancelled().await;
-        Err(ds_ai::codex::auth::Error::Cancelled)
-    }
 }
 
 #[derive(Default)]
 struct DeviceInteraction {
-    notification: Arc<Mutex<Option<Notification>>>,
+    event: Arc<Mutex<Option<AuthEvent>>>,
+    cancellation: CancellationToken,
+}
+
+impl DeviceInteraction {
+    fn with_cancellation(cancellation: CancellationToken) -> Self {
+        Self {
+            cancellation,
+            ..Default::default()
+        }
+    }
 }
 
 #[async_trait]
-impl Interaction for DeviceInteraction {
-    fn notify(&self, notification: Notification) {
-        *self.notification.lock().unwrap() = Some(notification);
+impl AuthInteraction for DeviceInteraction {
+    fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
     }
 
-    async fn manual_authorization(
-        &self,
-        _cancellation: CancellationToken,
-    ) -> Result<String, ds_ai::codex::auth::Error> {
-        panic!("device login requested manual authorization")
+    async fn prompt(&self, prompt: AuthPrompt) -> Result<String, AuthError> {
+        match prompt {
+            AuthPrompt::Select { .. } => Ok("device_code".into()),
+            _ => Err(AuthError::Authentication("unexpected prompt".into())),
+        }
+    }
+
+    fn notify(&self, event: AuthEvent) {
+        *self.event.lock().unwrap() = Some(event);
     }
 }
 
@@ -599,6 +584,15 @@ fn token(account_id: &str) -> String {
         .unwrap(),
     );
     format!("aaa.{payload}.bbb")
+}
+
+fn credential(account_id: &str, refresh: &str, expires: u64) -> Credential {
+    Credential::OAuth {
+        refresh: refresh.into(),
+        access: token(account_id),
+        expires,
+        extra: Default::default(),
+    }
 }
 
 fn now_millis() -> u64 {

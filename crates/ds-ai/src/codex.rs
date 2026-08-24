@@ -1,9 +1,8 @@
 use crate::{
-    CacheRetention, Context, Error, ResponseMetadata,
+    CacheRetention, Context, Error,
     deferred_tools::{DeferredToolsMode, ToolPlacement},
     http, openai, retry, transport,
 };
-use async_trait::async_trait;
 use base64::prelude::*;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -30,7 +29,7 @@ use tokio_tungstenite::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub use crate::openai::{ReasoningSummary, ServiceTier};
+pub use crate::openai::ServiceTier;
 
 pub mod auth;
 
@@ -53,9 +52,7 @@ impl Provider {
             id: crate::ProviderId::new("openai-codex"),
             models: models.into_iter().collect(),
             headers: BTreeMap::new(),
-            auth: crate::ProviderAuth::oauth(CodexOAuthAuth {
-                client: auth::Client::new(),
-            }),
+            auth: crate::ProviderAuth::oauth(auth::OAuth::new()),
         }
     }
 }
@@ -68,7 +65,7 @@ pub fn stream(
     let requested_model = model.clone();
     let context = context.for_model(&requested_model);
     let options = options.clone();
-    crate::legacy::adapt_provider(requested_model.clone(), async move {
+    crate::provider_stream::adapt(requested_model.clone(), async move {
         let stream_options = options.stream;
         let request_hooks = stream_options.request_hooks(&requested_model);
         let access_token = stream_options
@@ -76,12 +73,13 @@ pub fn stream(
             .ok_or_else(|| Error::InvalidRequest("Codex access token is required".into()))?;
         let provider_model =
             Model::new(&requested_model.id).with_base_url(requested_model.base_url.clone());
-        let mut provider_options = Options::new(access_token)
-            .with_cancellation(stream_options.cancellation)
-            .with_max_retries(stream_options.max_retries.unwrap_or_default())
-            .with_max_retry_delay(stream_options.max_retry_delay)
-            .with_cache_retention(stream_options.cache_retention)
-            .with_request_options(stream_options.headers, request_hooks);
+        let mut provider_options =
+            Options::new(access_token, stream_options.http_client.unwrap_or_default())
+                .with_cancellation(stream_options.cancellation)
+                .with_max_retries(stream_options.max_retries.unwrap_or_default())
+                .with_max_retry_delay(stream_options.max_retry_delay)
+                .with_cache_retention(stream_options.cache_retention)
+                .with_request_options(stream_options.headers, request_hooks);
         let compat = match &requested_model.compat {
             Some(crate::ModelCompatibility::OpenAi(compat)) => compat.clone(),
             _ => Default::default(),
@@ -171,7 +169,7 @@ impl crate::Provider for Provider {
         if model.api != crate::Api::OpenAiCodexResponses {
             let model = model.clone();
             let api = model.api.clone();
-            return crate::legacy::failure(
+            return crate::provider_stream::failure(
                 model,
                 Error::InvalidRequest(format!(
                     "Codex provider has no API implementation for {api}"
@@ -180,7 +178,7 @@ impl crate::Provider for Provider {
         }
         let crate::ApiStreamOptions::OpenAiCodexResponses(options) = options else {
             let model = model.clone();
-            return crate::legacy::failure(
+            return crate::provider_stream::failure(
                 model,
                 Error::InvalidRequest("OpenAI Codex Responses options are required".into()),
             );
@@ -202,7 +200,7 @@ impl crate::Provider for Provider {
             &crate::OpenAiCodexResponsesOptions {
                 stream: stream_options,
                 reasoning_effort: options
-                    .thinking
+                    .reasoning
                     .map(|level| model.clamp_thinking_level(level))
                     .and_then(reasoning_effort),
                 tool_choice: Some(match options.tool_choice {
@@ -239,143 +237,6 @@ fn mapped_reasoning_effort(model: &crate::Model, effort: ReasoningEffort) -> Opt
         .unwrap_or_else(|| Some(effort.as_str().into()))
 }
 
-struct CodexOAuthAuth {
-    client: auth::Client,
-}
-
-#[async_trait]
-impl crate::OAuthAuth for CodexOAuthAuth {
-    fn name(&self) -> &str {
-        "OpenAI (ChatGPT Plus/Pro)"
-    }
-
-    fn is_subscription(&self) -> bool {
-        true
-    }
-
-    async fn login(
-        &self,
-        interaction: &dyn crate::AuthInteraction,
-    ) -> Result<crate::Credential, crate::AuthError> {
-        let method = interaction
-            .prompt(crate::AuthPrompt::Select {
-                message: "Select OpenAI Codex login method:".into(),
-                options: vec![
-                    crate::AuthSelectOption {
-                        id: "browser".into(),
-                        label: "Browser login (default)".into(),
-                        description: None,
-                    },
-                    crate::AuthSelectOption {
-                        id: "device_code".into(),
-                        label: "Device code login (headless)".into(),
-                        description: None,
-                    },
-                ],
-            })
-            .await?;
-        let adapter = CodexInteraction(interaction);
-        let credentials = match method.as_str() {
-            "browser" => {
-                self.client
-                    .login_browser(&adapter, interaction.cancellation())
-                    .await
-            }
-            "device_code" => {
-                self.client
-                    .login_device(&adapter, interaction.cancellation())
-                    .await
-            }
-            method => {
-                return Err(crate::AuthError::Authentication(format!(
-                    "Unknown OpenAI Codex login method: {method}"
-                )));
-            }
-        }
-        .map_err(|error| crate::AuthError::OAuth(error.to_string()))?;
-        Ok(oauth_credential(credentials))
-    }
-
-    async fn refresh(
-        &self,
-        credential: &crate::Credential,
-        cancellation: &CancellationToken,
-    ) -> Result<crate::Credential, crate::AuthError> {
-        let crate::Credential::OAuth { refresh, .. } = credential else {
-            return Err(crate::AuthError::OAuth("expected OAuth credential".into()));
-        };
-        self.client
-            .refresh(refresh, cancellation)
-            .await
-            .map(oauth_credential)
-            .map_err(|error| crate::AuthError::OAuth(error.to_string()))
-    }
-
-    async fn to_auth(
-        &self,
-        credential: &crate::Credential,
-    ) -> Result<crate::ModelAuth, crate::AuthError> {
-        let crate::Credential::OAuth { access, .. } = credential else {
-            return Err(crate::AuthError::OAuth("expected OAuth credential".into()));
-        };
-        Ok(crate::ModelAuth {
-            api_key: Some(access.clone()),
-            ..Default::default()
-        })
-    }
-}
-
-struct CodexInteraction<'a>(&'a dyn crate::AuthInteraction);
-
-#[async_trait]
-impl auth::Interaction for CodexInteraction<'_> {
-    fn notify(&self, notification: auth::Notification) {
-        let event = match notification {
-            auth::Notification::AuthorizationUrl { url } => crate::AuthEvent::AuthUrl {
-                url,
-                instructions: Some(
-                    "A browser window should open. Complete login to finish.".into(),
-                ),
-            },
-            auth::Notification::DeviceCode {
-                user_code,
-                verification_uri,
-                interval,
-                expires_in,
-            } => crate::AuthEvent::DeviceCode {
-                user_code,
-                verification_uri,
-                interval_seconds: Some(interval.as_secs()),
-                expires_in_seconds: Some(expires_in.as_secs()),
-            },
-        };
-        self.0.notify(event);
-    }
-
-    async fn manual_authorization(
-        &self,
-        cancellation: CancellationToken,
-    ) -> Result<String, auth::Error> {
-        self.0
-            .prompt(crate::AuthPrompt::ManualCode {
-                message: "Complete login in your browser, or paste the authorization code / redirect URL here:".into(),
-                placeholder: Some("http://localhost:1455/auth/callback".into()),
-                cancellation,
-            })
-            .await
-            .map_err(|error| auth::Error::InvalidResponse(error.to_string()))
-    }
-}
-
-fn oauth_credential(credentials: auth::Credentials) -> crate::Credential {
-    crate::Credential::OAuth {
-        refresh: credentials.refresh_token,
-        access: credentials.access_token,
-        expires: credentials.expires_at,
-        extra: BTreeMap::new(),
-    }
-}
-
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Clone)]
@@ -384,7 +245,6 @@ struct CachedWebSocket {
     busy: Arc<AtomicBool>,
     created_at: Instant,
     session_id: Option<String>,
-    metadata: ResponseMetadata,
     continuation: Arc<StdMutex<Option<Continuation>>>,
     last_used: Arc<StdMutex<Instant>>,
 }
@@ -484,6 +344,7 @@ impl Model {
 
 struct Options {
     access_token: String,
+    http_client: reqwest::Client,
     max_retries: usize,
     max_retry_delay: Option<Duration>,
     cancellation: CancellationToken,
@@ -505,7 +366,7 @@ struct Options {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum Transport {
+enum Transport {
     #[default]
     Auto,
     Sse,
@@ -531,6 +392,16 @@ pub enum TextVerbosity {
     Low,
     Medium,
     High,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningSummary {
+    Auto,
+    Concise,
+    Detailed,
+    Off,
+    On,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -587,9 +458,10 @@ struct Reasoning {
 }
 
 impl Options {
-    fn new(access_token: impl Into<String>) -> Self {
+    fn new(access_token: impl Into<String>, http_client: reqwest::Client) -> Self {
         Self {
             access_token: access_token.into(),
+            http_client,
             max_retries: 0,
             max_retry_delay: Some(DEFAULT_MAX_RETRY_DELAY),
             cancellation: CancellationToken::new(),
@@ -734,6 +606,7 @@ struct RequestReasoning<'a> {
 
 #[derive(Clone)]
 struct SseRequest {
+    http_client: reqwest::Client,
     base_url: String,
     model: String,
     access_token: String,
@@ -757,7 +630,7 @@ async fn response_events(
     model: &Model,
     context: &Context,
     options: &Options,
-) -> Result<crate::legacy::ProviderEventStream, Error> {
+) -> Result<crate::provider_stream::ProviderEventStream, Error> {
     let overall_deadline: Option<Instant> = None;
     let account_id = account_id(&options.access_token).map_err(Error::InvalidRequest)?;
     let cache_session_id = match options.cache_retention {
@@ -819,6 +692,7 @@ async fn response_events(
         serde_json::to_vec(&value).map_err(|error| Error::InvalidRequest(error.to_string()))?;
     let request_bytes = json.len();
     let sse_request = SseRequest {
+        http_client: options.http_client.clone(),
         base_url: model.base_url.clone(),
         model: model.id.clone(),
         access_token: options.access_token.clone(),
@@ -944,10 +818,12 @@ async fn response_events(
     })
 }
 
-async fn sse_stream(request: &SseRequest) -> Result<crate::legacy::ProviderEventStream, Error> {
+async fn sse_stream(
+    request: &SseRequest,
+) -> Result<crate::provider_stream::ProviderEventStream, Error> {
     let body = zstd::stream::encode_all(request.json.as_slice(), 3)
         .map_err(|error| Error::Compression(error.to_string()))?;
-    let client = reqwest::Client::new();
+    let client = &request.http_client;
     let url = response_url(&request.base_url);
     let mut headers =
         http::request_headers(BTreeMap::new(), &request.headers).map_err(Error::InvalidRequest)?;
@@ -1001,10 +877,8 @@ async fn sse_stream(request: &SseRequest) -> Result<crate::legacy::ProviderEvent
     )
     .await?;
     if !response.status().is_success() {
-        let metadata = http::metadata(response.headers());
         return Err(http::codex_provider_error(
             response,
-            metadata,
             &request.cancellation,
             request.overall_deadline,
         )
@@ -1023,12 +897,11 @@ async fn sse_stream(request: &SseRequest) -> Result<crate::legacy::ProviderEvent
                 .service_tier
                 .map(|service_tier| service_tier.as_str().into()),
             use_requested_for_default: true,
-            codex: true,
         },
     ))
 }
 
-fn should_fallback_to_sse(event: &Result<crate::legacy::ProviderEvent, Error>) -> bool {
+fn should_fallback_to_sse(event: &Result<crate::provider_stream::ProviderEvent, Error>) -> bool {
     match event {
         Err(Error::Timeout {
             phase: crate::TimeoutPhase::FirstEvent,
@@ -1051,7 +924,7 @@ fn should_fallback_to_sse(event: &Result<crate::legacy::ProviderEvent, Error>) -
 }
 
 fn diagnose_websocket_failure(
-    event: &mut Result<crate::legacy::ProviderEvent, Error>,
+    event: &mut Result<crate::provider_stream::ProviderEvent, Error>,
     session_id: Option<&str>,
     transport: Transport,
     request_bytes: usize,
@@ -1067,7 +940,7 @@ fn diagnose_websocket_failure(
 }
 
 fn websocket_transport_failure(
-    event: &Result<crate::legacy::ProviderEvent, Error>,
+    event: &Result<crate::provider_stream::ProviderEvent, Error>,
 ) -> Option<String> {
     match event {
         Err(
@@ -1080,7 +953,7 @@ fn websocket_transport_failure(
     }
 }
 
-fn websocket_error_message(event: &Result<crate::legacy::ProviderEvent, Error>) -> String {
+fn websocket_error_message(event: &Result<crate::provider_stream::ProviderEvent, Error>) -> String {
     event.as_ref().err().map_or_else(
         || "websocket closed before a terminal event".into(),
         ToString::to_string,
@@ -1132,9 +1005,9 @@ fn websocket_diagnostic(
 }
 
 fn stream_with_diagnostic(
-    mut stream: crate::legacy::ProviderEventStream,
+    mut stream: crate::provider_stream::ProviderEventStream,
     diagnostic: crate::AssistantMessageDiagnostic,
-) -> crate::legacy::ProviderEventStream {
+) -> crate::provider_stream::ProviderEventStream {
     Box::pin(async_stream::stream! {
         while let Some(mut event) = stream.next().await {
             add_websocket_diagnostic(&mut event, diagnostic.clone());
@@ -1144,11 +1017,13 @@ fn stream_with_diagnostic(
 }
 
 fn add_websocket_diagnostic(
-    event: &mut Result<crate::legacy::ProviderEvent, Error>,
+    event: &mut Result<crate::provider_stream::ProviderEvent, Error>,
     diagnostic: crate::AssistantMessageDiagnostic,
 ) {
     match event {
-        Ok(crate::legacy::ProviderEvent::Done(response)) => response.add_diagnostic(diagnostic),
+        Ok(crate::provider_stream::ProviderEvent::Done(response)) => {
+            response.add_diagnostic(diagnostic)
+        }
         Err(
             Error::Stream { partial, .. }
             | Error::IncompleteStream { partial }
@@ -1208,7 +1083,7 @@ async fn websocket_stream(
     request: WebSocketRequest<'_>,
     options: &Options,
     overall_deadline: Option<Instant>,
-) -> Result<crate::legacy::ProviderEventStream, WebSocketConnectError> {
+) -> Result<crate::provider_stream::ProviderEventStream, WebSocketConnectError> {
     let cache_key = request.cache_session_id.map(|session_id| {
         format!(
             "{}\u{1f}{}\u{1f}{session_id}",
@@ -1264,7 +1139,6 @@ async fn websocket_stream(
     };
     let CachedWebSocket {
         socket,
-        metadata,
         mut continuation,
         mut last_used,
         ..
@@ -1587,23 +1461,21 @@ async fn websocket_stream(
     let mut decoded = openai::decode_events(
         Box::pin(events),
         request.model.to_owned(),
-        metadata,
         openai::ResponseEventOptions {
             grammar_input_properties: request.grammar_input_properties.clone(),
             requested_service_tier: options
                 .service_tier
                 .map(|service_tier| service_tier.as_str().into()),
             use_requested_for_default: true,
-            codex: true,
         },
     );
     let output = async_stream::stream! {
         while let Some(event) = decoded.next().await {
             match event {
-                Ok(crate::legacy::ProviderEvent::Done(response)) => {
+                Ok(crate::provider_stream::ProviderEvent::Done(response)) => {
                     drop(decoded);
                     lease.complete(WEBSOCKET_IDLE_TTL);
-                    yield Ok(crate::legacy::ProviderEvent::Done(response));
+                    yield Ok(crate::provider_stream::ProviderEvent::Done(response));
                     return;
                 }
                 Err(error) => {
@@ -1671,7 +1543,7 @@ async fn connect_websocket(
         .headers_mut()
         .insert("session-id", session_header);
     let connect_deadline = Instant::now() + connect_timeout;
-    let (socket, response) = tokio::select! {
+    let (socket, _) = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(WebSocketConnectError::Cancelled),
         _ = transport::wait_until(overall_deadline) => {
@@ -1692,7 +1564,6 @@ async fn connect_websocket(
         busy: Arc::new(AtomicBool::new(true)),
         created_at: Instant::now(),
         session_id: handshake.session_id.clone(),
-        metadata: http::metadata(response.headers()),
         continuation: Arc::new(StdMutex::new(None)),
         last_used: Arc::new(StdMutex::new(Instant::now())),
     })

@@ -517,7 +517,7 @@ async fn routes_simple_codex_options_to_cached_websocket_transport() {
                     transport: Some(ProviderTransport::Auto),
                     ..Default::default()
                 },
-                thinking: Some(ThinkingLevel::XHigh),
+                reasoning: Some(ThinkingLevel::XHigh),
                 ..Default::default()
             },
         )

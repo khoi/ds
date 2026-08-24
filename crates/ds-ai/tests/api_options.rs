@@ -870,7 +870,7 @@ async fn reserves_the_default_anthropic_thinking_budget_above_the_answer_cap() {
                     max_tokens: Some(4096),
                     ..Default::default()
                 },
-                thinking: Some(ds_ai::ThinkingLevel::Medium),
+                reasoning: Some(ds_ai::ThinkingLevel::Medium),
                 ..Default::default()
             },
         )
@@ -904,7 +904,7 @@ async fn applies_a_custom_anthropic_thinking_budget() {
                     max_tokens: Some(4096),
                     ..Default::default()
                 },
-                thinking: Some(ds_ai::ThinkingLevel::Medium),
+                reasoning: Some(ds_ai::ThinkingLevel::Medium),
                 thinking_budgets: Some(ThinkingBudgets {
                     medium: Some(2048),
                     ..Default::default()
@@ -976,7 +976,7 @@ async fn maps_anthropic_simple_effort_through_model_metadata() {
                     api_key: Some("key".into()),
                     ..Default::default()
                 },
-                thinking: Some(ds_ai::ThinkingLevel::Minimal),
+                reasoning: Some(ds_ai::ThinkingLevel::Minimal),
                 ..Default::default()
             },
         )
@@ -1277,7 +1277,7 @@ async fn routes_codex_specific_options() {
             ..Default::default()
         },
         reasoning_effort: Some(ds_ai::codex::ReasoningEffort::High),
-        reasoning_summary: Some(ds_ai::codex::ReasoningSummary::Detailed),
+        reasoning_summary: Some(ds_ai::codex::ReasoningSummary::Off),
         service_tier: Some(ds_ai::codex::ServiceTier::Priority),
         text_verbosity: Some(ds_ai::codex::TextVerbosity::High),
         tool_choice: Some(ds_ai::codex::ToolChoice::Required),
@@ -1300,7 +1300,7 @@ async fn routes_codex_specific_options() {
     assert_eq!(payload["temperature"], 0.25);
     assert_eq!(
         payload["reasoning"],
-        json!({"effort": "high", "summary": "detailed"})
+        json!({"effort": "high", "summary": "off"})
     );
     assert_eq!(payload["service_tier"], "priority");
     assert_eq!(payload["text"], json!({"verbosity": "high"}));

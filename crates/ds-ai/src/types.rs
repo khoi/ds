@@ -1,8 +1,7 @@
-use crate::{
-    Api, AssistantContent, AssistantMessage, AssistantToolCall, ImageContent, ModelInput,
-    ProviderId, TextContent, ThinkingContent,
+use crate::{AssistantContent, AssistantMessage, ImageContent, Model, ModelInput, TextContent};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::SerializeStruct,
 };
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -32,10 +31,8 @@ impl Message {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserMessage {
-    pub role: UserRole,
     pub content: UserContent,
     pub timestamp: u64,
 }
@@ -43,7 +40,6 @@ pub struct UserMessage {
 impl UserMessage {
     pub fn new(content: impl Into<String>, timestamp: u64) -> Self {
         Self {
-            role: UserRole::User,
             content: UserContent::Text(content.into()),
             timestamp,
         }
@@ -51,17 +47,46 @@ impl UserMessage {
 
     pub fn with_blocks(content: impl IntoIterator<Item = InputContent>, timestamp: u64) -> Self {
         Self {
-            role: UserRole::User,
             content: UserContent::Blocks(content.into_iter().collect()),
             timestamp,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum UserRole {
-    User,
+impl Serialize for UserMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("UserMessage", 3)?;
+        state.serialize_field("role", "user")?;
+        state.serialize_field("content", &self.content)?;
+        state.serialize_field("timestamp", &self.timestamp)?;
+        state.end()
+    }
+}
+
+#[derive(Deserialize)]
+struct UserMessageWire {
+    role: String,
+    content: UserContent,
+    timestamp: u64,
+}
+
+impl<'de> Deserialize<'de> for UserMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = UserMessageWire::deserialize(deserializer)?;
+        if wire.role != "user" {
+            return Err(D::Error::custom("user message role must be user"));
+        }
+        Ok(Self {
+            content: wire.content,
+            timestamp: wire.timestamp,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -71,18 +96,13 @@ pub enum UserContent {
     Blocks(Vec<InputContent>),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ToolResultMessage {
-    pub role: ToolResultRole,
     pub tool_call_id: String,
     pub tool_name: String,
     pub content: Vec<InputContent>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub added_tool_names: Option<Vec<String>>,
     pub is_error: bool,
     pub timestamp: u64,
@@ -95,7 +115,6 @@ impl ToolResultMessage {
         content: impl IntoIterator<Item = InputContent>,
     ) -> Self {
         Self {
-            role: ToolResultRole::ToolResult,
             tool_call_id: id.into(),
             tool_name: name.into(),
             content: content.into_iter().collect(),
@@ -113,10 +132,67 @@ impl ToolResultMessage {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+impl Serialize for ToolResultMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("ToolResultMessage", 9)?;
+        state.serialize_field("role", "toolResult")?;
+        state.serialize_field("toolCallId", &self.tool_call_id)?;
+        state.serialize_field("toolName", &self.tool_name)?;
+        state.serialize_field("content", &self.content)?;
+        if let Some(value) = &self.details {
+            state.serialize_field("details", value)?;
+        }
+        if let Some(value) = &self.usage {
+            state.serialize_field("usage", value)?;
+        }
+        if let Some(value) = &self.added_tool_names {
+            state.serialize_field("addedToolNames", value)?;
+        }
+        state.serialize_field("isError", &self.is_error)?;
+        state.serialize_field("timestamp", &self.timestamp)?;
+        state.end()
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum ToolResultRole {
-    ToolResult,
+struct ToolResultMessageWire {
+    role: String,
+    tool_call_id: String,
+    tool_name: String,
+    content: Vec<InputContent>,
+    details: Option<serde_json::Value>,
+    usage: Option<Usage>,
+    added_tool_names: Option<Vec<String>>,
+    is_error: bool,
+    timestamp: u64,
+}
+
+impl<'de> Deserialize<'de> for ToolResultMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ToolResultMessageWire::deserialize(deserializer)?;
+        if wire.role != "toolResult" {
+            return Err(D::Error::custom(
+                "tool result message role must be toolResult",
+            ));
+        }
+        Ok(Self {
+            tool_call_id: wire.tool_call_id,
+            tool_name: wire.tool_name,
+            content: wire.content,
+            details: wire.details,
+            usage: wire.usage,
+            added_tool_names: wire.added_tool_names,
+            is_error: wire.is_error,
+            timestamp: wire.timestamp,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -349,20 +425,6 @@ pub struct GrammarVariants {
     pub openai_regex: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum Content {
-    Text(String),
-    Reasoning(String),
-    ToolCall(ToolCall),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: serde_json::Value,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Usage {
@@ -388,36 +450,17 @@ pub struct UsageCost {
     pub total: f64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct Response {
-    pub id: Option<String>,
-    pub content: Vec<Content>,
-    pub usage: Usage,
-    pub stop_reason: StopReason,
-    pub raw_stop_reason: Option<String>,
-    pub service_tier: Option<String>,
-    pub end_turn: Option<bool>,
-    pub metadata: ResponseMetadata,
-    #[serde(default, skip_serializing)]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Response {
+    pub(crate) response_model: String,
+    pub(crate) id: Option<String>,
+    pub(crate) content: Vec<AssistantContent>,
+    pub(crate) usage: Usage,
+    pub(crate) stop_reason: StopReason,
+    pub(crate) raw_stop_reason: Option<String>,
+    pub(crate) service_tier: Option<String>,
+    pub(crate) end_turn: Option<bool>,
     diagnostics: Option<Vec<crate::AssistantMessageDiagnostic>>,
-    #[serde(default, rename = "_provider")]
-    provider: ProviderState,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ResponseMetadata {
-    pub request_id: Option<String>,
-    pub rate_limits: RateLimits,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RateLimits {
-    pub limit_requests: Option<u64>,
-    pub remaining_requests: Option<u64>,
-    pub reset_requests: Option<String>,
-    pub limit_tokens: Option<u64>,
-    pub remaining_tokens: Option<u64>,
-    pub reset_tokens: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -434,22 +477,9 @@ pub enum StopReason {
 }
 
 impl Response {
-    pub(crate) fn openai(model: String) -> Self {
+    pub(crate) fn new(response_model: String) -> Self {
         Self {
-            provider: ProviderState::OpenAi(OpenAiState {
-                model,
-                items: Vec::new(),
-            }),
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn codex(model: String) -> Self {
-        Self {
-            provider: ProviderState::Codex(OpenAiState {
-                model,
-                items: Vec::new(),
-            }),
+            response_model,
             ..Self::default()
         }
     }
@@ -460,93 +490,14 @@ impl Response {
             .push(diagnostic);
     }
 
-    pub(crate) fn add_openai_item(&mut self, item: OpenAiReplay) {
-        if let ProviderState::OpenAi(state) | ProviderState::Codex(state) = &mut self.provider {
-            state.items.push(item);
-        }
-    }
-
-    pub(crate) fn backfill_openai_reasoning(&mut self, id: &str, encrypted: &str) {
-        let (ProviderState::OpenAi(state) | ProviderState::Codex(state)) = &mut self.provider
-        else {
-            return;
-        };
-        for item in &mut state.items {
-            let OpenAiReplay::Reasoning {
-                id: item_id,
-                encrypted_content,
-                ..
-            } = item
-            else {
-                continue;
-            };
-            if item_id != id {
-                continue;
-            }
-            if encrypted_content.is_none() {
-                *encrypted_content = Some(encrypted.to_owned());
-            }
-            return;
-        }
-    }
-
-    pub(crate) fn anthropic(model: String) -> Self {
-        Self {
-            provider: ProviderState::Anthropic(AnthropicState {
-                model,
-                reasoning: Vec::new(),
-            }),
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn add_anthropic_reasoning(&mut self, reasoning: AnthropicReasoning) {
-        if let ProviderState::Anthropic(state) = &mut self.provider {
-            state.reasoning.push(reasoning);
-        }
-    }
-
-    pub(crate) fn set_anthropic_model(&mut self, model: String) {
-        if let ProviderState::Anthropic(state) = &mut self.provider {
-            state.model = model;
-        }
-    }
-
-    pub fn into_assistant_message(self, timestamp: u64) -> AssistantMessage {
-        let (api, provider, model) = match &self.provider {
-            ProviderState::OpenAi(state) => (
-                Api::OpenAiResponses,
-                ProviderId::new("openai"),
-                state.model.clone(),
-            ),
-            ProviderState::Codex(state) => (
-                Api::OpenAiCodexResponses,
-                ProviderId::new("openai-codex"),
-                state.model.clone(),
-            ),
-            ProviderState::Anthropic(state) => (
-                Api::AnthropicMessages,
-                ProviderId::new("anthropic"),
-                state.model.clone(),
-            ),
-            ProviderState::None => (
-                Api::Other("unknown".into()),
-                ProviderId::new("unknown"),
-                String::new(),
-            ),
-        };
-        let content = self
-            .content
-            .iter()
-            .enumerate()
-            .map(|(content_index, content)| self.assistant_content(content_index, content))
-            .collect();
+    pub(crate) fn into_assistant_message(self, model: &Model, timestamp: u64) -> AssistantMessage {
+        let response_model = (self.response_model != model.id).then_some(self.response_model);
         AssistantMessage {
-            content,
-            api,
-            provider,
-            model,
-            response_model: None,
+            content: self.content,
+            api: model.api.clone(),
+            provider: model.provider.clone(),
+            model: model.id.clone(),
+            response_model,
             response_id: self.id,
             diagnostics: self.diagnostics,
             usage: self.usage,
@@ -557,188 +508,10 @@ impl Response {
             timestamp,
         }
     }
-
-    fn assistant_content(&self, content_index: usize, content: &Content) -> AssistantContent {
-        match content {
-            Content::Text(text) => AssistantContent::Text(TextContent {
-                text: text.clone(),
-                text_signature: self.openai_text_signature(content_index),
-            }),
-            Content::Reasoning(thinking) => AssistantContent::Thinking(ThinkingContent {
-                thinking: thinking.clone(),
-                thinking_signature: self.thinking_signature(content_index, thinking),
-                redacted: self.anthropic_redacted(content_index),
-            }),
-            Content::ToolCall(call) => {
-                let (id, namespace) = self.openai_tool_identity(content_index, &call.id);
-                AssistantContent::ToolCall(AssistantToolCall {
-                    id,
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                    thought_signature: None,
-                    namespace,
-                })
-            }
-        }
-    }
-
-    fn openai_text_signature(&self, content_index: usize) -> Option<String> {
-        let items = match &self.provider {
-            ProviderState::OpenAi(state) | ProviderState::Codex(state) => &state.items,
-            _ => return None,
-        };
-        let OpenAiReplay::Message { id, phase, .. } = items.iter().find(|item| {
-            matches!(item, OpenAiReplay::Message { content_index: index, .. } if *index == content_index)
-        })?
-        else {
-            return None;
-        };
-        serde_json::to_string(&serde_json::json!({
-            "v": 1,
-            "id": id,
-            "phase": phase
-        }))
-        .ok()
-    }
-
-    fn thinking_signature(&self, content_index: usize, thinking: &str) -> Option<String> {
-        match &self.provider {
-            ProviderState::OpenAi(state) | ProviderState::Codex(state) => {
-                let OpenAiReplay::Reasoning {
-                    id,
-                    encrypted_content,
-                    ..
-                } = state.items.iter().find(|item| {
-                    matches!(item, OpenAiReplay::Reasoning { content_index: index, .. } if *index == content_index)
-                })?
-                else {
-                    return None;
-                };
-                let mut item = serde_json::json!({
-                    "type": "reasoning",
-                    "id": id,
-                    "summary": [{"type": "summary_text", "text": thinking}]
-                });
-                if let Some(encrypted_content) = encrypted_content {
-                    item["encrypted_content"] = encrypted_content.clone().into();
-                }
-                serde_json::to_string(&item).ok()
-            }
-            ProviderState::Anthropic(state) => {
-                state
-                    .reasoning
-                    .iter()
-                    .find_map(|reasoning| match reasoning {
-                        AnthropicReasoning::Thinking {
-                            content_index: index,
-                            signature,
-                        } if *index == content_index => Some(signature.clone()),
-                        AnthropicReasoning::Redacted {
-                            content_index: index,
-                            data,
-                        } if *index == content_index => Some(data.clone()),
-                        _ => None,
-                    })
-            }
-            ProviderState::None => None,
-        }
-    }
-
-    fn anthropic_redacted(&self, content_index: usize) -> Option<bool> {
-        match &self.provider {
-            ProviderState::Anthropic(state)
-                if state.reasoning.iter().any(|reasoning| {
-                    matches!(reasoning, AnthropicReasoning::Redacted { content_index: index, .. } if *index == content_index)
-                }) => Some(true),
-            _ => None,
-        }
-    }
-
-    fn openai_tool_identity(
-        &self,
-        content_index: usize,
-        call_id: &str,
-    ) -> (String, Option<String>) {
-        let (ProviderState::OpenAi(state) | ProviderState::Codex(state)) = &self.provider else {
-            return (call_id.to_owned(), None);
-        };
-        let Some(OpenAiReplay::ToolCall {
-            item_id, namespace, ..
-        }) = state.items.iter().find(|item| {
-            matches!(item, OpenAiReplay::ToolCall { content_index: index, .. } if *index == content_index)
-        })
-        else {
-            return (call_id.to_owned(), None);
-        };
-        let id = if call_id.contains('|') {
-            call_id.to_owned()
-        } else {
-            format!("{call_id}|{item_id}")
-        };
-        (id, namespace.clone())
-    }
-}
-
-impl From<Response> for AssistantMessage {
-    fn from(response: Response) -> Self {
-        response.into_assistant_message(0)
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-enum ProviderState {
-    #[default]
-    None,
-    OpenAi(OpenAiState),
-    Codex(OpenAiState),
-    Anthropic(AnthropicState),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct OpenAiState {
-    model: String,
-    items: Vec<OpenAiReplay>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) enum OpenAiReplay {
-    Reasoning {
-        content_index: usize,
-        id: String,
-        encrypted_content: Option<String>,
-    },
-    Message {
-        content_index: usize,
-        id: String,
-        phase: Option<String>,
-    },
-    ToolCall {
-        content_index: usize,
-        item_id: String,
-        namespace: Option<String>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct AnthropicState {
-    model: String,
-    reasoning: Vec<AnthropicReasoning>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) enum AnthropicReasoning {
-    Thinking {
-        content_index: usize,
-        signature: String,
-    },
-    Redacted {
-        content_index: usize,
-        data: String,
-    },
 }
 
 #[derive(Clone, Debug, Error, PartialEq)]
-pub enum Error {
+pub(crate) enum Error {
     #[error("HTTP request failed: {0}")]
     Http(String),
     #[error("invalid request: {0}")]
@@ -748,14 +521,7 @@ pub enum Error {
     #[error("request compression failed: {0}")]
     Compression(String),
     #[error("provider returned HTTP {status}: {message}")]
-    Provider {
-        status: u16,
-        code: Option<String>,
-        message: String,
-        request_id: Option<String>,
-        retry_after: Option<Duration>,
-        rate_limits: RateLimits,
-    },
+    Provider { status: u16, message: String },
     #[error("invalid provider stream: {message}")]
     Stream { message: String, partial: Response },
     #[error("provider stream ended before a terminal event")]
@@ -781,7 +547,7 @@ pub enum Error {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TimeoutPhase {
+pub(crate) enum TimeoutPhase {
     Connection,
     FirstEvent,
     Idle,

@@ -1,6 +1,4 @@
-use crate::{
-    Error, ProviderResponse, RateLimits, ResponseMetadata, TimeoutPhase, retry, transport,
-};
+use crate::{Error, ProviderResponse, TimeoutPhase, transport};
 use reqwest::{
     Response,
     header::{HeaderMap, HeaderName, HeaderValue},
@@ -12,61 +10,29 @@ use std::{
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-pub(crate) fn metadata(headers: &HeaderMap) -> ResponseMetadata {
-    ResponseMetadata {
-        request_id: header(headers, "x-request-id").or_else(|| header(headers, "request-id")),
-        rate_limits: RateLimits {
-            limit_requests: header_u64(headers, "x-ratelimit-limit-requests"),
-            remaining_requests: header_u64(headers, "x-ratelimit-remaining-requests"),
-            reset_requests: header(headers, "x-ratelimit-reset-requests"),
-            limit_tokens: header_u64(headers, "x-ratelimit-limit-tokens"),
-            remaining_tokens: header_u64(headers, "x-ratelimit-remaining-tokens"),
-            reset_tokens: header(headers, "x-ratelimit-reset-tokens"),
-        },
-    }
-}
-
 pub(crate) async fn provider_error(
     response: Response,
-    response_metadata: ResponseMetadata,
     cancellation: &CancellationToken,
     overall_deadline: Option<Instant>,
 ) -> Error {
-    provider_error_with(
-        response,
-        response_metadata,
-        cancellation,
-        overall_deadline,
-        false,
-    )
-    .await
+    provider_error_with(response, cancellation, overall_deadline, false).await
 }
 
 pub(crate) async fn codex_provider_error(
     response: Response,
-    response_metadata: ResponseMetadata,
     cancellation: &CancellationToken,
     overall_deadline: Option<Instant>,
 ) -> Error {
-    provider_error_with(
-        response,
-        response_metadata,
-        cancellation,
-        overall_deadline,
-        true,
-    )
-    .await
+    provider_error_with(response, cancellation, overall_deadline, true).await
 }
 
 async fn provider_error_with(
     response: Response,
-    response_metadata: ResponseMetadata,
     cancellation: &CancellationToken,
     overall_deadline: Option<Instant>,
     codex: bool,
 ) -> Error {
     let status = response.status().as_u16();
-    let retry_after = retry::requested_delay(response.headers());
     let body = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Error::Cancelled { partial: None },
@@ -79,14 +45,6 @@ async fn provider_error_with(
         body = response.text() => body.unwrap_or_default(),
     };
     let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
-    let code = parsed
-        .as_ref()
-        .and_then(|body| {
-            body.pointer("/error/code")
-                .or_else(|| body.pointer("/error/type"))
-        })
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
     let friendly_message = codex
         .then(|| codex_usage_limit_message(status, parsed.as_ref()))
         .flatten();
@@ -106,14 +64,7 @@ async fn provider_error_with(
                 body
             }
         });
-    Error::Provider {
-        status,
-        code,
-        message,
-        request_id: response_metadata.request_id,
-        retry_after,
-        rate_limits: response_metadata.rate_limits,
-    }
+    Error::Provider { status, message }
 }
 
 fn codex_usage_limit_message(status: u16, body: Option<&serde_json::Value>) -> Option<String> {
@@ -156,17 +107,6 @@ fn codex_usage_limit_message(status: u16, body: Option<&serde_json::Value>) -> O
     Some(format!(
         "You have hit your ChatGPT usage limit{plan}.{when}"
     ))
-}
-
-pub(crate) fn header(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-}
-
-pub(crate) fn header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
-    header(headers, name).and_then(|value| value.parse().ok())
 }
 
 pub(crate) fn request_headers(

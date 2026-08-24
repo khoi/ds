@@ -1264,7 +1264,7 @@ async fn encodes_openai_prompt_cache_retention_and_session_keys() {
 }
 
 #[tokio::test]
-async fn preserves_openai_http_error_and_response_metadata() {
+async fn exposes_openai_error_headers_to_the_response_hook() {
     let failure = Reply::json(
         429,
         json!({"error": {"code": "rate_limit_exceeded", "message": "Too many requests"}}),

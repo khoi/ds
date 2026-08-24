@@ -7,11 +7,11 @@ mod event_stream;
 mod frame;
 mod http;
 mod json;
-mod legacy;
 mod message;
 mod model;
 mod overflow;
 mod provider;
+mod provider_stream;
 mod retry;
 mod schema;
 mod sse;
@@ -65,10 +65,10 @@ pub use provider::{
 pub use retry::{RetryCallbacks, RetryPolicy, is_retryable_assistant_error, retry_assistant_call};
 pub use text::{ContentText, content_text, content_text_with_separator};
 pub use types::{
-    CacheRetention, ConstrainedSampling, ConstrainedSamplingStrictness, Content, Context, Error,
-    GrammarVariants, InputContent, Message, RateLimits, Response, ResponseMetadata, StopReason,
-    TimeoutPhase, Tool, ToolCall, ToolResultMessage, ToolResultRole, Usage, UsageCost, UserContent,
-    UserMessage, UserRole,
+    CacheRetention, ConstrainedSampling, ConstrainedSamplingStrictness, Context, GrammarVariants,
+    InputContent, Message, StopReason, Tool, ToolResultMessage, Usage, UsageCost, UserContent,
+    UserMessage,
 };
+pub(crate) use types::{Error, Response, TimeoutPhase};
 pub use uuid::{UuidV7Error, uuid_v7, uuid_v7_at};
 pub use validation::{ToolValidationError, validate_tool_arguments, validate_tool_call};

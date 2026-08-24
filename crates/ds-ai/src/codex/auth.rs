@@ -3,27 +3,25 @@ use base64::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Mutex,
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_BASE_URL: &str = "https://auth.openai.com";
-const MINIMUM_VALIDITY: Duration = Duration::from_secs(5 * 60);
 const SCOPE: &str = "openid profile email offline_access";
 const DEVICE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Notification {
+pub(crate) enum Notification {
     AuthorizationUrl {
         url: String,
     },
@@ -36,27 +34,27 @@ pub enum Notification {
 }
 
 #[async_trait]
-pub trait Interaction: Send + Sync {
+pub(crate) trait Interaction: Send + Sync {
     fn notify(&self, notification: Notification);
 
     async fn manual_authorization(&self, cancellation: CancellationToken) -> Result<String, Error>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Credentials {
-    pub access_token: String,
-    pub refresh_token: String,
-    pub expires_at: u64,
+pub(crate) struct Credentials {
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
+    pub(crate) expires_at: u64,
 }
 
 impl Credentials {
-    pub fn account_id(&self) -> Result<String, Error> {
+    fn account_id(&self) -> Result<String, Error> {
         super::account_id(&self.access_token).map_err(Error::InvalidResponse)
     }
 }
 
 #[derive(Clone)]
-pub struct Client {
+struct Client {
     http: reqwest::Client,
     base_url: String,
     callback_address: SocketAddr,
@@ -71,7 +69,7 @@ impl Default for Client {
 }
 
 impl Client {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: DEFAULT_BASE_URL.into(),
@@ -81,23 +79,23 @@ impl Client {
         }
     }
 
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+    fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into().trim_end_matches('/').to_owned();
         self
     }
 
-    pub fn with_callback_address(mut self, address: SocketAddr) -> Self {
+    fn with_callback_address(mut self, address: SocketAddr) -> Self {
         self.callback_address = address;
         self.callback_host = address.ip().to_string();
         self
     }
 
-    pub fn with_device_timeout(mut self, timeout: Duration) -> Self {
+    fn with_device_timeout(mut self, timeout: Duration) -> Self {
         self.device_timeout = timeout;
         self
     }
 
-    pub async fn login_browser(
+    async fn login_browser(
         &self,
         interaction: &dyn Interaction,
         cancellation: &CancellationToken,
@@ -140,7 +138,7 @@ impl Client {
             .await
     }
 
-    pub async fn login_device(
+    async fn login_device(
         &self,
         interaction: &dyn Interaction,
         cancellation: &CancellationToken,
@@ -204,7 +202,7 @@ impl Client {
         .await
     }
 
-    pub async fn refresh(
+    async fn refresh(
         &self,
         refresh_token: &str,
         cancellation: &CancellationToken,
@@ -297,42 +295,179 @@ impl Client {
 }
 
 #[derive(Clone)]
-pub struct CredentialManager {
+pub struct OAuth {
     client: Client,
-    credentials: Arc<Mutex<Credentials>>,
 }
 
-impl CredentialManager {
-    pub fn new(client: Client, credentials: Credentials) -> Self {
+impl Default for OAuth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OAuth {
+    pub fn new() -> Self {
         Self {
-            client,
-            credentials: Arc::new(Mutex::new(credentials)),
+            client: Client::new(),
         }
     }
 
-    pub async fn access_token(&self, cancellation: &CancellationToken) -> Result<String, Error> {
-        let mut credentials = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(Error::Cancelled),
-            credentials = self.credentials.lock() => credentials,
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.client = self.client.with_base_url(base_url);
+        self
+    }
+
+    pub fn with_callback_address(mut self, address: SocketAddr) -> Self {
+        self.client = self.client.with_callback_address(address);
+        self
+    }
+
+    pub fn with_device_timeout(mut self, timeout: Duration) -> Self {
+        self.client = self.client.with_device_timeout(timeout);
+        self
+    }
+}
+
+#[async_trait]
+impl crate::OAuthAuth for OAuth {
+    fn name(&self) -> &str {
+        "OpenAI (ChatGPT Plus/Pro)"
+    }
+
+    fn is_subscription(&self) -> bool {
+        true
+    }
+
+    async fn login(
+        &self,
+        interaction: &dyn crate::AuthInteraction,
+    ) -> Result<crate::Credential, crate::AuthError> {
+        let method = interaction
+            .prompt(crate::AuthPrompt::Select {
+                message: "Select OpenAI Codex login method:".into(),
+                options: vec![
+                    crate::AuthSelectOption {
+                        id: "browser".into(),
+                        label: "Browser login (default)".into(),
+                        description: None,
+                    },
+                    crate::AuthSelectOption {
+                        id: "device_code".into(),
+                        label: "Device code login (headless)".into(),
+                        description: None,
+                    },
+                ],
+            })
+            .await?;
+        let interaction_adapter = InteractionAdapter(interaction);
+        let credentials = match method.as_str() {
+            "browser" => {
+                self.client
+                    .login_browser(&interaction_adapter, interaction.cancellation())
+                    .await
+            }
+            "device_code" => {
+                self.client
+                    .login_device(&interaction_adapter, interaction.cancellation())
+                    .await
+            }
+            method => {
+                return Err(crate::AuthError::Authentication(format!(
+                    "Unknown OpenAI Codex login method: {method}"
+                )));
+            }
+        }
+        .map_err(auth_error)?;
+        Ok(oauth_credential(credentials))
+    }
+
+    async fn refresh(
+        &self,
+        credential: &crate::Credential,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::Credential, crate::AuthError> {
+        let crate::Credential::OAuth { refresh, .. } = credential else {
+            return Err(crate::AuthError::OAuth("expected OAuth credential".into()));
         };
-        let minimum_expiry = now_millis().saturating_add(duration_millis(MINIMUM_VALIDITY));
-        if credentials.expires_at <= minimum_expiry {
-            *credentials = self
-                .client
-                .refresh(&credentials.refresh_token, cancellation)
-                .await?;
-        }
-        Ok(credentials.access_token.clone())
+        self.client
+            .refresh(refresh, cancellation)
+            .await
+            .map(oauth_credential)
+            .map_err(auth_error)
     }
 
-    pub async fn snapshot(&self) -> Credentials {
-        self.credentials.lock().await.clone()
+    async fn to_auth(
+        &self,
+        credential: &crate::Credential,
+    ) -> Result<crate::ModelAuth, crate::AuthError> {
+        let crate::Credential::OAuth { access, .. } = credential else {
+            return Err(crate::AuthError::OAuth("expected OAuth credential".into()));
+        };
+        Ok(crate::ModelAuth {
+            api_key: Some(access.clone()),
+            ..Default::default()
+        })
+    }
+}
+
+struct InteractionAdapter<'a>(&'a dyn crate::AuthInteraction);
+
+#[async_trait]
+impl Interaction for InteractionAdapter<'_> {
+    fn notify(&self, notification: Notification) {
+        let event = match notification {
+            Notification::AuthorizationUrl { url } => crate::AuthEvent::AuthUrl {
+                url,
+                instructions: Some(
+                    "A browser window should open. Complete login to finish.".into(),
+                ),
+            },
+            Notification::DeviceCode {
+                user_code,
+                verification_uri,
+                interval,
+                expires_in,
+            } => crate::AuthEvent::DeviceCode {
+                user_code,
+                verification_uri,
+                interval_seconds: Some(interval.as_secs()),
+                expires_in_seconds: Some(expires_in.as_secs()),
+            },
+        };
+        self.0.notify(event);
+    }
+
+    async fn manual_authorization(&self, cancellation: CancellationToken) -> Result<String, Error> {
+        self.0
+            .prompt(crate::AuthPrompt::ManualCode {
+                message: "Complete login in your browser, or paste the authorization code / redirect URL here:"
+                    .into(),
+                placeholder: Some("http://localhost:1455/auth/callback".into()),
+                cancellation,
+            })
+            .await
+            .map_err(|error| Error::InvalidResponse(error.to_string()))
+    }
+}
+
+fn oauth_credential(credentials: Credentials) -> crate::Credential {
+    crate::Credential::OAuth {
+        refresh: credentials.refresh_token,
+        access: credentials.access_token,
+        expires: credentials.expires_at,
+        extra: BTreeMap::new(),
+    }
+}
+
+fn auth_error(error: Error) -> crate::AuthError {
+    match error {
+        Error::Cancelled => crate::AuthError::Cancelled,
+        error => crate::AuthError::OAuth(error.to_string()),
     }
 }
 
 #[derive(Debug, Error)]
-pub enum Error {
+pub(crate) enum Error {
     #[error("OAuth request failed: {0}")]
     Http(String),
     #[error("OAuth {operation} failed with HTTP {status}: {body}")]
@@ -442,10 +577,6 @@ fn now_millis() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
-}
-
-fn duration_millis(duration: Duration) -> u64 {
-    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn parse_device(body: &str) -> Result<Device, Error> {
