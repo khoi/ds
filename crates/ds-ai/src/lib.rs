@@ -4,4 +4,6 @@ mod types;
 
 pub mod openai;
 
-pub use types::{Content, Context, Error, Event, Message, Response, ResponseStream, Usage};
+pub use types::{
+    Content, Context, Error, Event, Message, Response, ResponseStream, Tool, ToolCall, Usage,
+};

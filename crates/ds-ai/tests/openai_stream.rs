@@ -1,6 +1,6 @@
 mod support;
 
-use ds_ai::{Context, Event, Message, openai};
+use ds_ai::{Context, Event, Message, Tool, ToolCall, openai};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use support::{Reply, serve};
@@ -590,6 +590,121 @@ async fn replays_serialized_openai_reasoning_and_message_items() {
                 "status": "completed",
                 "id": "msg_replay",
                 "phase": "final_answer"
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Continue"}]
+            }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn streams_and_replays_openai_tool_calls() {
+    let first_sse = [
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"fc_edit\",\"type\":\"function_call\",\"call_id\":\"call_edit\",\"name\":\"edit\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"README.md\\\"\"}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\",\\\"content\\\":\\\"updated\\\"}\"}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"{\\\"path\\\":\\\"README.md\\\",\\\"content\\\":\\\"updated\\\"}\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"fc_edit\",\"type\":\"function_call\",\"call_id\":\"call_edit\",\"name\":\"edit\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\",\\\"content\\\":\\\"updated\\\"}\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool\",\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{},\"output_tokens\":2,\"output_tokens_details\":{}}}}\n\n",
+    ]
+    .concat();
+    let first_server = serve([Reply::sse(first_sse)]).await;
+    let first_model = openai::Model::new("gpt-5.6").with_base_url(&first_server.base_url);
+    let first_context = Context::new([Message::user("Edit the file")]).with_tools([Tool::new(
+        "edit",
+        "Edit a file",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"}
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false
+        }),
+    )]);
+    let options = openai::Options::new("test-key");
+
+    let first_events = openai::stream(&first_model, &first_context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert_eq!(
+        first_events.first(),
+        Some(&Ok(Event::ToolCallDelta {
+            content_index: 0,
+            delta: "{\"path\":\"README.md\"".into(),
+        }))
+    );
+    assert_eq!(
+        first_events.get(1),
+        Some(&Ok(Event::ToolCallDelta {
+            content_index: 0,
+            delta: ",\"content\":\"updated\"}".into(),
+        }))
+    );
+    let response = done(&first_events);
+    assert_eq!(
+        response.content,
+        [ds_ai::Content::ToolCall(ToolCall {
+            id: "call_edit".into(),
+            name: "edit".into(),
+            arguments: json!({"path": "README.md", "content": "updated"}),
+        })]
+    );
+
+    let first_request = first_server.requests().await.pop().unwrap();
+    let first_body: Value =
+        serde_json::from_str(first_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        first_body["tools"],
+        json!([{
+            "type": "function",
+            "name": "edit",
+            "description": "Edit a file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            },
+            "strict": false
+        }])
+    );
+
+    let restored: ds_ai::Response =
+        serde_json::from_value(serde_json::to_value(response).unwrap()).unwrap();
+    let second_sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_second\",\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
+    let second_server = serve([Reply::sse(second_sse)]).await;
+    let second_model = openai::Model::new("gpt-5.6").with_base_url(&second_server.base_url);
+    let second_context = Context::new([Message::assistant(restored), Message::user("Continue")]);
+
+    openai::stream(&second_model, &second_context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    let second_request = second_server.requests().await.pop().unwrap();
+    let second_body: Value =
+        serde_json::from_str(second_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        second_body["input"],
+        json!([
+            {
+                "type": "function_call",
+                "id": "fc_edit",
+                "call_id": "call_edit",
+                "name": "edit",
+                "arguments": "{\"content\":\"updated\",\"path\":\"README.md\"}"
             },
             {
                 "role": "user",

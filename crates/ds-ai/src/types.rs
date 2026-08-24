@@ -22,17 +22,49 @@ impl Message {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Context {
     messages: Vec<Message>,
+    tools: Vec<Tool>,
 }
 
 impl Context {
     pub fn new(messages: impl IntoIterator<Item = Message>) -> Self {
         Self {
             messages: messages.into_iter().collect(),
+            tools: Vec::new(),
         }
+    }
+
+    pub fn with_tools(mut self, tools: impl IntoIterator<Item = Tool>) -> Self {
+        self.tools = tools.into_iter().collect();
+        self
     }
 
     pub(crate) fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    pub(crate) fn tools(&self) -> &[Tool] {
+        &self.tools
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Tool {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+impl Tool {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+        }
     }
 }
 
@@ -40,6 +72,14 @@ impl Context {
 pub enum Content {
     Text(String),
     Reasoning(String),
+    ToolCall(ToolCall),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -110,12 +150,18 @@ pub(crate) enum OpenAiReplay {
         id: String,
         phase: Option<String>,
     },
+    ToolCall {
+        content_index: usize,
+        item_id: String,
+        namespace: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     TextDelta { content_index: usize, delta: String },
     ReasoningDelta { content_index: usize, delta: String },
+    ToolCallDelta { content_index: usize, delta: String },
     Done(Response),
 }
 

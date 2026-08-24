@@ -1,5 +1,5 @@
 use crate::{
-    Content, Context, Error, Event, Message, Response, ResponseStream, Usage, retry, sse,
+    Content, Context, Error, Event, Message, Response, ResponseStream, ToolCall, Usage, retry, sse,
     types::OpenAiReplay,
 };
 use async_stream::stream;
@@ -68,6 +68,8 @@ impl Options {
 struct Request<'a> {
     model: &'a str,
     input: Vec<RequestItem<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<RequestTool<'a>>,
     stream: bool,
     store: bool,
 }
@@ -78,6 +80,7 @@ enum RequestItem<'a> {
     User(RequestUser<'a>),
     Reasoning(RequestReasoning<'a>),
     Assistant(RequestAssistant<'a>),
+    FunctionCall(RequestFunctionCall<'a>),
 }
 
 #[derive(Serialize)]
@@ -125,6 +128,26 @@ struct RequestAssistantContent<'a> {
     annotations: [(); 0],
 }
 
+#[derive(Serialize)]
+struct RequestFunctionCall<'a> {
+    r#type: &'static str,
+    id: &'a str,
+    call_id: &'a str,
+    name: &'a str,
+    arguments: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    namespace: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct RequestTool<'a> {
+    r#type: &'static str,
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a serde_json::Value,
+    strict: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum StreamEvent {
@@ -139,6 +162,13 @@ enum StreamEvent {
     OutputTextDelta { output_index: usize, delta: String },
     #[serde(rename = "response.reasoning_summary_text.delta")]
     ReasoningSummaryTextDelta { output_index: usize, delta: String },
+    #[serde(rename = "response.function_call_arguments.delta")]
+    FunctionCallArgumentsDelta { output_index: usize, delta: String },
+    #[serde(rename = "response.function_call_arguments.done")]
+    FunctionCallArgumentsDone {
+        output_index: usize,
+        arguments: String,
+    },
     #[serde(rename = "response.output_item.done")]
     OutputItemDone {
         output_index: usize,
@@ -159,12 +189,16 @@ struct IdentifiedResponse {
 struct OutputItem {
     id: Option<String>,
     r#type: String,
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: Option<String>,
     #[serde(default)]
     content: Vec<OutputContent>,
     #[serde(default)]
     summary: Vec<SummaryContent>,
     encrypted_content: Option<String>,
     phase: Option<String>,
+    namespace: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -182,6 +216,10 @@ struct SummaryContent {
 enum Slot {
     Text(usize),
     Reasoning(usize),
+    ToolCall {
+        content_index: usize,
+        arguments: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -287,14 +325,51 @@ pub async fn stream(
                                 phase: phase.as_deref(),
                             }));
                         }
+                        Content::ToolCall(call) => {
+                            let Some(OpenAiReplay::ToolCall {
+                                item_id, namespace, ..
+                            }) = items.iter().find(|item| {
+                                matches!(
+                                    item,
+                                    OpenAiReplay::ToolCall {
+                                        content_index: index,
+                                        ..
+                                    } if *index == content_index
+                                )
+                            })
+                            else {
+                                continue;
+                            };
+                            input.push(RequestItem::FunctionCall(RequestFunctionCall {
+                                r#type: "function_call",
+                                id: item_id,
+                                call_id: &call.id,
+                                name: &call.name,
+                                arguments: serde_json::to_string(&call.arguments)
+                                    .expect("tool arguments serialize"),
+                                namespace: namespace.as_deref(),
+                            }));
+                        }
                     }
                 }
             }
         }
     }
+    let tools = context
+        .tools()
+        .iter()
+        .map(|tool| RequestTool {
+            r#type: "function",
+            name: &tool.name,
+            description: &tool.description,
+            parameters: &tool.parameters,
+            strict: false,
+        })
+        .collect();
     let request = Request {
         model: &model.id,
         input,
+        tools,
         stream: true,
         store: false,
     };
@@ -371,6 +446,24 @@ pub async fn stream(
                                 result.content.push(Content::Reasoning(String::new()));
                                 slots.insert(output_index, Slot::Reasoning(content_index));
                             }
+                            "function_call" => {
+                                let (Some(id), Some(name)) = (item.call_id, item.name) else {
+                                    continue;
+                                };
+                                let arguments = item.arguments.unwrap_or_default();
+                                result.content.push(Content::ToolCall(ToolCall {
+                                    id,
+                                    name,
+                                    arguments: parse_arguments(&arguments),
+                                }));
+                                slots.insert(
+                                    output_index,
+                                    Slot::ToolCall {
+                                        content_index,
+                                        arguments,
+                                    },
+                                );
+                            }
                             _ => {}
                         }
                     }
@@ -391,6 +484,32 @@ pub async fn stream(
                             reasoning.push_str(&delta);
                         }
                         yield Ok(Event::ReasoningDelta { content_index: *content_index, delta });
+                    }
+                    StreamEvent::FunctionCallArgumentsDelta { output_index, delta } => {
+                        let Some(Slot::ToolCall { content_index, arguments }) = slots.get_mut(&output_index) else {
+                            continue;
+                        };
+                        arguments.push_str(&delta);
+                        if let Content::ToolCall(call) = &mut result.content[*content_index] {
+                            call.arguments = parse_arguments(arguments);
+                        }
+                        yield Ok(Event::ToolCallDelta { content_index: *content_index, delta });
+                    }
+                    StreamEvent::FunctionCallArgumentsDone { output_index, arguments: completed } => {
+                        let Some(Slot::ToolCall { content_index, arguments }) = slots.get_mut(&output_index) else {
+                            continue;
+                        };
+                        let delta = completed
+                            .strip_prefix(arguments.as_str())
+                            .filter(|delta| !delta.is_empty())
+                            .map(str::to_owned);
+                        *arguments = completed;
+                        if let Content::ToolCall(call) = &mut result.content[*content_index] {
+                            call.arguments = parse_arguments(arguments);
+                        }
+                        if let Some(delta) = delta {
+                            yield Ok(Event::ToolCallDelta { content_index: *content_index, delta });
+                        }
                     }
                     StreamEvent::OutputItemDone { output_index, item } if item.r#type == "message" => {
                         let Some(Slot::Text(content_index)) = slots.get(&output_index) else {
@@ -434,6 +553,28 @@ pub async fn stream(
                             });
                         }
                     }
+                    StreamEvent::OutputItemDone { output_index, item } if item.r#type == "function_call" => {
+                        let Some(Slot::ToolCall { content_index, arguments }) = slots.get(&output_index) else {
+                            continue;
+                        };
+                        let final_arguments = item.arguments.as_deref().unwrap_or(arguments);
+                        if let Content::ToolCall(call) = &mut result.content[*content_index] {
+                            if let Some(id) = item.call_id {
+                                call.id = id;
+                            }
+                            if let Some(name) = item.name {
+                                call.name = name;
+                            }
+                            call.arguments = parse_arguments(final_arguments);
+                        }
+                        if let Some(item_id) = item.id {
+                            result.add_openai_item(OpenAiReplay::ToolCall {
+                                content_index: *content_index,
+                                item_id,
+                                namespace: item.namespace,
+                            });
+                        }
+                    }
                     StreamEvent::Completed { response } => {
                         result.id = Some(response.id);
                         result.usage = Usage {
@@ -459,4 +600,8 @@ pub async fn stream(
     };
 
     Ok(Box::pin(output))
+}
+
+fn parse_arguments(arguments: &str) -> serde_json::Value {
+    serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
 }
