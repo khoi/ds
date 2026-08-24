@@ -28,13 +28,20 @@ impl Model {
 
 pub struct Options {
     api_key: String,
+    max_retries: usize,
 }
 
 impl Options {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
+            max_retries: 0,
         }
+    }
+
+    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = max_retries;
+        self
     }
 }
 
@@ -152,24 +159,31 @@ pub async fn stream(
         stream: true,
         store: false,
     };
-    let response = reqwest::Client::new()
-        .post(format!(
-            "{}/responses",
-            model.base_url.trim_end_matches('/')
-        ))
-        .bearer_auth(&options.api_key)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|error| Error::Http(error.to_string()))?;
-    let status = response.status();
-    if !status.is_success() {
+    let client = reqwest::Client::new();
+    let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
+    let mut retries = 0;
+    let response = loop {
+        let response = client
+            .post(&url)
+            .bearer_auth(&options.api_key)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| Error::Http(error.to_string()))?;
+        let status = response.status();
+        if status.is_success() {
+            break response;
+        }
+        if retries < options.max_retries && matches!(status.as_u16(), 408 | 409 | 429 | 500..=599) {
+            retries += 1;
+            continue;
+        }
         let body = response.text().await.unwrap_or_default();
         return Err(Error::Provider {
             status: status.as_u16(),
             body,
         });
-    }
+    };
 
     let output = stream! {
         let mut chunks = response.bytes_stream();

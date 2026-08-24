@@ -156,3 +156,36 @@ async fn decodes_openai_sse_across_arbitrary_chunks() {
     );
     server.requests().await;
 }
+
+#[tokio::test]
+async fn retries_openai_before_streaming_starts() {
+    let completed = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_retry\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
+    let server = serve([
+        Reply::json(
+            429,
+            json!({"error": {"type": "rate_limit_error", "message": "retry"}}),
+        )
+        .with_header("retry-after-ms", "0"),
+        Reply::sse(completed),
+    ])
+    .await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options = openai::Options::new("test-key").with_max_retries(1);
+
+    let events = openai::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert_eq!(
+        events,
+        vec![Ok(Event::Done(ds_ai::Response {
+            id: Some("resp_retry".into()),
+            content: Vec::new(),
+            usage: ds_ai::Usage::default(),
+        }))]
+    );
+    assert_eq!(server.requests().await.len(), 2);
+}

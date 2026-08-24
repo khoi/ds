@@ -1,3 +1,4 @@
+use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -25,6 +26,27 @@ impl Reply {
             headers: Vec::new(),
             chunks: chunks.into_iter().collect(),
         }
+    }
+
+    pub fn json(status: u16, body: Value) -> Self {
+        Self {
+            status,
+            reason: match status {
+                429 => "Too Many Requests",
+                500 => "Internal Server Error",
+                502 => "Bad Gateway",
+                503 => "Service Unavailable",
+                _ => "Error",
+            },
+            content_type: "application/json",
+            headers: Vec::new(),
+            chunks: vec![serde_json::to_vec(&body).unwrap()],
+        }
+    }
+
+    pub fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.headers.push((name, value.into()));
+        self
     }
 }
 
