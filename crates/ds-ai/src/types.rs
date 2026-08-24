@@ -7,6 +7,7 @@ use thiserror::Error;
 pub enum Message {
     User(String),
     Assistant(Response),
+    ToolResult(ToolResult),
 }
 
 impl Message {
@@ -16,6 +17,57 @@ impl Message {
 
     pub fn assistant(response: Response) -> Self {
         Self::Assistant(response)
+    }
+
+    pub fn tool_result(result: ToolResult) -> Self {
+        Self::ToolResult(result)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub id: String,
+    pub name: String,
+    pub content: Vec<InputContent>,
+    pub is_error: bool,
+}
+
+impl ToolResult {
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        content: impl IntoIterator<Item = InputContent>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            content: content.into_iter().collect(),
+            is_error: false,
+        }
+    }
+
+    pub fn with_error(mut self, is_error: bool) -> Self {
+        self.is_error = is_error;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum InputContent {
+    Text(String),
+    Image { media_type: String, data: String },
+}
+
+impl InputContent {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text(text.into())
+    }
+
+    pub fn image(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self::Image {
+            media_type: media_type.into(),
+            data: data.into(),
+        }
     }
 }
 

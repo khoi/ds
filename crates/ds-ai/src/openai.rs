@@ -1,6 +1,6 @@
 use crate::{
-    Content, Context, Error, Event, Message, Response, ResponseStream, ToolCall, Usage, retry, sse,
-    types::OpenAiReplay,
+    Content, Context, Error, Event, InputContent, Message, Response, ResponseStream, ToolCall,
+    ToolResult, Usage, retry, sse, types::OpenAiReplay,
 };
 use async_stream::stream;
 use futures_util::StreamExt;
@@ -81,6 +81,7 @@ enum RequestItem<'a> {
     Reasoning(RequestReasoning<'a>),
     Assistant(RequestAssistant<'a>),
     FunctionCall(RequestFunctionCall<'a>),
+    FunctionOutput(RequestFunctionOutput<'a>),
 }
 
 #[derive(Serialize)]
@@ -137,6 +138,13 @@ struct RequestFunctionCall<'a> {
     arguments: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     namespace: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct RequestFunctionOutput<'a> {
+    r#type: &'static str,
+    call_id: &'a str,
+    output: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -352,6 +360,13 @@ pub async fn stream(
                         }
                     }
                 }
+            }
+            Message::ToolResult(result) => {
+                input.push(RequestItem::FunctionOutput(RequestFunctionOutput {
+                    r#type: "function_call_output",
+                    call_id: &result.id,
+                    output: tool_result_output(result),
+                }));
             }
         }
     }
@@ -604,4 +619,44 @@ pub async fn stream(
 
 fn parse_arguments(arguments: &str) -> serde_json::Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn tool_result_output(result: &ToolResult) -> serde_json::Value {
+    let text = result
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            InputContent::Text(text) => Some(text.as_str()),
+            InputContent::Image { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let images = result
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            InputContent::Image { media_type, data } => Some((media_type, data)),
+            InputContent::Text(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        return serde_json::Value::String(if text.is_empty() {
+            "(no tool output)".into()
+        } else {
+            text
+        });
+    }
+
+    let mut output = Vec::new();
+    if !text.is_empty() {
+        output.push(serde_json::json!({"type": "input_text", "text": text}));
+    }
+    output.extend(images.into_iter().map(|(media_type, data)| {
+        serde_json::json!({
+            "type": "input_image",
+            "detail": "auto",
+            "image_url": format!("data:{media_type};base64,{data}")
+        })
+    }));
+    serde_json::Value::Array(output)
 }

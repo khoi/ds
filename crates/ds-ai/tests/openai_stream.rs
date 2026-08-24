@@ -1,6 +1,6 @@
 mod support;
 
-use ds_ai::{Context, Event, Message, Tool, ToolCall, openai};
+use ds_ai::{Context, Event, InputContent, Message, Tool, ToolCall, ToolResult, openai};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use support::{Reply, serve};
@@ -709,6 +709,65 @@ async fn streams_and_replays_openai_tool_calls() {
             {
                 "role": "user",
                 "content": [{"type": "input_text", "text": "Continue"}]
+            }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn sends_openai_tool_result_text_images_and_empty_output() {
+    let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_result\",\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
+    let server = serve([Reply::sse(sse)]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([
+        Message::user("Inspect the image"),
+        Message::tool_result(ToolResult::new(
+            "call_image",
+            "inspect",
+            [
+                InputContent::text("A red circle"),
+                InputContent::image("image/png", "iVBORw0KGgo="),
+            ],
+        )),
+        Message::tool_result(ToolResult::new(
+            "call_empty",
+            "noop",
+            [InputContent::text("")],
+        )),
+    ]);
+    let options = openai::Options::new("test-key");
+
+    openai::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    let request = server.requests().await.pop().unwrap();
+    let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        body["input"],
+        json!([
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Inspect the image"}]
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_image",
+                "output": [
+                    {"type": "input_text", "text": "A red circle"},
+                    {
+                        "type": "input_image",
+                        "detail": "auto",
+                        "image_url": "data:image/png;base64,iVBORw0KGgo="
+                    }
+                ]
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_empty",
+                "output": "(no tool output)"
             }
         ])
     );
