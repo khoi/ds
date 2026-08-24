@@ -176,6 +176,8 @@ pub struct Response {
     pub usage: Usage,
     pub stop_reason: StopReason,
     pub raw_stop_reason: Option<String>,
+    pub service_tier: Option<String>,
+    pub end_turn: Option<bool>,
     pub metadata: ResponseMetadata,
     #[serde(default, rename = "_provider")]
     provider: ProviderState,

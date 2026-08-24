@@ -120,7 +120,13 @@ async fn streams_a_codex_websocket_request() {
         }),
         json!({
             "type": "response.completed",
-            "response": {"id": "resp_ws", "status": "completed", "usage": {}}
+            "response": {
+                "id": "resp_ws",
+                "status": "completed",
+                "service_tier": "priority",
+                "end_turn": true,
+                "usage": {}
+            }
         }),
     ]])
     .await;
@@ -137,10 +143,10 @@ async fn streams_a_codex_websocket_request() {
         .collect::<Vec<_>>()
         .await;
 
-    assert_eq!(
-        done(&events).content,
-        [ds_ai::Content::Text("WebSocket".into())]
-    );
+    let response = done(&events);
+    assert_eq!(response.content, [ds_ai::Content::Text("WebSocket".into())]);
+    assert_eq!(response.service_tier.as_deref(), Some("priority"));
+    assert_eq!(response.end_turn, Some(true));
     let capture = capture.await.unwrap();
     assert_eq!(capture.path, "/codex/responses");
     assert_eq!(capture.headers["authorization"], format!("Bearer {token}"));

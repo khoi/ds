@@ -395,6 +395,8 @@ enum Slot {
 struct CompletedResponse {
     id: Option<String>,
     status: Option<String>,
+    service_tier: Option<String>,
+    end_turn: Option<bool>,
     incomplete_details: Option<IncompleteDetails>,
     error: Option<FailedDetail>,
     #[serde(default)]
@@ -404,6 +406,8 @@ struct CompletedResponse {
 #[derive(Deserialize)]
 struct IncompleteResponse {
     id: Option<String>,
+    service_tier: Option<String>,
+    end_turn: Option<bool>,
     incomplete_details: IncompleteDetails,
     #[serde(default)]
     usage: CompletedUsage,
@@ -417,6 +421,8 @@ struct IncompleteDetails {
 #[derive(Deserialize)]
 struct FailedResponse {
     id: Option<String>,
+    service_tier: Option<String>,
+    end_turn: Option<bool>,
     error: Option<FailedDetail>,
     incomplete_details: Option<IncompleteDetails>,
 }
@@ -887,6 +893,8 @@ pub(crate) fn decode_events(
                         if response.id.is_some() {
                             result.id = response.id;
                         }
+                        result.service_tier = response.service_tier;
+                        result.end_turn = response.end_turn;
                         result.usage = usage(response.usage);
                         if response.status.as_deref() == Some("incomplete") {
                             let reason = response
@@ -943,6 +951,8 @@ pub(crate) fn decode_events(
                         if response.id.is_some() {
                             result.id = response.id;
                         }
+                        result.service_tier = response.service_tier;
+                        result.end_turn = response.end_turn;
                         result.usage = usage(response.usage);
                         result.stop_reason = StopReason::Length;
                         result.raw_stop_reason = Some("incomplete.max_output_tokens".into());
@@ -954,6 +964,8 @@ pub(crate) fn decode_events(
                         if response.id.is_some() {
                             result.id = response.id;
                         }
+                        result.service_tier = response.service_tier;
+                        result.end_turn = response.end_turn;
                         result.usage = usage(response.usage);
                         result.stop_reason = StopReason::Error;
                         result.raw_stop_reason = Some(format!("incomplete.{reason}"));
@@ -978,6 +990,8 @@ pub(crate) fn decode_events(
                         if response.id.is_some() {
                             result.id = response.id;
                         }
+                        result.service_tier = response.service_tier;
+                        result.end_turn = response.end_turn;
                         result.stop_reason = StopReason::Error;
                         result.raw_stop_reason = Some("failed".into());
                         yield Err(Error::Response {
