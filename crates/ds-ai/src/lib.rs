@@ -7,6 +7,7 @@ mod transport;
 mod types;
 
 pub mod anthropic;
+pub mod codex;
 pub mod openai;
 
 pub use types::{

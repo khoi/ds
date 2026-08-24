@@ -322,6 +322,8 @@ pub enum Error {
     Http(String),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    #[error("request compression failed: {0}")]
+    Compression(String),
     #[error("provider returned HTTP {status}: {message}")]
     Provider {
         status: u16,

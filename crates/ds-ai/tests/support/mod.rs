@@ -98,7 +98,7 @@ impl Reply {
 
 pub struct Server {
     pub base_url: String,
-    requests: oneshot::Receiver<Vec<String>>,
+    requests: oneshot::Receiver<Vec<Vec<u8>>>,
     request_count: Arc<AtomicUsize>,
     request_notify: Arc<Notify>,
 }
@@ -119,6 +119,15 @@ impl Server {
     }
 
     pub async fn requests(self) -> Vec<String> {
+        self.requests
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|request| String::from_utf8(request).unwrap())
+            .collect()
+    }
+
+    pub async fn request_bytes(self) -> Vec<Vec<u8>> {
         self.requests.await.unwrap()
     }
 }
@@ -153,7 +162,7 @@ pub async fn serve(replies: impl IntoIterator<Item = Reply>) -> Server {
     }
 }
 
-async fn read_request(socket: &mut TcpStream) -> String {
+async fn read_request(socket: &mut TcpStream) -> Vec<u8> {
     let mut request = Vec::new();
     let header_end = loop {
         let mut bytes = [0; 1024];
@@ -177,7 +186,7 @@ async fn read_request(socket: &mut TcpStream) -> String {
         let count = socket.read(&mut bytes).await.unwrap();
         request.extend_from_slice(&bytes[..count]);
     }
-    String::from_utf8(request).unwrap()
+    request
 }
 
 async fn write_reply(socket: &mut TcpStream, reply: Reply) {

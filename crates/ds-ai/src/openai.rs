@@ -373,14 +373,16 @@ enum Slot {
 
 #[derive(Deserialize)]
 struct CompletedResponse {
-    id: String,
+    id: Option<String>,
+    #[serde(default)]
     usage: CompletedUsage,
 }
 
 #[derive(Deserialize)]
 struct IncompleteResponse {
-    id: String,
+    id: Option<String>,
     incomplete_details: IncompleteDetails,
+    #[serde(default)]
     usage: CompletedUsage,
 }
 
@@ -402,15 +404,19 @@ struct FailedDetail {
     message: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct CompletedUsage {
+    #[serde(default)]
     input_tokens: u64,
+    #[serde(default)]
     input_tokens_details: InputTokenDetails,
+    #[serde(default)]
     output_tokens: u64,
+    #[serde(default)]
     output_tokens_details: OutputTokenDetails,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct InputTokenDetails {
     #[serde(default)]
     cached_tokens: u64,
@@ -418,7 +424,7 @@ struct InputTokenDetails {
     cache_write_tokens: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct OutputTokenDetails {
     #[serde(default)]
     reasoning_tokens: u64,
@@ -617,12 +623,25 @@ pub async fn stream(
     if !response.status().is_success() {
         return Err(http::provider_error(response).await);
     }
-    let metadata = http::metadata(response.headers());
+    Ok(decode_stream(
+        response,
+        model.id.clone(),
+        options.cancellation.clone(),
+        options.first_event_timeout,
+        options.idle_timeout,
+        overall_deadline,
+    ))
+}
 
-    let response_model = model.id.clone();
-    let stream_cancellation = options.cancellation.clone();
-    let first_event_timeout = options.first_event_timeout;
-    let idle_timeout = options.idle_timeout;
+pub(crate) fn decode_stream(
+    response: reqwest::Response,
+    response_model: String,
+    stream_cancellation: CancellationToken,
+    first_event_timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
+    overall_deadline: Option<Instant>,
+) -> ResponseStream {
+    let metadata = http::metadata(response.headers());
     let output = stream! {
         let mut events = transport::EventStream::new(
             response,
@@ -818,7 +837,9 @@ pub async fn stream(
                         }
                     }
                     StreamEvent::Completed { response } => {
-                        result.id = Some(response.id);
+                        if response.id.is_some() {
+                            result.id = response.id;
+                        }
                         result.usage = usage(response.usage);
                         result.stop_reason = if result
                             .content
@@ -836,7 +857,9 @@ pub async fn stream(
                     StreamEvent::Incomplete { response }
                         if response.incomplete_details.reason == "max_output_tokens" =>
                     {
-                        result.id = Some(response.id);
+                        if response.id.is_some() {
+                            result.id = response.id;
+                        }
                         result.usage = usage(response.usage);
                         result.stop_reason = StopReason::Length;
                         result.raw_stop_reason = Some("incomplete.max_output_tokens".into());
@@ -845,7 +868,9 @@ pub async fn stream(
                     }
                     StreamEvent::Incomplete { response } => {
                         let reason = response.incomplete_details.reason;
-                        result.id = Some(response.id);
+                        if response.id.is_some() {
+                            result.id = response.id;
+                        }
                         result.usage = usage(response.usage);
                         result.stop_reason = StopReason::Error;
                         result.raw_stop_reason = Some(format!("incomplete.{reason}"));
@@ -896,14 +921,14 @@ pub async fn stream(
         yield Err(Error::IncompleteStream { partial: result });
     };
 
-    Ok(Box::pin(output))
+    Box::pin(output)
 }
 
 fn parse_arguments(arguments: &str) -> serde_json::Value {
     json::value(arguments)
 }
 
-fn clamp_cache_key(key: &str) -> String {
+pub(crate) fn clamp_cache_key(key: &str) -> String {
     key.chars().take(64).collect()
 }
 
@@ -937,7 +962,7 @@ fn usage(usage: CompletedUsage) -> Usage {
     }
 }
 
-fn tool_result_output(result: &ToolResult) -> serde_json::Value {
+pub(crate) fn tool_result_output(result: &ToolResult) -> serde_json::Value {
     let text = result
         .content
         .iter()
