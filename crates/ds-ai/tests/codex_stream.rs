@@ -8,7 +8,11 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    sync::oneshot,
+};
 use tokio_tungstenite::{
     accept_hdr_async,
     tungstenite::{
@@ -489,6 +493,59 @@ async fn falls_back_to_sse_when_codex_websocket_connect_fails() {
 }
 
 #[tokio::test]
+async fn falls_back_to_sse_when_codex_websocket_has_no_first_event() {
+    let (base_url, capture) = serve_idle_websocket_then_sse().await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let events = codex::stream(
+        &model,
+        &Context::new([Message::user("Wait")]),
+        &codex::Options::new(token("acc_idle_fallback"))
+            .with_cache_retention(ds_ai::CacheRetention::None)
+            .with_first_event_timeout(Duration::from_millis(10)),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+
+    assert_eq!(
+        done(&events).content,
+        [ds_ai::Content::Text("Fallback".into())]
+    );
+    let requests = capture.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with(b"GET /codex/responses HTTP/1.1\r\n"));
+    assert!(requests[1].starts_with(b"POST /codex/responses HTTP/1.1\r\n"));
+}
+
+#[tokio::test]
+async fn does_not_fall_back_after_a_codex_websocket_event() {
+    let base_url = serve_started_idle_websocket().await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let events = codex::stream(
+        &model,
+        &Context::new([Message::user("Wait")]),
+        &codex::Options::new(token("acc_started_idle"))
+            .with_cache_retention(ds_ai::CacheRetention::None)
+            .with_first_event_timeout(Duration::from_millis(10))
+            .with_idle_timeout(Duration::from_millis(10))
+            .with_overall_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+
+    assert!(matches!(
+        events.last(),
+        Some(Err(ds_ai::Error::Timeout {
+            phase: ds_ai::TimeoutPhase::Idle,
+            partial: Some(partial),
+        })) if partial.id.as_deref() == Some("resp_started_idle")
+    ));
+}
+
+#[tokio::test]
 async fn preserves_partial_content_after_an_oversized_websocket_close() {
     let base_url = serve_websocket_close([
         json!({
@@ -638,6 +695,91 @@ async fn serve_websocket_close(events: impl IntoIterator<Item = Value>) -> Strin
             .unwrap();
     });
     format!("http://{address}")
+}
+
+async fn serve_idle_websocket_then_sse() -> (String, oneshot::Receiver<Vec<Vec<u8>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sender, receiver) = oneshot::channel();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        let websocket_request = match websocket.next().await {
+            Some(Ok(WebSocketMessage::Text(_))) => b"GET /codex/responses HTTP/1.1\r\n".to_vec(),
+            message => panic!("unexpected websocket request: {message:?}"),
+        };
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let http_request = read_http_request(&mut socket).await;
+        let sse = [
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_idle_fallback\",\"type\":\"message\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Fallback\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_idle_fallback\",\"usage\":{}}}\n\n",
+        ]
+        .concat();
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                    sse.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        sender.send(vec![websocket_request, http_request]).ok();
+        drop(websocket);
+    });
+    (format!("http://{address}"), receiver)
+}
+
+async fn serve_started_idle_websocket() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        assert!(matches!(
+            socket.next().await,
+            Some(Ok(WebSocketMessage::Text(_)))
+        ));
+        socket
+            .send(WebSocketMessage::Text(
+                json!({"type": "response.created", "response": {"id": "resp_started_idle"}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        socket.next().await;
+    });
+    format!("http://{address}")
+}
+
+async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    let header_end = loop {
+        let mut bytes = [0; 1024];
+        let count = socket.read(&mut bytes).await.unwrap();
+        request.extend_from_slice(&bytes[..count]);
+        if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length: ")
+                .and_then(|value| value.parse::<usize>().ok())
+        })
+        .unwrap_or_default();
+    while request.len() < header_end + content_length {
+        let mut bytes = [0; 1024];
+        let count = socket.read(&mut bytes).await.unwrap();
+        request.extend_from_slice(&bytes[..count]);
+    }
+    request
 }
 
 async fn serve_websocket_connections(

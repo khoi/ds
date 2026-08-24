@@ -258,6 +258,23 @@ struct RequestReasoning {
     summary: ReasoningSummary,
 }
 
+#[derive(Clone)]
+struct SseRequest {
+    base_url: String,
+    model: String,
+    access_token: String,
+    account_id: String,
+    session_id: Option<String>,
+    json: Vec<u8>,
+    max_retries: usize,
+    max_retry_delay: Option<Duration>,
+    cancellation: CancellationToken,
+    connection_timeout: Option<Duration>,
+    first_event_timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
+    overall_deadline: Option<Instant>,
+}
+
 pub async fn stream(
     model: &Model,
     context: &Context,
@@ -298,6 +315,21 @@ pub async fn stream(
         serde_json::to_value(&request).map_err(|error| Error::InvalidRequest(error.to_string()))?;
     let json =
         serde_json::to_vec(&value).map_err(|error| Error::InvalidRequest(error.to_string()))?;
+    let sse_request = SseRequest {
+        base_url: model.base_url.clone(),
+        model: model.id.clone(),
+        access_token: options.access_token.clone(),
+        account_id: account_id.clone(),
+        session_id: session_id.clone(),
+        json,
+        max_retries: options.max_retries,
+        max_retry_delay: options.max_retry_delay,
+        cancellation: options.cancellation.clone(),
+        connection_timeout: options.connection_timeout,
+        first_event_timeout: options.first_event_timeout,
+        idle_timeout: options.idle_timeout,
+        overall_deadline,
+    };
     if options.transport != Transport::Sse {
         let mut websocket_value = value.clone();
         websocket_value
@@ -318,7 +350,27 @@ pub async fn stream(
         )
         .await
         {
-            Ok(stream) => return Ok(stream),
+            Ok(mut websocket) => {
+                let output = async_stream::stream! {
+                    match websocket.next().await {
+                        Some(event) if !should_fallback_to_sse(&event) => {
+                            yield event;
+                            while let Some(event) = websocket.next().await {
+                                yield event;
+                            }
+                        }
+                        Some(_) | None => match sse_stream(&sse_request).await {
+                            Ok(mut fallback) => {
+                                while let Some(event) = fallback.next().await {
+                                    yield event;
+                                }
+                            }
+                            Err(error) => yield Err(error),
+                        },
+                    }
+                };
+                return Ok(Box::pin(output));
+            }
             Err(WebSocketConnectError::Cancelled) => {
                 return Err(Error::Cancelled { partial: None });
             }
@@ -331,38 +383,42 @@ pub async fn stream(
             Err(WebSocketConnectError::Transport) => {}
         }
     }
-    let body = zstd::stream::encode_all(json.as_slice(), 3)
+    sse_stream(&sse_request).await
+}
+
+async fn sse_stream(request: &SseRequest) -> Result<ResponseStream, Error> {
+    let body = zstd::stream::encode_all(request.json.as_slice(), 3)
         .map_err(|error| Error::Compression(error.to_string()))?;
     let client = reqwest::Client::new();
-    let url = response_url(&model.base_url);
+    let url = response_url(&request.base_url);
     let response = transport::connect(
         retry::send(
             retry::Policy {
-                max_retries: options.max_retries,
-                max_delay: options.max_retry_delay,
-                cancellation: &options.cancellation,
+                max_retries: request.max_retries,
+                max_delay: request.max_retry_delay,
+                cancellation: &request.cancellation,
             },
             || {
-                let mut request = client
+                let mut builder = client
                     .post(&url)
-                    .bearer_auth(&options.access_token)
-                    .header("chatgpt-account-id", &account_id)
+                    .bearer_auth(&request.access_token)
+                    .header("chatgpt-account-id", &request.account_id)
                     .header("openai-beta", "responses=experimental")
                     .header("originator", "ds")
                     .header("user-agent", concat!("ds-ai/", env!("CARGO_PKG_VERSION")))
                     .header("accept", "text/event-stream")
                     .header("content-type", "application/json")
                     .header("content-encoding", "zstd");
-                if let Some(session_id) = &session_id {
-                    request = request
+                if let Some(session_id) = &request.session_id {
+                    builder = builder
                         .header("session-id", session_id)
                         .header("x-client-request-id", session_id);
                 }
-                request.body(body.clone()).send()
+                builder.body(body.clone()).send()
             },
         ),
-        options.connection_timeout,
-        overall_deadline,
+        request.connection_timeout,
+        request.overall_deadline,
     )
     .await?;
     if !response.status().is_success() {
@@ -370,12 +426,25 @@ pub async fn stream(
     }
     Ok(openai::decode_stream(
         response,
-        model.id.clone(),
-        options.cancellation.clone(),
-        options.first_event_timeout,
-        options.idle_timeout,
-        overall_deadline,
+        request.model.clone(),
+        request.cancellation.clone(),
+        request.first_event_timeout,
+        request.idle_timeout,
+        request.overall_deadline,
     ))
+}
+
+fn should_fallback_to_sse(event: &Result<crate::Event, Error>) -> bool {
+    match event {
+        Err(Error::Timeout {
+            phase: crate::TimeoutPhase::FirstEvent,
+            ..
+        }) => true,
+        Err(Error::Stream { partial, .. } | Error::IncompleteStream { partial }) => {
+            partial.id.is_none() && partial.content.is_empty()
+        }
+        _ => false,
+    }
 }
 
 enum WebSocketConnectError {
