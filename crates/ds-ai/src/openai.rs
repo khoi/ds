@@ -182,7 +182,7 @@ pub async fn stream(
         if status.is_success() {
             break response;
         }
-        if retries < options.max_retries && matches!(status.as_u16(), 408 | 409 | 429 | 500..=599) {
+        if retries < options.max_retries && is_retryable(&response) {
             retries += 1;
             let delay = response
                 .headers()
@@ -293,4 +293,16 @@ pub async fn stream(
     };
 
     Ok(Box::pin(output))
+}
+
+fn is_retryable(response: &reqwest::Response) -> bool {
+    match response
+        .headers()
+        .get("x-should-retry")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("true") => true,
+        Some("false") => false,
+        _ => matches!(response.status().as_u16(), 408 | 409 | 429 | 500..=599),
+    }
 }

@@ -255,3 +255,51 @@ async fn cancels_an_openai_retry_wait() {
     assert_eq!(error, ds_ai::Error::Cancelled);
     assert_eq!(server.request_count(), 1);
 }
+
+#[tokio::test]
+async fn follows_openai_retry_status_and_override_headers() {
+    let cases = [
+        (408, None, true),
+        (409, None, true),
+        (429, None, true),
+        (500, None, true),
+        (599, None, true),
+        (400, None, false),
+        (400, Some(("x-should-retry", "true")), true),
+        (500, Some(("x-should-retry", "false")), false),
+    ];
+
+    for (status, header, should_retry) in cases {
+        let mut failure = Reply::json(status, json!({"error": {"message": "failed"}}));
+        if let Some((name, value)) = header {
+            failure = failure.with_header(name, value);
+        }
+        let mut replies = vec![failure];
+        if should_retry {
+            replies.push(Reply::sse(format!(
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_{status}\",\"usage\":{{\"input_tokens\":0,\"input_tokens_details\":{{}},\"output_tokens\":0,\"output_tokens_details\":{{}}}}}}}}\n\n"
+            )));
+        }
+        let server = serve(replies).await;
+        let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+        let context = Context::new([Message::user("Hello")]);
+        let options = openai::Options::new("test-key").with_max_retries(1);
+
+        let result = openai::stream(&model, &context, &options).await;
+
+        if should_retry {
+            let events = result.unwrap().collect::<Vec<_>>().await;
+            assert!(matches!(events.as_slice(), [Ok(Event::Done(_))]));
+            assert_eq!(server.requests().await.len(), 2);
+        } else {
+            assert!(matches!(
+                result,
+                Err(ds_ai::Error::Provider {
+                    status: actual,
+                    ..
+                }) if actual == status
+            ));
+            assert_eq!(server.request_count(), 1);
+        }
+    }
+}
