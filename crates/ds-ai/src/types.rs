@@ -68,6 +68,8 @@ pub enum Error {
     Stream(String),
     #[error("provider stream ended before a terminal event")]
     IncompleteStream { partial: Response },
+    #[error("request cancelled")]
+    Cancelled,
 }
 
 pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send>>;

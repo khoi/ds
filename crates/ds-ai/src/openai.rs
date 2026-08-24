@@ -3,6 +3,7 @@ use async_stream::stream;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -29,6 +30,7 @@ impl Model {
 pub struct Options {
     api_key: String,
     max_retries: usize,
+    cancellation: CancellationToken,
 }
 
 impl Options {
@@ -36,11 +38,17 @@ impl Options {
         Self {
             api_key: api_key.into(),
             max_retries: 0,
+            cancellation: CancellationToken::new(),
         }
     }
 
     pub fn with_max_retries(mut self, max_retries: usize) -> Self {
         self.max_retries = max_retries;
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
         self
     }
 }
@@ -184,7 +192,10 @@ pub async fn stream(
                 .map(Duration::from_millis)
                 .unwrap_or_default();
             if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = options.cancellation.cancelled() => return Err(Error::Cancelled),
+                }
             }
             continue;
         }

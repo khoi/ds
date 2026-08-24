@@ -225,3 +225,33 @@ async fn waits_for_openai_retry_after_milliseconds() {
     assert!(matches!(events.as_slice(), [Ok(Event::Done(_))]));
     assert_eq!(server.requests().await.len(), 2);
 }
+
+#[tokio::test(start_paused = true)]
+async fn cancels_an_openai_retry_wait() {
+    let server = serve([
+        Reply::json(
+            429,
+            json!({"error": {"type": "rate_limit_error", "message": "retry"}}),
+        )
+        .with_header("retry-after-ms", "60000"),
+        Reply::sse(Vec::new()),
+    ])
+    .await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let options = openai::Options::new("test-key")
+        .with_max_retries(1)
+        .with_cancellation(cancellation.clone());
+    let task = tokio::spawn(async move { openai::stream(&model, &context, &options).await });
+
+    server.wait_for_requests(1).await;
+    cancellation.cancel();
+    let error = match task.await.unwrap() {
+        Ok(_) => panic!("retry wait did not cancel"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error, ds_ai::Error::Cancelled);
+    assert_eq!(server.request_count(), 1);
+}
