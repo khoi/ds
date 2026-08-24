@@ -535,6 +535,70 @@ async fn streams_openai_reasoning_and_text_in_content_order() {
     );
 }
 
+#[tokio::test]
+async fn replays_serialized_openai_reasoning_and_message_items() {
+    let first_sse = [
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_first\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_replay\",\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"Need answer.\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_replay\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Need answer.\"}],\"encrypted_content\":\"encrypted\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"msg_replay\",\"type\":\"message\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"Hello\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"msg_replay\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}],\"phase\":\"final_answer\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_first\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{},\"output_tokens\":2,\"output_tokens_details\":{\"reasoning_tokens\":1}}}}\n\n",
+    ]
+    .concat();
+    let first_server = serve([Reply::sse(first_sse)]).await;
+    let first_model = openai::Model::new("gpt-5.6").with_base_url(&first_server.base_url);
+    let first_context = Context::new([Message::user("Hello")]);
+    let options = openai::Options::new("test-key");
+    let first_events = openai::stream(&first_model, &first_context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    let response =
+        serde_json::from_value(serde_json::to_value(done(&first_events)).unwrap()).unwrap();
+    first_server.requests().await;
+
+    let second_sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_second\",\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
+    let second_server = serve([Reply::sse(second_sse)]).await;
+    let second_model = openai::Model::new("gpt-5.6").with_base_url(&second_server.base_url);
+    let second_context = Context::new([Message::assistant(response), Message::user("Continue")]);
+
+    openai::stream(&second_model, &second_context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    let request = second_server.requests().await.pop().unwrap();
+    let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        body["input"],
+        json!([
+            {
+                "type": "reasoning",
+                "id": "rs_replay",
+                "summary": [{"type": "summary_text", "text": "Need answer."}],
+                "encrypted_content": "encrypted"
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hello", "annotations": []}],
+                "status": "completed",
+                "id": "msg_replay",
+                "phase": "final_answer"
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Continue"}]
+            }
+        ])
+    );
+}
+
 fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {
     match events.last() {
         Some(Ok(Event::Done(response))) => response,

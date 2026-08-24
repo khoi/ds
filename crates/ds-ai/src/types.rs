@@ -6,11 +6,16 @@ use thiserror::Error;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     User(String),
+    Assistant(Response),
 }
 
 impl Message {
     pub fn user(content: impl Into<String>) -> Self {
         Self::User(content.into())
+    }
+
+    pub fn assistant(response: Response) -> Self {
+        Self::Assistant(response)
     }
 }
 
@@ -51,6 +56,60 @@ pub struct Response {
     pub id: Option<String>,
     pub content: Vec<Content>,
     pub usage: Usage,
+    #[serde(default, rename = "_provider")]
+    provider: ProviderState,
+}
+
+impl Response {
+    pub(crate) fn openai(model: String) -> Self {
+        Self {
+            provider: ProviderState::OpenAi(OpenAiState {
+                model,
+                items: Vec::new(),
+            }),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn openai_items(&self, model: &str) -> Option<&[OpenAiReplay]> {
+        match &self.provider {
+            ProviderState::OpenAi(state) if state.model == model => Some(&state.items),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn add_openai_item(&mut self, item: OpenAiReplay) {
+        if let ProviderState::OpenAi(state) = &mut self.provider {
+            state.items.push(item);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+enum ProviderState {
+    #[default]
+    None,
+    OpenAi(OpenAiState),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct OpenAiState {
+    model: String,
+    items: Vec<OpenAiReplay>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum OpenAiReplay {
+    Reasoning {
+        content_index: usize,
+        id: String,
+        encrypted_content: Option<String>,
+    },
+    Message {
+        content_index: usize,
+        id: String,
+        phase: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

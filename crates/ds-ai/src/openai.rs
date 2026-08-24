@@ -1,4 +1,7 @@
-use crate::{Content, Context, Error, Event, Message, Response, ResponseStream, Usage, retry, sse};
+use crate::{
+    Content, Context, Error, Event, Message, Response, ResponseStream, Usage, retry, sse,
+    types::OpenAiReplay,
+};
 use async_stream::stream;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -64,21 +67,62 @@ impl Options {
 #[derive(Serialize)]
 struct Request<'a> {
     model: &'a str,
-    input: Vec<RequestMessage<'a>>,
+    input: Vec<RequestItem<'a>>,
     stream: bool,
     store: bool,
 }
 
 #[derive(Serialize)]
-struct RequestMessage<'a> {
-    role: &'static str,
-    content: Vec<RequestContent<'a>>,
+#[serde(untagged)]
+enum RequestItem<'a> {
+    User(RequestUser<'a>),
+    Reasoning(RequestReasoning<'a>),
+    Assistant(RequestAssistant<'a>),
 }
 
 #[derive(Serialize)]
-struct RequestContent<'a> {
+struct RequestUser<'a> {
+    role: &'static str,
+    content: [RequestUserContent<'a>; 1],
+}
+
+#[derive(Serialize)]
+struct RequestUserContent<'a> {
     r#type: &'static str,
     text: &'a str,
+}
+
+#[derive(Serialize)]
+struct RequestReasoning<'a> {
+    r#type: &'static str,
+    id: &'a str,
+    summary: [RequestSummary<'a>; 1],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encrypted_content: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct RequestSummary<'a> {
+    r#type: &'static str,
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+struct RequestAssistant<'a> {
+    r#type: &'static str,
+    role: &'static str,
+    content: [RequestAssistantContent<'a>; 1],
+    status: &'static str,
+    id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct RequestAssistantContent<'a> {
+    r#type: &'static str,
+    text: &'a str,
+    annotations: [(); 0],
 }
 
 #[derive(Deserialize)]
@@ -113,11 +157,14 @@ struct IdentifiedResponse {
 
 #[derive(Deserialize)]
 struct OutputItem {
+    id: Option<String>,
     r#type: String,
     #[serde(default)]
     content: Vec<OutputContent>,
     #[serde(default)]
     summary: Vec<SummaryContent>,
+    encrypted_content: Option<String>,
+    phase: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -170,19 +217,81 @@ pub async fn stream(
     context: &Context,
     options: &Options,
 ) -> Result<ResponseStream, Error> {
-    let input = context
-        .messages()
-        .iter()
-        .map(|message| match message {
-            Message::User(text) => RequestMessage {
+    let mut input = Vec::new();
+    for message in context.messages() {
+        match message {
+            Message::User(text) => input.push(RequestItem::User(RequestUser {
                 role: "user",
-                content: vec![RequestContent {
+                content: [RequestUserContent {
                     r#type: "input_text",
                     text,
                 }],
-            },
-        })
-        .collect();
+            })),
+            Message::Assistant(response) => {
+                let Some(items) = response.openai_items(&model.id) else {
+                    continue;
+                };
+                for (content_index, content) in response.content.iter().enumerate() {
+                    match content {
+                        Content::Reasoning(text) => {
+                            let Some(OpenAiReplay::Reasoning {
+                                id,
+                                encrypted_content,
+                                ..
+                            }) = items.iter().find(|item| {
+                                matches!(
+                                    item,
+                                    OpenAiReplay::Reasoning {
+                                        content_index: index,
+                                        ..
+                                    } if *index == content_index
+                                )
+                            })
+                            else {
+                                continue;
+                            };
+                            input.push(RequestItem::Reasoning(RequestReasoning {
+                                r#type: "reasoning",
+                                id,
+                                summary: [RequestSummary {
+                                    r#type: "summary_text",
+                                    text,
+                                }],
+                                encrypted_content: encrypted_content.as_deref(),
+                            }));
+                        }
+                        Content::Text(text) => {
+                            let Some(OpenAiReplay::Message { id, phase, .. }) =
+                                items.iter().find(|item| {
+                                    matches!(
+                                        item,
+                                        OpenAiReplay::Message {
+                                            content_index: index,
+                                            ..
+                                        } if *index == content_index
+                                    )
+                                })
+                            else {
+                                continue;
+                            };
+                            input.push(RequestItem::Assistant(RequestAssistant {
+                                r#type: "message",
+                                role: "assistant",
+                                content: [RequestAssistantContent {
+                                    r#type: "output_text",
+                                    text,
+                                    annotations: [],
+                                }],
+                                status: "completed",
+                                id,
+                                phase: phase.as_deref(),
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
     let request = Request {
         model: &model.id,
         input,
@@ -215,10 +324,11 @@ pub async fn stream(
         });
     }
 
+    let response_model = model.id.clone();
     let output = stream! {
         let mut chunks = response.bytes_stream();
         let mut decoder = sse::Decoder::default();
-        let mut result = Response::default();
+        let mut result = Response::openai(response_model);
         let mut slots = HashMap::new();
 
         while let Some(chunk) = chunks.next().await {
@@ -295,6 +405,13 @@ pub async fn stream(
                         if !text.is_empty() {
                             result.content[*content_index] = Content::Text(text);
                         }
+                        if let Some(id) = item.id {
+                            result.add_openai_item(OpenAiReplay::Message {
+                                content_index: *content_index,
+                                id,
+                                phase: item.phase,
+                            });
+                        }
                     }
                     StreamEvent::OutputItemDone { output_index, item } if item.r#type == "reasoning" => {
                         let Some(Slot::Reasoning(content_index)) = slots.get(&output_index) else {
@@ -308,6 +425,13 @@ pub async fn stream(
                             .join("\n\n");
                         if !summary.is_empty() {
                             result.content[*content_index] = Content::Reasoning(summary);
+                        }
+                        if let Some(id) = item.id {
+                            result.add_openai_item(OpenAiReplay::Reasoning {
+                                content_index: *content_index,
+                                id,
+                                encrypted_content: item.encrypted_content,
+                            });
                         }
                     }
                     StreamEvent::Completed { response } => {
