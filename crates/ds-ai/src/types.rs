@@ -235,6 +235,23 @@ impl Response {
         }
     }
 
+    pub(crate) fn backfill_openai_reasoning(&mut self, id: &str, encrypted: &str) {
+        let ProviderState::OpenAi(state) = &mut self.provider else {
+            return;
+        };
+        let Some(OpenAiReplay::Reasoning {
+            encrypted_content, ..
+        }) = state.items.iter_mut().find(
+            |item| matches!(item, OpenAiReplay::Reasoning { id: item_id, .. } if item_id == id),
+        )
+        else {
+            return;
+        };
+        if encrypted_content.is_none() {
+            *encrypted_content = Some(encrypted.to_owned());
+        }
+    }
+
     pub(crate) fn anthropic(model: String) -> Self {
         Self {
             provider: ProviderState::Anthropic(AnthropicState {

@@ -1,5 +1,7 @@
-use crate::{Error, RateLimits, ResponseMetadata, retry};
+use crate::{Error, RateLimits, ResponseMetadata, TimeoutPhase, retry, transport};
 use reqwest::{Response, header::HeaderMap};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) fn metadata(headers: &HeaderMap) -> ResponseMetadata {
     ResponseMetadata {
@@ -15,11 +17,25 @@ pub(crate) fn metadata(headers: &HeaderMap) -> ResponseMetadata {
     }
 }
 
-pub(crate) async fn provider_error(response: Response) -> Error {
+pub(crate) async fn provider_error(
+    response: Response,
+    response_metadata: ResponseMetadata,
+    cancellation: &CancellationToken,
+    overall_deadline: Option<Instant>,
+) -> Error {
     let status = response.status().as_u16();
-    let response_metadata = metadata(response.headers());
     let retry_after = retry::requested_delay(response.headers());
-    let body = response.text().await.unwrap_or_default();
+    let body = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Error::Cancelled { partial: None },
+        _ = transport::wait_until(overall_deadline) => {
+            return Error::Timeout {
+                phase: TimeoutPhase::Overall,
+                partial: None,
+            };
+        }
+        body = response.text() => body.unwrap_or_default(),
+    };
     let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
     let code = parsed
         .as_ref()
@@ -52,13 +68,13 @@ pub(crate) async fn provider_error(response: Response) -> Error {
     }
 }
 
-fn header(headers: &HeaderMap, name: &'static str) -> Option<String> {
+pub(crate) fn header(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
 }
 
-fn header_u64(headers: &HeaderMap, name: &'static str) -> Option<u64> {
+pub(crate) fn header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
     header(headers, name).and_then(|value| value.parse().ok())
 }

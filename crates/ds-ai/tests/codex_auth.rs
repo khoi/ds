@@ -117,6 +117,26 @@ async fn cancels_an_active_codex_refresh() {
 }
 
 #[tokio::test]
+async fn cancels_a_codex_refresh_while_reading_the_token_body() {
+    let server = serve([Reply::open_json(200, json!({"access_token": "unfinished"}))]).await;
+    let client = Client::new().with_base_url(&server.base_url);
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let refresh =
+        tokio::spawn(async move { client.refresh("refresh_wait", &task_cancellation).await });
+    server.wait_for_requests(1).await;
+    tokio::task::yield_now().await;
+
+    cancellation.cancel();
+
+    assert!(matches!(
+        refresh.await.unwrap(),
+        Err(ds_ai::codex::auth::Error::Cancelled)
+    ));
+    server.requests().await;
+}
+
+#[tokio::test]
 async fn logs_in_with_a_manual_codex_redirect() {
     let server = serve([Reply::json(
         200,

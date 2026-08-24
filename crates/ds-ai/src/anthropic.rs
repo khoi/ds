@@ -1,6 +1,7 @@
 use crate::{
-    CacheRetention, Content, Context, Error, Event, InputContent, Message, Response,
-    ResponseStream, StopReason, ToolResult, Usage, http, json, retry, schema, transport,
+    CacheRetention, Content, Context, Error, Event, InputContent, Message, RateLimits, Response,
+    ResponseMetadata, ResponseStream, StopReason, ToolResult, Usage, http, json, retry, schema,
+    transport,
     types::{AnthropicReasoning, normalize_id},
 };
 use async_stream::stream;
@@ -436,10 +437,17 @@ pub async fn stream(
     )
     .await?;
     if !response.status().is_success() {
-        return Err(http::provider_error(response).await);
+        let metadata = metadata(response.headers());
+        return Err(http::provider_error(
+            response,
+            metadata,
+            &options.cancellation,
+            overall_deadline,
+        )
+        .await);
     }
 
-    let metadata = http::metadata(response.headers());
+    let metadata = metadata(response.headers());
     let response_model = model.id.clone();
     let stream_cancellation = options.cancellation.clone();
     let first_event_timeout = options.first_event_timeout;
@@ -698,6 +706,19 @@ pub async fn stream(
         yield Err(Error::IncompleteStream { partial: result });
     };
     Ok(Box::pin(output))
+}
+
+fn metadata(headers: &reqwest::header::HeaderMap) -> ResponseMetadata {
+    let mut metadata = http::metadata(headers);
+    metadata.rate_limits = RateLimits {
+        limit_requests: http::header_u64(headers, "anthropic-ratelimit-requests-limit"),
+        remaining_requests: http::header_u64(headers, "anthropic-ratelimit-requests-remaining"),
+        reset_requests: http::header(headers, "anthropic-ratelimit-requests-reset"),
+        limit_tokens: http::header_u64(headers, "anthropic-ratelimit-tokens-limit"),
+        remaining_tokens: http::header_u64(headers, "anthropic-ratelimit-tokens-remaining"),
+        reset_tokens: http::header(headers, "anthropic-ratelimit-tokens-reset"),
+    };
+    metadata
 }
 
 fn messages(

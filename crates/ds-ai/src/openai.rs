@@ -249,6 +249,10 @@ enum StreamEvent {
     OutputTextDelta { output_index: usize, delta: String },
     #[serde(rename = "response.reasoning_summary_text.delta")]
     ReasoningSummaryTextDelta { output_index: usize, delta: String },
+    #[serde(rename = "response.reasoning_text.delta")]
+    ReasoningTextDelta { output_index: usize, delta: String },
+    #[serde(rename = "response.refusal.delta")]
+    RefusalDelta { output_index: usize, delta: String },
     #[serde(rename = "response.function_call_arguments.delta")]
     FunctionCallArgumentsDelta { output_index: usize, delta: String },
     #[serde(rename = "response.function_call_arguments.done")]
@@ -302,6 +306,8 @@ struct OutputContent {
     r#type: String,
     #[serde(default)]
     text: String,
+    #[serde(default)]
+    refusal: String,
 }
 
 #[derive(Deserialize)]
@@ -328,6 +334,8 @@ struct CompletedResponse {
     error: Option<FailedDetail>,
     #[serde(default)]
     usage: CompletedUsage,
+    #[serde(default)]
+    output: Vec<OutputItem>,
 }
 
 #[derive(Deserialize)]
@@ -338,6 +346,8 @@ struct IncompleteResponse {
     incomplete_details: IncompleteDetails,
     #[serde(default)]
     usage: CompletedUsage,
+    #[serde(default)]
+    output: Vec<OutputItem>,
 }
 
 #[derive(Deserialize)]
@@ -468,7 +478,14 @@ pub async fn stream(
     )
     .await?;
     if !response.status().is_success() {
-        return Err(http::provider_error(response).await);
+        let metadata = http::metadata(response.headers());
+        return Err(http::provider_error(
+            response,
+            metadata,
+            &options.cancellation,
+            overall_deadline,
+        )
+        .await);
     }
     Ok(decode_stream(
         response,
@@ -726,7 +743,8 @@ pub(crate) fn decode_events(
                             _ => {}
                         }
                     }
-                    StreamEvent::OutputTextDelta { output_index, delta } => {
+                    StreamEvent::OutputTextDelta { output_index, delta }
+                    | StreamEvent::RefusalDelta { output_index, delta } => {
                         let Some(Slot::Text(content_index)) = slots.get(&output_index) else {
                             continue;
                         };
@@ -735,7 +753,8 @@ pub(crate) fn decode_events(
                         }
                         yield Ok(Event::TextDelta { content_index: *content_index, delta });
                     }
-                    StreamEvent::ReasoningSummaryTextDelta { output_index, delta } => {
+                    StreamEvent::ReasoningSummaryTextDelta { output_index, delta }
+                    | StreamEvent::ReasoningTextDelta { output_index, delta } => {
                         let Some(Slot::Reasoning(content_index)) = slots.get(&output_index) else {
                             continue;
                         };
@@ -777,8 +796,11 @@ pub(crate) fn decode_events(
                         let text = item
                             .content
                             .iter()
-                            .filter(|content| content.r#type == "output_text")
-                            .map(|content| content.text.as_str())
+                            .filter_map(|content| match content.r#type.as_str() {
+                                "output_text" => Some(content.text.as_str()),
+                                "refusal" => Some(content.refusal.as_str()),
+                                _ => None,
+                            })
                             .collect::<String>();
                         if !text.is_empty() {
                             result.content[*content_index] = Content::Text(text);
@@ -801,8 +823,15 @@ pub(crate) fn decode_events(
                             .map(|content| content.text.as_str())
                             .collect::<Vec<_>>()
                             .join("\n\n");
-                        if !summary.is_empty() {
-                            result.content[*content_index] = Content::Reasoning(summary);
+                        let content = item
+                            .content
+                            .iter()
+                            .map(|content| content.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        let reasoning = if summary.is_empty() { content } else { summary };
+                        if !reasoning.is_empty() {
+                            result.content[*content_index] = Content::Reasoning(reasoning);
                         }
                         if let Some(id) = item.id {
                             result.add_openai_item(OpenAiReplay::Reasoning {
@@ -835,6 +864,7 @@ pub(crate) fn decode_events(
                         }
                     }
                     StreamEvent::Completed { response } => {
+                        backfill_reasoning(&mut result, &response.output);
                         if response.id.is_some() {
                             result.id = response.id;
                         }
@@ -893,6 +923,7 @@ pub(crate) fn decode_events(
                     StreamEvent::Incomplete { response }
                         if response.incomplete_details.reason == "max_output_tokens" =>
                     {
+                        backfill_reasoning(&mut result, &response.output);
                         if response.id.is_some() {
                             result.id = response.id;
                         }
@@ -905,6 +936,7 @@ pub(crate) fn decode_events(
                         return;
                     }
                     StreamEvent::Incomplete { response } => {
+                        backfill_reasoning(&mut result, &response.output);
                         let reason = response.incomplete_details.reason;
                         if response.id.is_some() {
                             result.id = response.id;
@@ -968,6 +1000,17 @@ pub(crate) fn decode_events(
 
 fn parse_arguments(arguments: &str) -> serde_json::Value {
     json::value(arguments)
+}
+
+fn backfill_reasoning(result: &mut Response, output: &[OutputItem]) {
+    for item in output {
+        let (Some(id), Some(encrypted)) = (&item.id, &item.encrypted_content) else {
+            continue;
+        };
+        if item.r#type == "reasoning" {
+            result.backfill_openai_reasoning(id, encrypted);
+        }
+    }
 }
 
 pub(crate) fn clamp_cache_key(key: &str) -> String {

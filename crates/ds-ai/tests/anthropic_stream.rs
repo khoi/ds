@@ -17,7 +17,15 @@ async fn streams_anthropic_text_until_message_stop() {
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
     ]
     .concat();
-    let server = serve([Reply::sse(sse).with_header("request-id", "req_anthropic")]).await;
+    let server = serve([Reply::sse(sse)
+        .with_header("request-id", "req_anthropic")
+        .with_header("anthropic-ratelimit-requests-limit", "100")
+        .with_header("anthropic-ratelimit-requests-remaining", "90")
+        .with_header("anthropic-ratelimit-requests-reset", "2026-08-24T12:00:00Z")
+        .with_header("anthropic-ratelimit-tokens-limit", "10000")
+        .with_header("anthropic-ratelimit-tokens-remaining", "9000")
+        .with_header("anthropic-ratelimit-tokens-reset", "2026-08-24T12:01:00Z")])
+    .await;
     let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
     let context = Context::new([Message::user("Hello")]).with_system("Be brief");
     let options = anthropic::Options::new("test-key").with_max_tokens(1024);
@@ -48,6 +56,18 @@ async fn streams_anthropic_text_until_message_stop() {
         response.metadata.request_id.as_deref(),
         Some("req_anthropic")
     );
+    assert_eq!(response.metadata.rate_limits.limit_requests, Some(100));
+    assert_eq!(response.metadata.rate_limits.remaining_requests, Some(90));
+    assert_eq!(
+        response.metadata.rate_limits.reset_requests.as_deref(),
+        Some("2026-08-24T12:00:00Z")
+    );
+    assert_eq!(response.metadata.rate_limits.limit_tokens, Some(10000));
+    assert_eq!(response.metadata.rate_limits.remaining_tokens, Some(9000));
+    assert_eq!(
+        response.metadata.rate_limits.reset_tokens.as_deref(),
+        Some("2026-08-24T12:01:00Z")
+    );
 
     let request = server.requests().await.pop().unwrap();
     assert!(request.starts_with("POST /v1/messages HTTP/1.1\r\n"));
@@ -75,6 +95,43 @@ async fn streams_anthropic_text_until_message_stop() {
             "stream": true
         })
     );
+}
+
+#[tokio::test]
+async fn preserves_anthropic_http_error_rate_limits() {
+    let server = serve([Reply::json(
+        429,
+        json!({"error": {"type": "rate_limit_error", "message": "Too many requests"}}),
+    )
+    .with_header("request-id", "req_anthropic_failure")
+    .with_header("anthropic-ratelimit-requests-limit", "100")
+    .with_header("anthropic-ratelimit-requests-remaining", "0")
+    .with_header("anthropic-ratelimit-tokens-limit", "10000")
+    .with_header("anthropic-ratelimit-tokens-remaining", "200")])
+    .await;
+    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+
+    match anthropic::stream(
+        &model,
+        &Context::new([Message::user("Hello")]),
+        &anthropic::Options::new("test-key"),
+    )
+    .await
+    {
+        Err(ds_ai::Error::Provider {
+            request_id,
+            rate_limits,
+            ..
+        }) => {
+            assert_eq!(request_id.as_deref(), Some("req_anthropic_failure"));
+            assert_eq!(rate_limits.limit_requests, Some(100));
+            assert_eq!(rate_limits.remaining_requests, Some(0));
+            assert_eq!(rate_limits.limit_tokens, Some(10000));
+            assert_eq!(rate_limits.remaining_tokens, Some(200));
+        }
+        _ => panic!("unexpected provider result"),
+    }
+    server.requests().await;
 }
 
 #[tokio::test]

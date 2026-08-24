@@ -537,16 +537,65 @@ async fn streams_openai_reasoning_and_text_in_content_order() {
 }
 
 #[tokio::test]
+async fn streams_openai_reasoning_text_and_refusal_content() {
+    let sse = [
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_text\",\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+        "data: {\"type\":\"response.reasoning_text.delta\",\"output_index\":0,\"delta\":\"Private\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_text\",\"type\":\"reasoning\",\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"Private\"}]}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"msg_refusal\",\"type\":\"message\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.refusal.delta\",\"output_index\":1,\"delta\":\"Denied\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"msg_refusal\",\"type\":\"message\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"Denied\"}]}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_variants\",\"usage\":{}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+
+    let events = openai::stream(
+        &model,
+        &Context::new([Message::user("Answer")]),
+        &openai::Options::new("test-key"),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+
+    assert_eq!(
+        events.first(),
+        Some(&Ok(Event::ReasoningDelta {
+            content_index: 0,
+            delta: "Private".into(),
+        }))
+    );
+    assert_eq!(
+        events.get(1),
+        Some(&Ok(Event::TextDelta {
+            content_index: 1,
+            delta: "Denied".into(),
+        }))
+    );
+    assert_eq!(
+        done(&events).content,
+        [
+            ds_ai::Content::Reasoning("Private".into()),
+            ds_ai::Content::Text("Denied".into()),
+        ]
+    );
+    server.requests().await;
+}
+
+#[tokio::test]
 async fn replays_serialized_openai_reasoning_and_message_items() {
     let first_sse = [
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_first\"}}\n\n",
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_replay\",\"type\":\"reasoning\",\"summary\":[]}}\n\n",
         "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"Need answer.\"}\n\n",
-        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_replay\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Need answer.\"}],\"encrypted_content\":\"encrypted\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_replay\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Need answer.\"}]}}\n\n",
         "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"msg_replay\",\"type\":\"message\",\"content\":[]}}\n\n",
         "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"Hello\"}\n\n",
         "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"msg_replay\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}],\"phase\":\"final_answer\"}}\n\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_first\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{},\"output_tokens\":2,\"output_tokens_details\":{\"reasoning_tokens\":1}}}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_first\",\"output\":[{\"id\":\"rs_replay\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Need answer.\"}],\"encrypted_content\":\"encrypted\"}],\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{},\"output_tokens\":2,\"output_tokens_details\":{\"reasoning_tokens\":1}}}}\n\n",
     ]
     .concat();
     let first_server = serve([Reply::sse(first_sse)]).await;
@@ -1095,6 +1144,30 @@ async fn cancels_an_openai_request_before_response_headers() {
 }
 
 #[tokio::test]
+async fn cancels_while_reading_an_openai_error_body() {
+    let server = serve([Reply::open_json(
+        500,
+        json!({"error": {"message": "unfinished"}}),
+    )])
+    .await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let options = openai::Options::new("test-key").with_cancellation(cancellation.clone());
+    let request = tokio::spawn(async move { openai::stream(&model, &context, &options).await });
+    server.wait_for_requests(1).await;
+    tokio::task::yield_now().await;
+
+    cancellation.cancel();
+
+    assert!(matches!(
+        request.await.unwrap(),
+        Err(ds_ai::Error::Cancelled { partial: None })
+    ));
+    server.requests().await;
+}
+
+#[tokio::test]
 async fn cancels_an_active_openai_stream_with_partial_content() {
     let sse = [
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cancel\"}}\n\n",
@@ -1147,6 +1220,28 @@ async fn times_out_an_openai_request_before_response_headers() {
         }
         _ => panic!("request did not time out"),
     }
+}
+
+#[tokio::test]
+async fn times_out_while_reading_an_openai_error_body() {
+    let server = serve([Reply::open_json(
+        500,
+        json!({"error": {"message": "unfinished"}}),
+    )])
+    .await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options =
+        openai::Options::new("test-key").with_overall_timeout(std::time::Duration::from_millis(50));
+
+    assert!(matches!(
+        openai::stream(&model, &context, &options).await,
+        Err(ds_ai::Error::Timeout {
+            phase: ds_ai::TimeoutPhase::Overall,
+            partial: None,
+        })
+    ));
+    server.requests().await;
 }
 
 #[tokio::test(start_paused = true)]

@@ -57,6 +57,13 @@ impl Reply {
         }
     }
 
+    pub(crate) fn open_json(status: u16, body: Value) -> Self {
+        Self {
+            finish: false,
+            ..Self::json(status, body)
+        }
+    }
+
     pub(crate) fn disconnect() -> Self {
         Self {
             status: 0,

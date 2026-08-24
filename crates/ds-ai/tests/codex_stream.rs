@@ -467,36 +467,54 @@ async fn replaces_a_stale_cached_codex_websocket() {
 
 #[tokio::test]
 async fn expires_an_idle_cached_codex_websocket() {
-    let (base_url, capture) = serve_kept_websocket_connections([
-        text_events("resp_idle_seed", "msg_idle_seed", "First"),
-        text_events("resp_idle_fresh", "msg_idle_fresh", "Second"),
-    ])
-    .await;
+    let (base_url, closed) =
+        serve_one_shot_websocket(text_events("resp_idle", "msg_idle", "Done")).await;
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
     let options = codex::Options::new(token("acc_idle"))
         .with_session_id("session_idle")
         .with_websocket_cache_ttl(Duration::from_millis(10))
         .with_transport(codex::Transport::WebSocket);
+    let events = codex::stream(&model, &Context::new([Message::user("Connect")]), &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert_eq!(done(&events).content, [ds_ai::Content::Text("Done".into())]);
+    assert!(closed.await.unwrap());
+}
+
+#[tokio::test]
+async fn evicts_a_cached_codex_websocket_after_stream_failure() {
+    let (base_url, evicted) = serve_failed_then_fresh_websockets().await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let options = codex::Options::new(token("acc_failed_cache"))
+        .with_session_id("session_failed_cache")
+        .with_idle_timeout(Duration::from_millis(10))
+        .with_transport(codex::Transport::WebSocket);
     let context = Context::new([Message::user("Connect")]);
-    let first = codex::stream(&model, &context, &options)
+
+    let failed = codex::stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
         .await;
-    assert_eq!(done(&first).content, [ds_ai::Content::Text("First".into())]);
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(matches!(
+        failed.last(),
+        Some(Err(ds_ai::Error::Timeout {
+            phase: ds_ai::TimeoutPhase::Idle,
+            ..
+        }))
+    ));
 
-    let second = codex::stream(&model, &context, &options)
+    let fresh = codex::stream(&model, &context, &options)
         .await
         .unwrap()
         .collect::<Vec<_>>()
         .await;
 
-    assert_eq!(
-        done(&second).content,
-        [ds_ai::Content::Text("Second".into())]
-    );
-    assert_eq!(capture.await.unwrap().len(), 2);
+    assert_eq!(done(&fresh).content, [ds_ai::Content::Text("Fresh".into())]);
+    assert!(evicted.await.unwrap());
 }
 
 #[tokio::test]
@@ -819,6 +837,50 @@ async fn serve_one_shot_websocket(
             Ok(Some(Ok(WebSocketMessage::Close(_))))
         );
         sender.send(closed).ok();
+    });
+    (format!("http://{address}"), receiver)
+}
+
+async fn serve_failed_then_fresh_websockets() -> (String, oneshot::Receiver<bool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sender, receiver) = oneshot::channel();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        assert!(matches!(
+            socket.next().await,
+            Some(Ok(WebSocketMessage::Text(_)))
+        ));
+        socket
+            .send(WebSocketMessage::Text(
+                json!({"type": "response.created", "response": {"id": "resp_failed"}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let evicted = matches!(
+            tokio::time::timeout(Duration::from_secs(1), socket.next()).await,
+            Ok(Some(Ok(WebSocketMessage::Close(_))))
+        );
+        if !evicted {
+            sender.send(false).ok();
+            return;
+        }
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        assert!(matches!(
+            socket.next().await,
+            Some(Ok(WebSocketMessage::Text(_)))
+        ));
+        for event in text_events("resp_fresh", "msg_fresh", "Fresh") {
+            socket
+                .send(WebSocketMessage::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        sender.send(true).ok();
     });
     (format!("http://{address}"), receiver)
 }

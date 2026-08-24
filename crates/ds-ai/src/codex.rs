@@ -48,6 +48,39 @@ struct Continuation {
     response_items: Vec<serde_json::Value>,
 }
 
+struct WebSocketLease {
+    key: Option<String>,
+}
+
+impl WebSocketLease {
+    fn new(key: Option<String>) -> Self {
+        Self { key }
+    }
+
+    fn release(&mut self) -> Option<String> {
+        self.key.take()
+    }
+
+    fn evict(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let connection = websockets()
+            .lock()
+            .expect("websocket cache lock")
+            .remove(&key);
+        if let Some(connection) = connection {
+            close_websocket(connection);
+        }
+    }
+}
+
+impl Drop for WebSocketLease {
+    fn drop(&mut self) {
+        self.evict();
+    }
+}
+
 static WEBSOCKETS: OnceLock<StdMutex<HashMap<String, CachedWebSocket>>> = OnceLock::new();
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -422,7 +455,14 @@ async fn sse_stream(request: &SseRequest) -> Result<ResponseStream, Error> {
     )
     .await?;
     if !response.status().is_success() {
-        return Err(http::provider_error(response).await);
+        let metadata = http::metadata(response.headers());
+        return Err(http::provider_error(
+            response,
+            metadata,
+            &request.cancellation,
+            request.overall_deadline,
+        )
+        .await);
     }
     Ok(openai::decode_stream(
         response,
@@ -513,6 +553,7 @@ async fn websocket_stream(
         }
         connection
     };
+    let mut lease = WebSocketLease::new(cache_key.clone());
     let CachedWebSocket {
         socket,
         metadata,
@@ -528,6 +569,7 @@ async fn websocket_stream(
         }
         socket = socket.lock_owned() => socket,
     };
+    *last_used.lock().expect("websocket last-used lock") = Instant::now();
     let full_request = request.body;
     let full_body =
         serde_json::to_string(&full_request).map_err(|_| WebSocketConnectError::Transport)?;
@@ -784,11 +826,30 @@ async fn websocket_stream(
             }
         }
     };
-    Ok(openai::decode_events(
-        Box::pin(events),
-        request.model.to_owned(),
-        metadata,
-    ))
+    let mut decoded = openai::decode_events(Box::pin(events), request.model.to_owned(), metadata);
+    let websocket_cache_ttl = options.websocket_cache_ttl;
+    let output = async_stream::stream! {
+        while let Some(event) = decoded.next().await {
+            match event {
+                Ok(crate::Event::Done(response)) => {
+                    drop(decoded);
+                    if let Some(key) = lease.release() {
+                        schedule_websocket_expiry(key, websocket_cache_ttl);
+                    }
+                    yield Ok(crate::Event::Done(response));
+                    return;
+                }
+                Err(error) => {
+                    drop(decoded);
+                    lease.evict();
+                    yield Err(error);
+                    return;
+                }
+                Ok(event) => yield Ok(event),
+            }
+        }
+    };
+    Ok(Box::pin(output))
 }
 
 async fn connect_websocket(
@@ -940,6 +1001,60 @@ fn normalize_codex_error(data: String) -> String {
 
 fn websockets() -> &'static StdMutex<HashMap<String, CachedWebSocket>> {
     WEBSOCKETS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn close_websocket(connection: CachedWebSocket) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    runtime.spawn(async move {
+        let mut socket = connection.socket.lock().await;
+        let _ = socket.close(None).await;
+    });
+}
+
+fn schedule_websocket_expiry(key: String, idle_ttl: Duration) {
+    let Some(connection) = websockets()
+        .lock()
+        .expect("websocket cache lock")
+        .get(&key)
+        .cloned()
+    else {
+        return;
+    };
+    let idle_remaining = idle_ttl.saturating_sub(
+        connection
+            .last_used
+            .lock()
+            .expect("websocket last-used lock")
+            .elapsed(),
+    );
+    let age_remaining = WEBSOCKET_MAX_AGE.saturating_sub(connection.created_at.elapsed());
+    tokio::spawn(async move {
+        tokio::time::sleep(idle_remaining.min(age_remaining)).await;
+        let expired = connection.created_at.elapsed() >= WEBSOCKET_MAX_AGE
+            || connection.socket.try_lock().is_ok()
+                && connection
+                    .last_used
+                    .lock()
+                    .expect("websocket last-used lock")
+                    .elapsed()
+                    >= idle_ttl;
+        if !expired {
+            return;
+        }
+        let removed = {
+            let mut cache = websockets().lock().expect("websocket cache lock");
+            let current = cache
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(&current.socket, &connection.socket));
+            current.then(|| cache.remove(&key)).flatten()
+        };
+        if let Some(connection) = removed {
+            let mut socket = connection.socket.lock().await;
+            let _ = socket.close(None).await;
+        }
+    });
 }
 
 fn cached_websocket(key: &str, idle_ttl: Duration) -> Option<CachedWebSocket> {

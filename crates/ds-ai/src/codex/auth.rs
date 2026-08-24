@@ -224,7 +224,7 @@ impl Client {
                 .body(body)
                 .send() => response.map_err(|error| Error::Http(error.to_string()))?,
         };
-        read_credentials(response, "refresh").await
+        read_credentials(response, "refresh", cancellation).await
     }
 
     async fn exchange(
@@ -251,7 +251,7 @@ impl Client {
                 .body(body)
                 .send() => response.map_err(|error| Error::Http(error.to_string()))?,
         };
-        read_credentials(response, "exchange").await
+        read_credentials(response, "exchange", cancellation).await
     }
 
     fn authorization_url(
@@ -387,12 +387,14 @@ enum DevicePoll {
 async fn read_credentials(
     response: reqwest::Response,
     operation: &'static str,
+    cancellation: &CancellationToken,
 ) -> Result<Credentials, Error> {
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| Error::Http(error.to_string()))?;
+    let body = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(Error::Cancelled),
+        body = response.text() => body.map_err(|error| Error::Http(error.to_string()))?,
+    };
     if !status.is_success() {
         return Err(Error::Server {
             operation,
