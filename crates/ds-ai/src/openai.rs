@@ -5,7 +5,7 @@ use crate::{
     constrained_sampling::{self, GrammarInputBuffer},
     deferred_tools::{DeferredToolsMode, ToolPlacement},
     http, json, retry, transport,
-    types::{OpenAiReplay, normalize_id},
+    types::OpenAiReplay,
 };
 use async_stream::stream;
 use futures_core::Stream;
@@ -920,6 +920,7 @@ pub async fn stream(
                 .service_tier
                 .map(|service_tier| service_tier.as_str().into()),
             use_requested_for_default: false,
+            codex: false,
         },
     ))
 }
@@ -929,7 +930,101 @@ fn fallback_message_id(message_index: usize, text_index: usize) -> String {
 }
 
 fn openai_call_id(id: &str) -> String {
-    normalize_id(id.split('|').next().unwrap_or(id))
+    normalize_response_id(id.split('|').next().unwrap_or(id))
+}
+
+fn normalize_response_id(id: &str) -> String {
+    id.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect::<String>()
+        .trim_end_matches('_')
+        .into()
+}
+
+fn response_tool_call_id(id: &str, foreign: bool) -> String {
+    let Some((call_id, item_id)) = id.split_once('|') else {
+        return normalize_response_id(id);
+    };
+    let call_id = normalize_response_id(call_id);
+    let mut item_id = if foreign {
+        format!("fc_{}", short_hash(item_id))
+    } else {
+        normalize_response_id(item_id)
+    };
+    if !item_id.starts_with("fc_") {
+        item_id = normalize_response_id(&format!("fc_{item_id}"));
+    }
+    format!("{call_id}|{item_id}")
+}
+
+fn response_message(
+    text: &str,
+    message_index: usize,
+    text_index: usize,
+    signature: Option<(String, Option<String>)>,
+) -> serde_json::Value {
+    let (id, phase) = signature.map_or_else(
+        || (fallback_message_id(message_index, text_index), None),
+        |(id, phase)| {
+            let id = if id.len() > 64 {
+                format!("msg_{}", short_hash(&id))
+            } else {
+                id
+            };
+            (id, phase)
+        },
+    );
+    let mut item = serde_json::json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": text,
+            "annotations": []
+        }],
+        "status": "completed",
+        "id": id
+    });
+    if let Some(phase) = phase {
+        item["phase"] = phase.into();
+    }
+    item
+}
+
+struct PendingResponseToolCall {
+    id: String,
+    name: String,
+}
+
+fn finish_response_tool_calls(
+    input: &mut Vec<serde_json::Value>,
+    pending: &mut Vec<PendingResponseToolCall>,
+    results: &mut std::collections::BTreeSet<String>,
+    grammar_input_properties: &BTreeMap<String, String>,
+) {
+    for call in pending.drain(..) {
+        if results.contains(&call.id) {
+            continue;
+        }
+        let output_type = if grammar_input_properties.contains_key(&call.name) {
+            "custom_tool_call_output"
+        } else {
+            "function_call_output"
+        };
+        input.push(serde_json::json!({
+            "type": output_type,
+            "call_id": openai_call_id(&call.id),
+            "output": "No result provided"
+        }));
+    }
+    results.clear();
 }
 
 pub(crate) struct ResponseInputTarget<'a> {
@@ -966,6 +1061,9 @@ pub(crate) fn response_input(
 ) -> Result<Vec<serde_json::Value>, String> {
     let mut input = Vec::new();
     let mut loaded_tools = std::collections::BTreeSet::new();
+    let mut tool_call_ids = BTreeMap::new();
+    let mut pending_tool_calls = Vec::new();
+    let mut tool_results = std::collections::BTreeSet::new();
     if let Some(role) = system_role
         && let Some(system) = context.system()
     {
@@ -977,6 +1075,12 @@ pub(crate) fn response_input(
     for (message_index, message) in context.messages().iter().enumerate() {
         match message {
             Message::User(message) => {
+                finish_response_tool_calls(
+                    &mut input,
+                    &mut pending_tool_calls,
+                    &mut tool_results,
+                    grammar_input_properties,
+                );
                 let content = match &message.content {
                     UserContent::Text(text) => vec![serde_json::json!({
                         "type": "input_text",
@@ -991,50 +1095,75 @@ pub(crate) fn response_input(
                 }
             }
             Message::Assistant(message) => {
+                finish_response_tool_calls(
+                    &mut input,
+                    &mut pending_tool_calls,
+                    &mut tool_results,
+                    grammar_input_properties,
+                );
+                if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+                    continue;
+                }
                 let same_api_provider =
                     message.api == target.api && message.provider.as_str() == target.provider;
                 let same_model = same_api_provider && message.model == target.model;
+                let different_model = same_api_provider && message.model != target.model;
                 let mut text_index = 0;
                 for content in &message.content {
                     match content {
                         AssistantContent::Thinking(thinking) => {
-                            if let Some(signature) = &thinking.thinking_signature
+                            if !same_model {
+                                if thinking.redacted != Some(true)
+                                    && !thinking.thinking.trim().is_empty()
+                                {
+                                    input.push(response_message(
+                                        &thinking.thinking,
+                                        message_index,
+                                        text_index,
+                                        None,
+                                    ));
+                                    text_index += 1;
+                                }
+                            } else if let Some(signature) = &thinking.thinking_signature
                                 && let Ok(item) = serde_json::from_str(signature)
                             {
                                 input.push(item);
                             }
                         }
-                        AssistantContent::Text(text) if !text.text.is_empty() => {
-                            let signature = text
-                                .text_signature
-                                .as_deref()
-                                .and_then(parse_text_signature);
-                            let mut item = serde_json::json!({
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [{
-                                    "type": "output_text",
-                                    "text": text.text,
-                                    "annotations": []
-                                }],
-                                "status": "completed",
-                                "id": fallback_message_id(message_index, text_index)
-                            });
-                            if let Some((id, phase)) = signature {
-                                item["id"] = id.into();
-                                if let Some(phase) = phase {
-                                    item["phase"] = phase.into();
-                                }
-                            }
-                            input.push(item);
+                        AssistantContent::Text(text) => {
+                            let signature = same_model
+                                .then(|| {
+                                    text.text_signature
+                                        .as_deref()
+                                        .and_then(parse_text_signature)
+                                })
+                                .flatten();
+                            input.push(response_message(
+                                &text.text,
+                                message_index,
+                                text_index,
+                                signature,
+                            ));
                             text_index += 1;
                         }
                         AssistantContent::ToolCall(call) => {
-                            let mut ids = call.id.splitn(2, '|');
-                            let call_id = ids.next().unwrap_or(&call.id);
-                            let mut item = if let Some(input_property) =
-                                grammar_input_properties.get(&call.name)
-                            {
+                            let normalized_id = if same_model {
+                                call.id.clone()
+                            } else {
+                                response_tool_call_id(&call.id, !same_api_provider)
+                            };
+                            tool_call_ids.insert(call.id.clone(), normalized_id.clone());
+                            pending_tool_calls.push(PendingResponseToolCall {
+                                id: normalized_id.clone(),
+                                name: call.name.clone(),
+                            });
+                            let (call_id, item_id) = normalized_id
+                                .split_once('|')
+                                .map_or((normalized_id.as_str(), None), |(call_id, item_id)| {
+                                    (call_id, Some(item_id))
+                                });
+                            let input_property = grammar_input_properties.get(&call.name);
+                            let mut item = if let Some(input_property) = input_property {
                                 serde_json::json!({
                                     "type": "custom_tool_call",
                                     "call_id": openai_call_id(call_id),
@@ -1054,8 +1183,9 @@ pub(crate) fn response_input(
                                         .expect("tool arguments serialize")
                                 })
                             };
-                            if let Some(item_id) = ids.next()
-                                && same_model
+                            if let Some(item_id) = item_id
+                                && !(different_model && item_id.starts_with("fc_"))
+                                && (input_property.is_some() || item_id.starts_with("fc_"))
                             {
                                 item["id"] = item_id.into();
                             }
@@ -1068,11 +1198,15 @@ pub(crate) fn response_input(
                             }
                             input.push(item);
                         }
-                        _ => {}
                     }
                 }
             }
             Message::ToolResult(result) => {
+                let normalized_id = tool_call_ids
+                    .get(&result.tool_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| normalize_response_id(&result.tool_call_id));
+                tool_results.insert(normalized_id.clone());
                 let output_type = if grammar_input_properties.contains_key(&result.tool_name) {
                     "custom_tool_call_output"
                 } else {
@@ -1080,7 +1214,7 @@ pub(crate) fn response_input(
                 };
                 input.push(serde_json::json!({
                     "type": output_type,
-                    "call_id": openai_call_id(&result.tool_call_id),
+                    "call_id": openai_call_id(&normalized_id),
                     "output": tool_result_output(result)
                 }));
                 let Some((placement, mode)) = deferred_tools else {
@@ -1110,8 +1244,8 @@ pub(crate) fn response_input(
                             .map(|tool| tool.name.as_str())
                             .collect::<Vec<_>>();
                         let call_id = format!(
-                            "pi_tool_load_{}",
-                            short_hash(&format!("{}:{}", result.tool_call_id, names.join(",")))
+                            "ds_tool_load_{}",
+                            short_hash(&format!("{}:{}", normalized_id, names.join(",")))
                         );
                         input.push(serde_json::json!({
                             "type": "tool_search_call",
@@ -1132,6 +1266,12 @@ pub(crate) fn response_input(
             }
         }
     }
+    finish_response_tool_calls(
+        &mut input,
+        &mut pending_tool_calls,
+        &mut tool_results,
+        grammar_input_properties,
+    );
     Ok(input)
 }
 
@@ -1293,6 +1433,7 @@ pub(crate) struct ResponseEventOptions {
     pub(crate) grammar_input_properties: BTreeMap<String, String>,
     pub(crate) requested_service_tier: Option<String>,
     pub(crate) use_requested_for_default: bool,
+    pub(crate) codex: bool,
 }
 
 pub(crate) fn decode_stream(
@@ -1337,13 +1478,18 @@ pub(crate) fn decode_events(
     options: ResponseEventOptions,
 ) -> ResponseStream {
     let output = stream! {
-        let mut result = Response::openai(response_model);
+        let mut result = if options.codex {
+            Response::codex(response_model)
+        } else {
+            Response::openai(response_model)
+        };
         result.metadata = metadata;
         let mut slots = HashMap::new();
         let ResponseEventOptions {
             grammar_input_properties,
             requested_service_tier,
             use_requested_for_default,
+            codex: _,
         } = options;
 
         loop {

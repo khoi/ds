@@ -1,6 +1,9 @@
 use crate::support::{Reply, serve};
 use ds_ai::{
-    CacheRetention, Context, Event, InputContent, Message, ToolResultMessage, anthropic, openai,
+    Api, ApiStreamOptions, AssistantContent, AssistantMessage, AssistantToolCall, CacheRetention,
+    Context, Event, InputContent, Message, OpenAiResponsesOptions, Provider, ProviderId,
+    StopReason, StreamOptions, TextContent, ThinkingContent, ToolResultMessage, Usage, anthropic,
+    builtin_model, openai,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -178,6 +181,7 @@ async fn replays_an_anthropic_transcript_to_openai() {
             },
             {
                 "type": "function_call",
+                "id": "fc_smumt218o8l4c",
                 "call_id": "toolu_1",
                 "name": "inspect",
                 "arguments": "{\"path\":\"README.md\"}"
@@ -193,6 +197,169 @@ async fn replays_an_anthropic_transcript_to_openai() {
             }
         ])
     );
+}
+
+#[tokio::test]
+async fn normalizes_openai_handoffs_across_models_and_providers() {
+    let server = serve([Reply::sse(openai_done()), Reply::sse(openai_done())]).await;
+    let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    model.base_url = server.base_url.clone();
+    let provider = openai::Provider::new([model.clone()]);
+    let options = ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+        stream: StreamOptions {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    for source in [
+        AssistantSource {
+            api: Api::OpenAiResponses,
+            provider: ProviderId::new("openai"),
+            model: "gpt-5.5".into(),
+        },
+        AssistantSource {
+            api: Api::OpenAiCodexResponses,
+            provider: ProviderId::new("openai-codex"),
+            model: model.id.clone(),
+        },
+    ] {
+        let first_id = "call/first|item+first";
+        let second_id = "call/second|item+second";
+        let context = Context::new([
+            Message::user("Start"),
+            Message::assistant(AssistantMessage {
+                content: vec![AssistantContent::Thinking(ThinkingContent {
+                    thinking: "Discarded".into(),
+                    thinking_signature: Some(
+                        json!({"type": "reasoning", "id": "rs_aborted"}).to_string(),
+                    ),
+                    redacted: None,
+                })],
+                stop_reason: StopReason::Aborted,
+                ..assistant(&source)
+            }),
+            Message::assistant(AssistantMessage {
+                content: vec![
+                    AssistantContent::Thinking(ThinkingContent {
+                        thinking: "Reasoned".into(),
+                        thinking_signature: Some(
+                            json!({"type": "reasoning", "id": "rs_foreign"}).to_string(),
+                        ),
+                        redacted: None,
+                    }),
+                    AssistantContent::Text(TextContent {
+                        text: "Visible".into(),
+                        text_signature: Some(
+                            json!({"v": 1, "id": "msg_foreign", "phase": "final_answer"})
+                                .to_string(),
+                        ),
+                    }),
+                    tool_call(first_id, "first"),
+                    tool_call(second_id, "second"),
+                ],
+                stop_reason: StopReason::ToolUse,
+                ..assistant(&source)
+            }),
+            Message::tool_result(ToolResultMessage::new(
+                first_id,
+                "first",
+                [InputContent::text("done")],
+            )),
+            Message::user("Continue"),
+        ]);
+
+        provider
+            .stream(&model, &context, &options)
+            .result()
+            .await
+            .unwrap();
+    }
+
+    for (request, foreign) in server.requests().await.iter().zip([false, true]) {
+        let input = request_json(request)["input"].as_array().unwrap().to_vec();
+        assert!(!input.iter().any(|item| item["id"] == "rs_aborted"));
+        assert!(!input.iter().any(|item| item["type"] == "reasoning"));
+        let messages = input
+            .iter()
+            .filter(|item| item["type"] == "message" && item["role"] == "assistant")
+            .collect::<Vec<_>>();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"][0]["text"], "Reasoned");
+        assert_eq!(messages[1]["content"][0]["text"], "Visible");
+        assert_ne!(messages[1]["id"], "msg_foreign");
+
+        let calls = input
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|call| call.get("namespace").is_none()));
+        if foreign {
+            assert!(calls.iter().all(|call| {
+                call["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("fc_") && id.len() <= 64)
+            }));
+        } else {
+            assert!(calls.iter().all(|call| call.get("id").is_none()));
+        }
+        assert_eq!(calls[0]["call_id"], "call_first");
+        assert_eq!(calls[1]["call_id"], "call_second");
+
+        let outputs = input
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0]["call_id"], "call_first");
+        assert_eq!(outputs[0]["output"], "done");
+        assert_eq!(outputs[1]["call_id"], "call_second");
+        assert_eq!(outputs[1]["output"], "No result provided");
+    }
+}
+
+struct AssistantSource {
+    api: Api,
+    provider: ProviderId,
+    model: String,
+}
+
+fn assistant(source: &AssistantSource) -> AssistantMessage {
+    AssistantMessage {
+        content: Vec::new(),
+        api: source.api.clone(),
+        provider: source.provider.clone(),
+        model: source.model.clone(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::Pending,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 1,
+    }
+}
+
+fn tool_call(id: &str, name: &str) -> AssistantContent {
+    AssistantContent::ToolCall(AssistantToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: json!({"value": name}),
+        thought_signature: Some("discarded".into()),
+        namespace: Some("dynamic_tools".into()),
+    })
+}
+
+fn request_json(request: &str) -> Value {
+    serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+}
+
+fn openai_done() -> &'static str {
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_done\",\"status\":\"completed\",\"usage\":{}}}\n\n"
 }
 
 fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {

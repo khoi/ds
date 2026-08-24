@@ -386,6 +386,16 @@ impl Response {
         }
     }
 
+    pub(crate) fn codex(model: String) -> Self {
+        Self {
+            provider: ProviderState::Codex(OpenAiState {
+                model,
+                items: Vec::new(),
+            }),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn add_diagnostic(&mut self, diagnostic: crate::AssistantMessageDiagnostic) {
         self.diagnostics
             .get_or_insert_with(Vec::new)
@@ -393,13 +403,14 @@ impl Response {
     }
 
     pub(crate) fn add_openai_item(&mut self, item: OpenAiReplay) {
-        if let ProviderState::OpenAi(state) = &mut self.provider {
+        if let ProviderState::OpenAi(state) | ProviderState::Codex(state) = &mut self.provider {
             state.items.push(item);
         }
     }
 
     pub(crate) fn backfill_openai_reasoning(&mut self, id: &str, encrypted: &str) {
-        let ProviderState::OpenAi(state) = &mut self.provider else {
+        let (ProviderState::OpenAi(state) | ProviderState::Codex(state)) = &mut self.provider
+        else {
             return;
         };
         for item in &mut state.items {
@@ -448,6 +459,11 @@ impl Response {
             ProviderState::OpenAi(state) => (
                 Api::OpenAiResponses,
                 ProviderId::new("openai"),
+                state.model.clone(),
+            ),
+            ProviderState::Codex(state) => (
+                Api::OpenAiCodexResponses,
+                ProviderId::new("openai-codex"),
                 state.model.clone(),
             ),
             ProviderState::Anthropic(state) => (
@@ -510,7 +526,7 @@ impl Response {
 
     fn openai_text_signature(&self, content_index: usize) -> Option<String> {
         let items = match &self.provider {
-            ProviderState::OpenAi(state) => &state.items,
+            ProviderState::OpenAi(state) | ProviderState::Codex(state) => &state.items,
             _ => return None,
         };
         let OpenAiReplay::Message { id, phase, .. } = items.iter().find(|item| {
@@ -529,7 +545,7 @@ impl Response {
 
     fn thinking_signature(&self, content_index: usize, thinking: &str) -> Option<String> {
         match &self.provider {
-            ProviderState::OpenAi(state) => {
+            ProviderState::OpenAi(state) | ProviderState::Codex(state) => {
                 let OpenAiReplay::Reasoning {
                     id,
                     encrypted_content,
@@ -585,7 +601,7 @@ impl Response {
         content_index: usize,
         call_id: &str,
     ) -> (String, Option<String>) {
-        let ProviderState::OpenAi(state) = &self.provider else {
+        let (ProviderState::OpenAi(state) | ProviderState::Codex(state)) = &self.provider else {
             return (call_id.to_owned(), None);
         };
         let Some(OpenAiReplay::ToolCall {
@@ -616,6 +632,7 @@ enum ProviderState {
     #[default]
     None,
     OpenAi(OpenAiState),
+    Codex(OpenAiState),
     Anthropic(AnthropicState),
 }
 

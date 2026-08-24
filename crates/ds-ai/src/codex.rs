@@ -1069,6 +1069,7 @@ async fn sse_stream(request: &SseRequest) -> Result<ResponseStream, Error> {
                 .service_tier
                 .map(|service_tier| service_tier.as_str().into()),
             use_requested_for_default: true,
+            codex: true,
         },
     ))
 }
@@ -1637,6 +1638,7 @@ async fn websocket_stream(
                 .service_tier
                 .map(|service_tier| service_tier.as_str().into()),
             use_requested_for_default: true,
+            codex: true,
         },
     );
     let websocket_cache_ttl = options.websocket_cache_ttl;

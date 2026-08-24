@@ -829,6 +829,11 @@ async fn streams_and_replays_openai_tool_calls() {
                 "namespace": "dynamic_tools"
             },
             {
+                "type": "function_call_output",
+                "call_id": "call_edit",
+                "output": "No result provided"
+            },
+            {
                 "role": "user",
                 "content": [{"type": "input_text", "text": "Continue"}]
             }

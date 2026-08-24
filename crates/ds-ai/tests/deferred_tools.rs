@@ -170,7 +170,7 @@ async fn drops_foreign_tool_identity_with_the_same_model_id() {
     let payload = capture_openai(target, Context::new([Message::assistant(assistant)])).await;
     let call = item(&payload, "function_call");
 
-    assert!(call.get("id").is_none());
+    assert!(call["id"].as_str().is_some_and(|id| id.starts_with("fc_")));
     assert!(call.get("namespace").is_none());
 }
 
