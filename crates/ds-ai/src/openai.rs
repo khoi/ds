@@ -34,6 +34,7 @@ impl Model {
 pub struct Options {
     api_key: String,
     max_retries: usize,
+    max_retry_delay: Option<Duration>,
     cancellation: CancellationToken,
 }
 
@@ -42,6 +43,7 @@ impl Options {
         Self {
             api_key: api_key.into(),
             max_retries: 0,
+            max_retry_delay: Some(DEFAULT_MAX_RETRY_DELAY),
             cancellation: CancellationToken::new(),
         }
     }
@@ -53,6 +55,11 @@ impl Options {
 
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = cancellation;
+        self
+    }
+
+    pub fn with_max_retry_delay(mut self, max_retry_delay: Option<Duration>) -> Self {
+        self.max_retry_delay = max_retry_delay;
         self
     }
 }
@@ -199,10 +206,12 @@ pub async fn stream(
             let retry_index = retries;
             retries += 1;
             let delay = retry_delay(response.headers(), retry_index);
-            if delay > DEFAULT_MAX_RETRY_DELAY {
+            if let Some(maximum) = options.max_retry_delay
+                && delay > maximum
+            {
                 return Err(Error::RetryDelayExceeded {
                     requested: delay,
-                    maximum: DEFAULT_MAX_RETRY_DELAY,
+                    maximum,
                 });
             }
             wait_for_retry(delay, &options.cancellation).await?;
