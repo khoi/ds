@@ -230,6 +230,44 @@ async fn waits_for_openai_retry_headers() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn waits_for_an_openai_retry_after_http_date() {
+    let completed = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_date\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
+    let retry_at =
+        httpdate::fmt_http_date(std::time::SystemTime::now() + std::time::Duration::from_secs(60));
+    let server = serve([
+        Reply::json(
+            429,
+            json!({"error": {"type": "rate_limit_error", "message": "retry"}}),
+        )
+        .with_header("retry-after", retry_at),
+        Reply::sse(completed),
+    ])
+    .await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options = openai::Options::new("test-key").with_max_retries(1);
+    let task = tokio::spawn(async move {
+        openai::stream(&model, &context, &options)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+    });
+
+    server.wait_for_requests(1).await;
+    tokio::time::advance(std::time::Duration::from_secs(58)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(server.request_count(), 1);
+
+    tokio::time::advance(std::time::Duration::from_secs(3)).await;
+    let events = task.await.unwrap();
+    assert!(matches!(events.as_slice(), [Ok(Event::Done(_))]));
+    assert_eq!(server.requests().await.len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
 async fn cancels_an_openai_retry_wait() {
     let server = serve([
         Reply::json(

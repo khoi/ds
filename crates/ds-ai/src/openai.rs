@@ -2,7 +2,10 @@ use crate::{Content, Context, Error, Event, Message, Response, ResponseStream, U
 use async_stream::stream;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime},
+};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -316,10 +319,17 @@ fn retry_delay(headers: &reqwest::header::HeaderMap) -> Duration {
     {
         return Duration::from_millis(milliseconds);
     }
-    headers
+    let Some(value) = headers
         .get("retry-after")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs)
+    else {
+        return Duration::default();
+    };
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Duration::from_secs(seconds);
+    }
+    httpdate::parse_http_date(value)
+        .ok()
+        .and_then(|time| time.duration_since(SystemTime::now()).ok())
         .unwrap_or_default()
 }
