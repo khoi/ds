@@ -153,6 +153,42 @@ async fn sends_and_suppresses_headers_for_each_api() {
 }
 
 #[tokio::test]
+async fn sends_and_overrides_the_anthropic_user_agent() {
+    let server = serve([Reply::sse(anthropic_done()), Reply::sse(anthropic_done())]).await;
+    let mut model = builtin_model("anthropic", "claude-opus-4-5").unwrap();
+    model.base_url = server.base_url.clone();
+    let provider = ds_ai::anthropic::Provider::new([model.clone()]);
+
+    for user_agent in [None, Some("caller/1.0")] {
+        let mut stream = StreamOptions {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        };
+        if let Some(user_agent) = user_agent {
+            stream
+                .headers
+                .insert("User-Agent".into(), Some(user_agent.into()));
+        }
+        provider
+            .stream(
+                &model,
+                &Context::new([Message::user("Hello")]),
+                &ApiStreamOptions::AnthropicMessages(AnthropicOptions {
+                    stream,
+                    ..Default::default()
+                }),
+            )
+            .result()
+            .await
+            .unwrap();
+    }
+
+    let requests = server.requests().await;
+    assert!(requests[0].contains("user-agent: ds-ai/0.1.0\r\n"));
+    assert!(requests[1].contains("user-agent: caller/1.0\r\n"));
+}
+
+#[tokio::test]
 async fn turns_hook_failures_into_terminal_errors() {
     let model = builtin_model("openai", "gpt-5.6-sol").unwrap();
     let provider = ds_ai::openai::Provider::new([model.clone()]);

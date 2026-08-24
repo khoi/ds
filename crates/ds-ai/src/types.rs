@@ -182,6 +182,9 @@ impl Context {
 
     pub(crate) fn for_model(&self, model: &crate::Model) -> Self {
         let mut context = self.clone();
+        for message in &mut context.messages {
+            normalize_assistant_for_model(message, model);
+        }
         if model.input.contains(&ModelInput::Image) {
             return context;
         }
@@ -211,6 +214,34 @@ impl Context {
     pub(crate) fn tools(&self) -> &[Tool] {
         &self.tools
     }
+}
+
+fn normalize_assistant_for_model(message: &mut Message, model: &crate::Model) {
+    let Message::Assistant(message) = message else {
+        return;
+    };
+    if message.api == model.api && message.provider == model.provider && message.model == model.id {
+        return;
+    }
+    message.content = std::mem::take(&mut message.content)
+        .into_iter()
+        .filter_map(|content| match content {
+            AssistantContent::Thinking(thinking) if thinking.redacted == Some(true) => None,
+            AssistantContent::Thinking(thinking) if thinking.thinking.trim().is_empty() => None,
+            AssistantContent::Thinking(thinking) => Some(AssistantContent::Text(TextContent {
+                text: thinking.thinking,
+                text_signature: None,
+            })),
+            AssistantContent::Text(mut text) => {
+                text.text_signature = None;
+                Some(AssistantContent::Text(text))
+            }
+            AssistantContent::ToolCall(mut call) => {
+                call.thought_signature = None;
+                Some(AssistantContent::ToolCall(call))
+            }
+        })
+        .collect();
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

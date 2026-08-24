@@ -1,9 +1,9 @@
 use crate::support::{Reply, serve};
 use ds_ai::{
-    Api, ApiStreamOptions, AssistantContent, AssistantMessage, AssistantToolCall, CacheRetention,
-    Context, Event, InputContent, Message, OpenAiResponsesOptions, Provider, ProviderId,
-    StopReason, StreamOptions, TextContent, ThinkingContent, ToolResultMessage, Usage, anthropic,
-    builtin_model, openai,
+    AnthropicOptions, Api, ApiStreamOptions, AssistantContent, AssistantMessage, AssistantToolCall,
+    CacheRetention, Context, Event, InputContent, Message, OpenAiResponsesOptions, Provider,
+    ProviderId, StopReason, StreamOptions, TextContent, ThinkingContent, ToolResultMessage, Usage,
+    anthropic, builtin_model, openai,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -320,6 +320,74 @@ async fn normalizes_openai_handoffs_across_models_and_providers() {
     }
 }
 
+#[tokio::test]
+async fn drops_foreign_anthropic_replay_data_when_model_ids_match() {
+    let server = serve([Reply::sse(anthropic_done())]).await;
+    let mut model = builtin_model("anthropic", "claude-sonnet-4-5").unwrap();
+    model.base_url = server.base_url.clone();
+    let provider = anthropic::Provider::new([model.clone()]);
+    let source = AssistantSource {
+        api: Api::OpenAiResponses,
+        provider: ProviderId::new("openai"),
+        model: model.id.clone(),
+    };
+    let context = Context::new([
+        Message::user("Start"),
+        Message::assistant(AssistantMessage {
+            content: vec![
+                AssistantContent::Thinking(ThinkingContent {
+                    thinking: "Reasoned".into(),
+                    thinking_signature: Some("foreign-signature".into()),
+                    redacted: None,
+                }),
+                AssistantContent::Thinking(ThinkingContent {
+                    thinking: String::new(),
+                    thinking_signature: Some("foreign-redacted".into()),
+                    redacted: Some(true),
+                }),
+                AssistantContent::Text(TextContent {
+                    text: "Visible".into(),
+                    text_signature: Some("foreign-text-signature".into()),
+                }),
+            ],
+            stop_reason: StopReason::Stop,
+            ..assistant(&source)
+        }),
+    ]);
+
+    provider
+        .stream(
+            &model,
+            &context,
+            &ApiStreamOptions::AnthropicMessages(AnthropicOptions {
+                stream: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    cache_retention: CacheRetention::None,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .result()
+        .await
+        .unwrap();
+
+    let payload = request_json(&server.requests().await.pop().unwrap());
+    assert_eq!(
+        payload["messages"],
+        json!([
+            {"role": "user", "content": [{"type": "text", "text": "Start"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Reasoned"},
+                    {"type": "text", "text": "Visible"}
+                ]
+            }
+        ])
+    );
+}
+
 struct AssistantSource {
     api: Api,
     provider: ProviderId,
@@ -360,6 +428,10 @@ fn request_json(request: &str) -> Value {
 
 fn openai_done() -> &'static str {
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_done\",\"status\":\"completed\",\"usage\":{}}}\n\n"
+}
+
+fn anthropic_done() -> &'static str {
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 }
 
 fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {

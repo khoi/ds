@@ -950,6 +950,10 @@ pub async fn stream(
             "anthropic-dangerous-direct-browser-access".into(),
             "true".into(),
         ),
+        (
+            "user-agent".into(),
+            concat!("ds-ai/", env!("CARGO_PKG_VERSION")).into(),
+        ),
     ]);
     if oauth {
         default_headers.insert(
