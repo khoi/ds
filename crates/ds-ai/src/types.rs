@@ -66,6 +66,8 @@ pub enum Error {
     Provider { status: u16, body: String },
     #[error("invalid provider stream: {0}")]
     Stream(String),
+    #[error("provider stream ended before a terminal event")]
+    IncompleteStream { partial: Response },
 }
 
 pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send>>;

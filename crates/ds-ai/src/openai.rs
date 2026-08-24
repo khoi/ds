@@ -256,6 +256,8 @@ pub async fn stream(
                 }
             }
         }
+
+        yield Err(Error::IncompleteStream { partial: result });
     };
 
     Ok(Box::pin(output))

@@ -67,6 +67,44 @@ async fn streams_openai_text_until_the_provider_completes() {
     );
 }
 
+#[tokio::test]
+async fn rejects_an_openai_stream_that_ends_without_a_terminal_event() {
+    let sse = [
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_partial\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hel\"}\n\n",
+    ]
+    .concat();
+    let (base_url, request) = serve_once(sse).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options = openai::Options::new("test-key");
+
+    let events = openai::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert_eq!(
+        events,
+        vec![
+            Ok(Event::TextDelta {
+                content_index: 0,
+                delta: "Hel".into(),
+            }),
+            Err(ds_ai::Error::IncompleteStream {
+                partial: ds_ai::Response {
+                    id: Some("resp_partial".into()),
+                    content: vec![ds_ai::Content::Text("Hel".into())],
+                    usage: ds_ai::Usage::default(),
+                },
+            }),
+        ]
+    );
+    request.await.unwrap();
+}
+
 async fn serve_once(sse: String) -> (String, oneshot::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
