@@ -479,3 +479,56 @@ async fn accepts_fractional_openai_retry_headers() {
     assert!(matches!(events.as_slice(), [Ok(Event::Done(_))]));
     assert_eq!(server.requests().await.len(), 2);
 }
+
+#[tokio::test]
+async fn streams_openai_reasoning_and_text_in_content_order() {
+    let sse = [
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_reasoning\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"summary_index\":0,\"delta\":\"Need answer.\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Need answer.\"}],\"encrypted_content\":\"encrypted\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"content_index\":0,\"delta\":\"Hello\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}],\"phase\":\"final_answer\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_reasoning\",\"usage\":{\"input_tokens\":5,\"input_tokens_details\":{},\"output_tokens\":4,\"output_tokens_details\":{\"reasoning_tokens\":3}}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options = openai::Options::new("test-key");
+
+    let events = openai::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert_eq!(
+        events,
+        vec![
+            Ok(Event::ReasoningDelta {
+                content_index: 0,
+                delta: "Need answer.".into(),
+            }),
+            Ok(Event::TextDelta {
+                content_index: 1,
+                delta: "Hello".into(),
+            }),
+            Ok(Event::Done(ds_ai::Response {
+                id: Some("resp_reasoning".into()),
+                content: vec![
+                    ds_ai::Content::Reasoning("Need answer.".into()),
+                    ds_ai::Content::Text("Hello".into()),
+                ],
+                usage: ds_ai::Usage {
+                    input: 5,
+                    output: 4,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 3,
+                },
+            })),
+        ]
+    );
+}

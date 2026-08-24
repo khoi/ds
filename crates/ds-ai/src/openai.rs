@@ -93,6 +93,8 @@ enum StreamEvent {
     },
     #[serde(rename = "response.output_text.delta")]
     OutputTextDelta { output_index: usize, delta: String },
+    #[serde(rename = "response.reasoning_summary_text.delta")]
+    ReasoningSummaryTextDelta { output_index: usize, delta: String },
     #[serde(rename = "response.output_item.done")]
     OutputItemDone {
         output_index: usize,
@@ -114,6 +116,8 @@ struct OutputItem {
     r#type: String,
     #[serde(default)]
     content: Vec<OutputContent>,
+    #[serde(default)]
+    summary: Vec<SummaryContent>,
 }
 
 #[derive(Deserialize)]
@@ -121,6 +125,16 @@ struct OutputContent {
     r#type: String,
     #[serde(default)]
     text: String,
+}
+
+#[derive(Deserialize)]
+struct SummaryContent {
+    text: String,
+}
+
+enum Slot {
+    Text(usize),
+    Reasoning(usize),
 }
 
 #[derive(Deserialize)]
@@ -236,21 +250,40 @@ pub async fn stream(
 
                 match event {
                     StreamEvent::Created { response } => result.id = Some(response.id),
-                    StreamEvent::OutputItemAdded { output_index, item } if item.r#type == "message" => {
+                    StreamEvent::OutputItemAdded { output_index, item } => {
                         let content_index = result.content.len();
-                        result.content.push(Content::Text(String::new()));
-                        slots.insert(output_index, content_index);
+                        match item.r#type.as_str() {
+                            "message" => {
+                                result.content.push(Content::Text(String::new()));
+                                slots.insert(output_index, Slot::Text(content_index));
+                            }
+                            "reasoning" => {
+                                result.content.push(Content::Reasoning(String::new()));
+                                slots.insert(output_index, Slot::Reasoning(content_index));
+                            }
+                            _ => {}
+                        }
                     }
                     StreamEvent::OutputTextDelta { output_index, delta } => {
-                        let Some(&content_index) = slots.get(&output_index) else {
+                        let Some(Slot::Text(content_index)) = slots.get(&output_index) else {
                             continue;
                         };
-                        let Content::Text(text) = &mut result.content[content_index];
-                        text.push_str(&delta);
-                        yield Ok(Event::TextDelta { content_index, delta });
+                        if let Content::Text(text) = &mut result.content[*content_index] {
+                            text.push_str(&delta);
+                        }
+                        yield Ok(Event::TextDelta { content_index: *content_index, delta });
+                    }
+                    StreamEvent::ReasoningSummaryTextDelta { output_index, delta } => {
+                        let Some(Slot::Reasoning(content_index)) = slots.get(&output_index) else {
+                            continue;
+                        };
+                        if let Content::Reasoning(reasoning) = &mut result.content[*content_index] {
+                            reasoning.push_str(&delta);
+                        }
+                        yield Ok(Event::ReasoningDelta { content_index: *content_index, delta });
                     }
                     StreamEvent::OutputItemDone { output_index, item } if item.r#type == "message" => {
-                        let Some(&content_index) = slots.get(&output_index) else {
+                        let Some(Slot::Text(content_index)) = slots.get(&output_index) else {
                             continue;
                         };
                         let text = item
@@ -260,7 +293,21 @@ pub async fn stream(
                             .map(|content| content.text.as_str())
                             .collect::<String>();
                         if !text.is_empty() {
-                            result.content[content_index] = Content::Text(text);
+                            result.content[*content_index] = Content::Text(text);
+                        }
+                    }
+                    StreamEvent::OutputItemDone { output_index, item } if item.r#type == "reasoning" => {
+                        let Some(Slot::Reasoning(content_index)) = slots.get(&output_index) else {
+                            continue;
+                        };
+                        let summary = item
+                            .summary
+                            .iter()
+                            .map(|content| content.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        if !summary.is_empty() {
+                            result.content[*content_index] = Content::Reasoning(summary);
                         }
                     }
                     StreamEvent::Completed { response } => {

@@ -34,6 +34,7 @@ impl Context {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Content {
     Text(String),
+    Reasoning(String),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -55,6 +56,7 @@ pub struct Response {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     TextDelta { content_index: usize, delta: String },
+    ReasoningDelta { content_index: usize, delta: String },
     Done(Response),
 }
 
