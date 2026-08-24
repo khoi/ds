@@ -1,11 +1,10 @@
 use crate::support::{Reply, serve};
 use ds_ai::{
     AnthropicOptions, Api, ApiStreamOptions, AssistantContent, AssistantMessage, AssistantToolCall,
-    CacheRetention, Context, Event, InputContent, Message, OpenAiResponsesOptions, Provider,
-    ProviderId, StopReason, StreamOptions, TextContent, ThinkingContent, ToolResultMessage, Usage,
-    anthropic, builtin_model, openai,
+    CacheRetention, Context, InputContent, Message, OpenAiResponsesOptions, Provider, ProviderId,
+    StopReason, StreamOptions, TextContent, ThinkingContent, ToolResultMessage, Usage, anthropic,
+    builtin_model, openai,
 };
-use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 #[tokio::test]
@@ -26,17 +25,20 @@ async fn normalizes_a_cross_provider_tool_transcript() {
     ]
     .concat();
     let source_server = serve([Reply::sse(source_sse)]).await;
-    let source_model = openai::Model::new("gpt-5.6").with_base_url(&source_server.base_url);
-    let source_events = openai::raw_stream(
+    let mut source_model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    source_model.base_url = source_server.base_url.clone();
+    let mut source_stream = openai::stream(
         &source_model,
         &Context::new([Message::user("Run")]),
-        &openai::Options::new("test-key"),
-    )
-    .await
-    .unwrap()
-    .collect::<Vec<_>>()
-    .await;
-    let source_response = done(&source_events).clone();
+        &OpenAiResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let source_response = source_stream.result().await.unwrap();
     source_server.requests().await;
 
     let target_sse = [
@@ -45,8 +47,8 @@ async fn normalizes_a_cross_provider_tool_transcript() {
     ]
     .concat();
     let target_server = serve([Reply::sse(target_sse)]).await;
-    let target_model =
-        anthropic::Model::new("claude-sonnet-4-5").with_base_url(&target_server.base_url);
+    let mut target_model = builtin_model("anthropic", "claude-sonnet-4-5").unwrap();
+    target_model.base_url = target_server.base_url.clone();
     let target_context = Context::new([
         Message::user("Run"),
         Message::assistant(source_response),
@@ -57,15 +59,21 @@ async fn normalizes_a_cross_provider_tool_transcript() {
         )),
     ]);
 
-    anthropic::raw_stream(
+    anthropic::stream(
         &target_model,
         &target_context,
-        &anthropic::Options::new("test-key").with_cache_retention(CacheRetention::None),
+        &AnthropicOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                cache_retention: CacheRetention::None,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
+    .result()
     .await
-    .unwrap()
-    .collect::<Vec<_>>()
-    .await;
+    .unwrap();
 
     let request = target_server.requests().await.pop().unwrap();
     let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -127,24 +135,30 @@ async fn replays_an_anthropic_transcript_to_openai() {
     ]
     .concat();
     let source_server = serve([Reply::sse(source_sse)]).await;
-    let source_model =
-        anthropic::Model::new("claude-sonnet-4-5").with_base_url(&source_server.base_url);
-    let source = anthropic::raw_stream(
+    let mut source_model = builtin_model("anthropic", "claude-sonnet-4-5").unwrap();
+    source_model.base_url = source_server.base_url.clone();
+    let source = anthropic::stream(
         &source_model,
         &Context::new([Message::user("Run")]),
-        &anthropic::Options::new("test-key").with_cache_retention(CacheRetention::None),
+        &AnthropicOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                cache_retention: CacheRetention::None,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
+    .result()
     .await
-    .unwrap()
-    .collect::<Vec<_>>()
-    .await;
-    let source = done(&source).clone();
+    .unwrap();
     source_server.requests().await;
 
     let target_sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_target\",\"usage\":{}}}\n\n";
     let target_server = serve([Reply::sse(target_sse)]).await;
-    let target_model = openai::Model::new("gpt-5.6").with_base_url(&target_server.base_url);
-    openai::raw_stream(
+    let mut target_model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    target_model.base_url = target_server.base_url.clone();
+    openai::stream(
         &target_model,
         &Context::new([
             Message::user("Run"),
@@ -156,12 +170,18 @@ async fn replays_an_anthropic_transcript_to_openai() {
             )),
             Message::user("Continue"),
         ]),
-        &openai::Options::new("test-key").with_cache_retention(CacheRetention::None),
+        &OpenAiResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                cache_retention: CacheRetention::None,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
+    .result()
     .await
-    .unwrap()
-    .collect::<Vec<_>>()
-    .await;
+    .unwrap();
 
     let request = target_server.requests().await.pop().unwrap();
     let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -432,11 +452,4 @@ fn openai_done() -> &'static str {
 
 fn anthropic_done() -> &'static str {
     "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
-}
-
-fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {
-    match events.last() {
-        Some(Ok(Event::Done(response))) => response,
-        _ => panic!("stream did not complete"),
-    }
 }
