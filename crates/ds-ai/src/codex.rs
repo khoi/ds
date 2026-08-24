@@ -774,6 +774,9 @@ async fn websocket_stream(
                     });
                     *last_used.lock().expect("websocket last-used lock") = Instant::now();
                 }
+                if terminal && cache_key.is_none() {
+                    let _ = socket.close(None).await;
+                }
                 yield Ok(data);
                 if terminal {
                     return;

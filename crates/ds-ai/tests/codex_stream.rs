@@ -262,6 +262,46 @@ async fn reuses_a_codex_websocket_with_an_input_delta() {
 }
 
 #[tokio::test]
+async fn scopes_cached_codex_websockets_to_the_account() {
+    let (base_url, capture) = serve_kept_websocket_connections([
+        text_events("resp_account_one", "msg_account_one", "First"),
+        text_events("resp_account_two", "msg_account_two", "Second"),
+    ])
+    .await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let context = Context::new([Message::user("Connect")]);
+    let first = codex::stream(
+        &model,
+        &context,
+        &codex::Options::new(token("acc_scope_one"))
+            .with_session_id("session_scope")
+            .with_transport(codex::Transport::WebSocket),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+    let second = codex::stream(
+        &model,
+        &context,
+        &codex::Options::new(token("acc_scope_two"))
+            .with_session_id("session_scope")
+            .with_transport(codex::Transport::WebSocket),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+
+    assert_eq!(done(&first).content, [ds_ai::Content::Text("First".into())]);
+    assert_eq!(
+        done(&second).content,
+        [ds_ai::Content::Text("Second".into())]
+    );
+    assert_eq!(capture.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn retries_a_missing_codex_continuation_with_full_context() {
     let (base_url, capture) = serve_websocket([
         text_events("resp_seed", "msg_seed", "Seed"),
@@ -457,6 +497,63 @@ async fn expires_an_idle_cached_codex_websocket() {
         [ds_ai::Content::Text("Second".into())]
     );
     assert_eq!(capture.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn replaces_a_codex_websocket_at_the_connection_age_limit() {
+    let (base_url, capture) = serve_kept_websocket_connections([
+        text_events("resp_age_seed", "msg_age_seed", "First"),
+        text_events("resp_age_fresh", "msg_age_fresh", "Second"),
+    ])
+    .await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let options = codex::Options::new(token("acc_age"))
+        .with_session_id("session_age")
+        .with_websocket_cache_ttl(Duration::from_secs(56 * 60))
+        .with_transport(codex::Transport::WebSocket);
+    let context = Context::new([Message::user("Connect")]);
+    let first = codex::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    assert_eq!(done(&first).content, [ds_ai::Content::Text("First".into())]);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(55 * 60)).await;
+    tokio::time::resume();
+
+    let second = codex::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert_eq!(
+        done(&second).content,
+        [ds_ai::Content::Text("Second".into())]
+    );
+    assert_eq!(capture.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn closes_a_one_shot_codex_websocket_after_completion() {
+    let (base_url, closed) =
+        serve_one_shot_websocket(text_events("resp_one_shot", "msg_one_shot", "Done")).await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let events = codex::stream(
+        &model,
+        &Context::new([Message::user("Connect")]),
+        &codex::Options::new(token("acc_one_shot"))
+            .with_cache_retention(ds_ai::CacheRetention::None)
+            .with_transport(codex::Transport::WebSocket),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+
+    assert_eq!(done(&events).content, [ds_ai::Content::Text("Done".into())]);
+    assert!(closed.await.unwrap());
 }
 
 #[tokio::test]
@@ -695,6 +792,35 @@ async fn serve_websocket_close(events: impl IntoIterator<Item = Value>) -> Strin
             .unwrap();
     });
     format!("http://{address}")
+}
+
+async fn serve_one_shot_websocket(
+    events: impl IntoIterator<Item = Value>,
+) -> (String, oneshot::Receiver<bool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let events = events.into_iter().collect::<Vec<_>>();
+    let (sender, receiver) = oneshot::channel();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        assert!(matches!(
+            socket.next().await,
+            Some(Ok(WebSocketMessage::Text(_)))
+        ));
+        for event in events {
+            socket
+                .send(WebSocketMessage::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        let closed = matches!(
+            tokio::time::timeout(Duration::from_secs(1), socket.next()).await,
+            Ok(Some(Ok(WebSocketMessage::Close(_))))
+        );
+        sender.send(closed).ok();
+    });
+    (format!("http://{address}"), receiver)
 }
 
 async fn serve_idle_websocket_then_sse() -> (String, oneshot::Receiver<Vec<Vec<u8>>>) {
