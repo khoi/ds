@@ -70,6 +70,7 @@ impl Provider {
             if let Some(max_tokens) = options.max_tokens {
                 provider_options = provider_options.with_max_output_tokens(max_tokens);
             }
+            provider_options = provider_options.with_sampling_params(options.sampling_params);
             if let Some(temperature) = options.temperature {
                 provider_options = provider_options.with_temperature(temperature);
             }
@@ -134,11 +135,15 @@ impl crate::Provider for Provider {
         context: &Context,
         options: &crate::SimpleStreamOptions,
     ) -> crate::AssistantMessageEventStream {
+        let stream =
+            crate::provider::build_simple_stream_options(model, context, options.stream.clone());
         self.request(
             model,
             context,
-            &options.stream,
-            options.thinking,
+            &stream,
+            options
+                .thinking
+                .map(|level| model.clamp_thinking_level(level)),
             Some(options.tool_choice),
         )
     }
@@ -187,6 +192,7 @@ pub struct Options {
     cancellation: CancellationToken,
     max_output_tokens: Option<u64>,
     temperature: Option<f64>,
+    sampling_params: BTreeMap<String, serde_json::Value>,
     reasoning: Option<Reasoning>,
     tool_choice: Option<ToolChoice>,
     service_tier: Option<ServiceTier>,
@@ -249,6 +255,7 @@ impl Options {
             cancellation: CancellationToken::new(),
             max_output_tokens: None,
             temperature: None,
+            sampling_params: BTreeMap::new(),
             reasoning: None,
             tool_choice: None,
             service_tier: None,
@@ -283,6 +290,14 @@ impl Options {
 
     pub fn with_temperature(mut self, temperature: f64) -> Self {
         self.temperature = Some(temperature);
+        self
+    }
+
+    pub fn with_sampling_params(
+        mut self,
+        sampling_params: BTreeMap<String, serde_json::Value>,
+    ) -> Self {
+        self.sampling_params = sampling_params;
         self
     }
 
@@ -602,6 +617,12 @@ pub async fn stream(
         prompt_cache_options: matches!(options.cache_retention, CacheRetention::None)
             .then_some(PromptCacheOptions { mode: "explicit" }),
     };
+    let mut request =
+        serde_json::to_value(request).map_err(|error| Error::InvalidRequest(error.to_string()))?;
+    let fields = request
+        .as_object_mut()
+        .ok_or_else(|| Error::InvalidRequest("request body must be an object".into()))?;
+    fields.extend(options.sampling_params.clone());
     let client = reqwest::Client::new();
     let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
     let response = transport::connect(

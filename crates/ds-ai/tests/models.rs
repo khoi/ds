@@ -67,8 +67,11 @@ impl Provider for TestProvider {
         &self,
         model: &Model,
         _context: &Context,
-        _options: &SimpleStreamOptions,
+        options: &SimpleStreamOptions,
     ) -> AssistantMessageEventStream {
+        if let Some(captured) = &self.captured {
+            *captured.lock().unwrap() = Some(options.stream.clone());
+        }
         completed(model, &self.marker)
     }
 }
@@ -381,6 +384,51 @@ async fn merges_provider_model_auth_and_request_headers_once() {
             ("auth-only".into(), None),
         ])
     );
+}
+
+#[tokio::test]
+async fn prepares_simple_options_from_the_model_and_context() {
+    let sse = [
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let mut model = model("simple", "gpt-test");
+    model.provider = ProviderId::new("openai");
+    model.base_url = server.base_url.clone();
+    model.context_window = 10_000;
+    model.max_tokens = 8_000;
+    model
+        .sampling_params
+        .insert("top_p".into(), serde_json::json!(0.7));
+    model
+        .sampling_params
+        .insert("seed".into(), serde_json::json!(42));
+    let mut models = collection();
+    models.set_provider(ds_ai::openai::provider([model.clone()]));
+    models
+        .complete_simple(
+            &model,
+            &Context::new([ds_ai::Message::user("x".repeat(4_000))]),
+            &SimpleStreamOptions {
+                stream: StreamOptions {
+                    api_key: Some("key".into()),
+                    sampling_params: BTreeMap::from([("top_p".into(), serde_json::json!(0.9))]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let request = server.requests().await.pop().unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(payload["max_output_tokens"], 4_904);
+    assert_eq!(payload["seed"], serde_json::json!(42));
+    assert_eq!(payload["top_p"], serde_json::json!(0.9));
 }
 
 fn provider(model: &Model, marker: &str) -> Arc<dyn Provider> {

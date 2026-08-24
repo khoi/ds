@@ -1,4 +1,5 @@
 mod auth;
+mod estimate;
 mod event_stream;
 mod frame;
 mod http;
@@ -6,10 +7,12 @@ mod json;
 mod legacy;
 mod message;
 mod model;
+mod overflow;
 mod provider;
 mod retry;
 mod schema;
 mod sse;
+mod text;
 mod transport;
 mod types;
 mod validation;
@@ -25,6 +28,11 @@ pub use auth::{
     ModelAuth, OAuthAuth, ProviderAuth, SystemAuthContext,
 };
 
+pub use estimate::{
+    ContextUsageEstimate, calculate_context_tokens, clamp_max_tokens_to_context,
+    estimate_context_tokens, estimate_message_tokens, estimate_messages_tokens,
+    estimate_text_tokens,
+};
 pub use event_stream::{AssistantMessageEventStream, AssistantMessageStreamError};
 pub use frame::{
     AssistantMessageFrame, AssistantMessageFrameError, assistant_message_event_to_frame,
@@ -39,7 +47,10 @@ pub use model::{
     ModelCost, ModelCostRates, ModelCostTier, ModelInput, OpenAiResponsesCompatibility, ProviderId,
     SessionAffinityFormat, ThinkingLevel,
 };
+pub use overflow::{is_context_overflow, is_recoverable_length};
 pub use provider::{Models, Provider, SimpleStreamOptions, StreamOptions, ToolChoice, Transport};
+pub use retry::{RetryCallbacks, RetryPolicy, is_retryable_assistant_error, retry_assistant_call};
+pub use text::{ContentText, content_text, content_text_with_separator};
 pub use types::{
     CacheRetention, ConstrainedSampling, ConstrainedSamplingStrictness, Content, Context, Error,
     Event, GrammarVariants, InputContent, Message, RateLimits, Response, ResponseMetadata,

@@ -12,6 +12,8 @@ mod complete;
 mod cross_provider;
 #[path = "event_stream.rs"]
 mod event_stream;
+#[path = "helpers.rs"]
+mod helpers;
 #[path = "live.rs"]
 mod live;
 #[path = "message_frame.rs"]

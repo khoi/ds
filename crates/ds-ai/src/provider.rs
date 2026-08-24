@@ -400,6 +400,22 @@ impl Models {
     }
 }
 
+pub(crate) fn build_simple_stream_options(
+    model: &Model,
+    context: &Context,
+    mut options: StreamOptions,
+) -> StreamOptions {
+    let mut sampling_params = model.sampling_params.clone();
+    sampling_params.extend(options.sampling_params);
+    options.sampling_params = sampling_params;
+    options.max_tokens = Some(crate::clamp_max_tokens_to_context(
+        model,
+        context,
+        options.max_tokens.unwrap_or(model.max_tokens),
+    ));
+    options
+}
+
 fn error_stream(model: &Model, message: String) -> AssistantMessageEventStream {
     AssistantMessageEventStream::new(futures_stream::iter([error_event(model, message)]))
 }

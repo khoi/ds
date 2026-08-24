@@ -158,11 +158,15 @@ impl crate::Provider for Provider {
         context: &Context,
         options: &crate::SimpleStreamOptions,
     ) -> crate::AssistantMessageEventStream {
+        let stream =
+            crate::provider::build_simple_stream_options(model, context, options.stream.clone());
         self.request(
             model,
             context,
-            &options.stream,
-            options.thinking,
+            &stream,
+            options
+                .thinking
+                .map(|level| model.clamp_thinking_level(level)),
             Some(options.tool_choice),
         )
     }
