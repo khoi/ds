@@ -36,6 +36,43 @@ pub struct Options {
     max_retries: usize,
     max_retry_delay: Option<Duration>,
     cancellation: CancellationToken,
+    max_output_tokens: Option<u64>,
+    temperature: Option<f64>,
+    reasoning: Option<Reasoning>,
+    tool_choice: Option<ToolChoice>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningSummary {
+    Auto,
+    Detailed,
+    Concise,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoice {
+    Auto,
+    None,
+    Required,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Reasoning {
+    effort: ReasoningEffort,
+    summary: ReasoningSummary,
 }
 
 impl Options {
@@ -45,6 +82,10 @@ impl Options {
             max_retries: 0,
             max_retry_delay: Some(DEFAULT_MAX_RETRY_DELAY),
             cancellation: CancellationToken::new(),
+            max_output_tokens: None,
+            temperature: None,
+            reasoning: None,
+            tool_choice: None,
         }
     }
 
@@ -62,6 +103,26 @@ impl Options {
         self.max_retry_delay = max_retry_delay;
         self
     }
+
+    pub fn with_max_output_tokens(mut self, max_output_tokens: u64) -> Self {
+        self.max_output_tokens = Some(max_output_tokens);
+        self
+    }
+
+    pub fn with_temperature(mut self, temperature: f64) -> Self {
+        self.temperature = Some(temperature);
+        self
+    }
+
+    pub fn with_reasoning(mut self, effort: ReasoningEffort, summary: ReasoningSummary) -> Self {
+        self.reasoning = Some(Reasoning { effort, summary });
+        self
+    }
+
+    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+        self.tool_choice = Some(tool_choice);
+        self
+    }
 }
 
 #[derive(Serialize)]
@@ -72,6 +133,16 @@ struct Request<'a> {
     tools: Vec<RequestTool<'a>>,
     stream: bool,
     store: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<RequestReasoningOptions>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    include: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ToolChoice>,
 }
 
 #[derive(Serialize)]
@@ -87,13 +158,21 @@ enum RequestItem<'a> {
 #[derive(Serialize)]
 struct RequestUser<'a> {
     role: &'static str,
-    content: [RequestUserContent<'a>; 1],
+    content: Vec<RequestInputContent<'a>>,
 }
 
 #[derive(Serialize)]
-struct RequestUserContent<'a> {
-    r#type: &'static str,
-    text: &'a str,
+#[serde(untagged)]
+enum RequestInputContent<'a> {
+    Text {
+        r#type: &'static str,
+        text: &'a str,
+    },
+    Image {
+        r#type: &'static str,
+        detail: &'static str,
+        image_url: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -154,6 +233,12 @@ struct RequestTool<'a> {
     description: &'a str,
     parameters: &'a serde_json::Value,
     strict: bool,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct RequestReasoningOptions {
+    effort: ReasoningEffort,
+    summary: ReasoningSummary,
 }
 
 #[derive(Deserialize)]
@@ -298,14 +383,20 @@ pub async fn stream(
     options: &Options,
 ) -> Result<ResponseStream, Error> {
     let mut input = Vec::new();
+    if let Some(system) = context.system() {
+        input.push(RequestItem::User(RequestUser {
+            role: "developer",
+            content: vec![RequestInputContent::Text {
+                r#type: "input_text",
+                text: system,
+            }],
+        }));
+    }
     for message in context.messages() {
         match message {
-            Message::User(text) => input.push(RequestItem::User(RequestUser {
+            Message::User(content) => input.push(RequestItem::User(RequestUser {
                 role: "user",
-                content: [RequestUserContent {
-                    r#type: "input_text",
-                    text,
-                }],
+                content: request_input_content(content),
             })),
             Message::Assistant(response) => {
                 let Some(items) = response.openai_items(&model.id) else {
@@ -421,6 +512,17 @@ pub async fn stream(
         tools,
         stream: true,
         store: false,
+        max_output_tokens: options.max_output_tokens,
+        temperature: options.temperature,
+        reasoning: options.reasoning.map(|reasoning| RequestReasoningOptions {
+            effort: reasoning.effort,
+            summary: reasoning.summary,
+        }),
+        include: options
+            .reasoning
+            .map(|_| vec!["reasoning.encrypted_content"])
+            .unwrap_or_default(),
+        tool_choice: options.tool_choice,
     };
     let client = reqwest::Client::new();
     let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
@@ -709,6 +811,23 @@ pub async fn stream(
 
 fn parse_arguments(arguments: &str) -> serde_json::Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn request_input_content(content: &[InputContent]) -> Vec<RequestInputContent<'_>> {
+    content
+        .iter()
+        .map(|content| match content {
+            InputContent::Text(text) => RequestInputContent::Text {
+                r#type: "input_text",
+                text,
+            },
+            InputContent::Image { media_type, data } => RequestInputContent::Image {
+                r#type: "input_image",
+                detail: "auto",
+                image_url: format!("data:{media_type};base64,{data}"),
+            },
+        })
+        .collect()
 }
 
 fn usage(usage: CompletedUsage) -> Usage {

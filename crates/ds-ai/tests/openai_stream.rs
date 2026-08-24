@@ -922,6 +922,81 @@ async fn rejects_an_openai_error_event_with_code_and_partial_content() {
     }
 }
 
+#[tokio::test]
+async fn encodes_openai_multimodal_context_and_generation_options() {
+    let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_options\",\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
+    let server = serve([Reply::sse(sse)]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user_content([
+        InputContent::text("Describe this"),
+        InputContent::image("image/png", "iVBORw0KGgo="),
+    ])])
+    .with_system("Be brief")
+    .with_tools([Tool::new(
+        "inspect",
+        "Inspect an image",
+        json!({"type": "object", "properties": {}, "additionalProperties": false}),
+    )]);
+    let options = openai::Options::new("test-key")
+        .with_max_output_tokens(128)
+        .with_temperature(0.2)
+        .with_reasoning(
+            openai::ReasoningEffort::High,
+            openai::ReasoningSummary::Concise,
+        )
+        .with_tool_choice(openai::ToolChoice::Required);
+
+    openai::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    let request = server.requests().await.pop().unwrap();
+    let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        body,
+        json!({
+            "model": "gpt-5.6",
+            "input": [
+                {
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "Be brief"}]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Describe this"},
+                        {
+                            "type": "input_image",
+                            "detail": "auto",
+                            "image_url": "data:image/png;base64,iVBORw0KGgo="
+                        }
+                    ]
+                }
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "inspect",
+                "description": "Inspect an image",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                },
+                "strict": false
+            }],
+            "stream": true,
+            "store": false,
+            "max_output_tokens": 128,
+            "temperature": 0.2,
+            "reasoning": {"effort": "high", "summary": "concise"},
+            "include": ["reasoning.encrypted_content"],
+            "tool_choice": "required"
+        })
+    );
+}
+
 fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {
     match events.last() {
         Some(Ok(Event::Done(response))) => response,

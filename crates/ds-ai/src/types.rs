@@ -5,14 +5,18 @@ use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Message {
-    User(String),
+    User(Vec<InputContent>),
     Assistant(Response),
     ToolResult(ToolResult),
 }
 
 impl Message {
     pub fn user(content: impl Into<String>) -> Self {
-        Self::User(content.into())
+        Self::User(vec![InputContent::text(content)])
+    }
+
+    pub fn user_content(content: impl IntoIterator<Item = InputContent>) -> Self {
+        Self::User(content.into_iter().collect())
     }
 
     pub fn assistant(response: Response) -> Self {
@@ -73,6 +77,7 @@ impl InputContent {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Context {
+    system: Option<String>,
     messages: Vec<Message>,
     tools: Vec<Tool>,
 }
@@ -80,9 +85,15 @@ pub struct Context {
 impl Context {
     pub fn new(messages: impl IntoIterator<Item = Message>) -> Self {
         Self {
+            system: None,
             messages: messages.into_iter().collect(),
             tools: Vec::new(),
         }
+    }
+
+    pub fn with_system(mut self, system: impl Into<String>) -> Self {
+        self.system = Some(system.into());
+        self
     }
 
     pub fn with_tools(mut self, tools: impl IntoIterator<Item = Tool>) -> Self {
@@ -92,6 +103,10 @@ impl Context {
 
     pub(crate) fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    pub(crate) fn system(&self) -> Option<&str> {
+        self.system.as_deref()
     }
 
     pub(crate) fn tools(&self) -> &[Tool] {
