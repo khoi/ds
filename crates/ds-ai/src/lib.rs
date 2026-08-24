@@ -1,5 +1,6 @@
 mod auth;
 mod catalog;
+mod constrained_sampling;
 mod deferred_tools;
 mod estimate;
 mod event_stream;

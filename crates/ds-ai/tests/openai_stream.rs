@@ -854,7 +854,7 @@ async fn rejects_invalid_strict_tool_schemas_before_connecting() {
     assert!(matches!(
         result,
         Err(ds_ai::Error::InvalidRequest(message))
-            if message == "tool \"lookup\" has an invalid strict schema: $defs schemas are unsupported"
+            if message == "tool \"lookup\" requires JSON-schema constrained sampling, but $defs schemas are unsupported"
     ));
 }
 

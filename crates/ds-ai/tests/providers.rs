@@ -12,6 +12,8 @@ mod codex_auth;
 mod codex_stream;
 #[path = "complete.rs"]
 mod complete;
+#[path = "constrained_sampling.rs"]
+mod constrained_sampling;
 #[path = "cross_provider.rs"]
 mod cross_provider;
 #[path = "deferred_tools.rs"]

@@ -215,13 +215,6 @@ impl Tool {
         });
         self
     }
-
-    pub(crate) fn strict(&self) -> bool {
-        matches!(
-            self.constrained_sampling,
-            Some(ConstrainedSampling::JsonSchema { .. })
-        )
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

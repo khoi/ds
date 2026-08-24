@@ -1,7 +1,7 @@
 use crate::{
     AssistantContent, CacheRetention, Content, Context, Error, Event, InputContent, Message,
     RateLimits, Response, ResponseMetadata, ResponseStream, StopReason, ToolResultMessage, Usage,
-    UserContent, http, json, retry, schema, transport,
+    UserContent, constrained_sampling, http, json, retry, schema, transport,
     types::{AnthropicReasoning, normalize_id},
 };
 use async_stream::stream;
@@ -1179,14 +1179,12 @@ fn request_tools(
         .chain(placement.deferred.iter().map(|(_, tool)| (tool, true)))
         .enumerate()
         .map(|(index, (tool, deferred))| {
-            let strict = model.strict_tools && tool.strict();
-            let input_schema = if strict {
-                schema::strict(&tool.parameters).map_err(|error| {
-                    format!("tool {:?} has an invalid strict schema: {error}", tool.name)
-                })?
-            } else {
-                schema::object(&tool.parameters)
-            };
+            let sampling = constrained_sampling::json_schema(tool, model.strict_tools)?;
+            let strict = sampling.is_some();
+            let input_schema = sampling.map_or_else(
+                || schema::object(&tool.parameters),
+                |sampling| sampling.parameters,
+            );
             Ok(RequestTool {
                 name: tool.name.clone(),
                 description: tool.description.clone(),

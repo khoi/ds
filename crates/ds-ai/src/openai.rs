@@ -2,8 +2,9 @@ use crate::{
     AssistantContent, CacheRetention, Content, Context, Error, Event, InputContent, Message,
     Response, ResponseMetadata, ResponseStream, StopReason, TimeoutPhase, ToolCall,
     ToolResultMessage, Usage, UserContent,
+    constrained_sampling::{self, GrammarInputBuffer},
     deferred_tools::{DeferredToolsMode, ToolPlacement},
-    http, json, retry, schema, transport,
+    http, json, retry, transport,
     types::{OpenAiReplay, normalize_id},
 };
 use async_stream::stream;
@@ -59,16 +60,20 @@ impl Provider {
                 .with_max_retries(stream_options.max_retries.unwrap_or_default())
                 .with_max_retry_delay(stream_options.max_retry_delay)
                 .with_cache_retention(stream_options.cache_retention);
-            if let Some(crate::ModelCompatibility::OpenAi(compat)) = &requested_model.compat {
-                let mode = if compat.supports_additional_tools == Some(true) {
-                    Some(DeferredToolsMode::AdditionalTools)
-                } else if compat.supports_tool_search == Some(true) {
-                    Some(DeferredToolsMode::ToolSearch)
-                } else {
-                    None
-                };
-                provider_options = provider_options.with_deferred_tools_mode(mode);
-            }
+            let compat = match &requested_model.compat {
+                Some(crate::ModelCompatibility::OpenAi(compat)) => compat.clone(),
+                _ => Default::default(),
+            };
+            let mode = if compat.supports_additional_tools == Some(true) {
+                Some(DeferredToolsMode::AdditionalTools)
+            } else if compat.supports_tool_search == Some(true) {
+                Some(DeferredToolsMode::ToolSearch)
+            } else {
+                None
+            };
+            provider_options = provider_options
+                .with_deferred_tools_mode(mode)
+                .with_compatibility(&compat);
             if let Some(max_tokens) = stream_options.max_tokens {
                 provider_options = provider_options.with_max_output_tokens(max_tokens);
             }
@@ -232,6 +237,11 @@ pub struct Options {
     session_id: Option<String>,
     cache_retention: CacheRetention,
     deferred_tools_mode: Option<DeferredToolsMode>,
+    supports_developer_role: bool,
+    supports_long_cache_retention: bool,
+    supports_strict_mode: bool,
+    supports_grammar_tools: bool,
+    supports_explicit_prompt_cache_mode: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -296,6 +306,11 @@ impl Options {
             session_id: None,
             cache_retention: CacheRetention::Short,
             deferred_tools_mode: None,
+            supports_developer_role: true,
+            supports_long_cache_retention: true,
+            supports_strict_mode: true,
+            supports_grammar_tools: false,
+            supports_explicit_prompt_cache_mode: true,
         }
     }
 
@@ -381,6 +396,16 @@ impl Options {
         self.deferred_tools_mode = mode;
         self
     }
+
+    fn with_compatibility(mut self, compat: &crate::OpenAiResponsesCompatibility) -> Self {
+        self.supports_developer_role = compat.supports_developer_role.unwrap_or(true);
+        self.supports_long_cache_retention = compat.supports_long_cache_retention.unwrap_or(true);
+        self.supports_strict_mode = compat.supports_strict_mode.unwrap_or(false);
+        self.supports_grammar_tools = compat.supports_open_ai_grammar_tools.unwrap_or(false);
+        self.supports_explicit_prompt_cache_mode =
+            compat.supports_explicit_prompt_cache_mode.unwrap_or(false);
+        self
+    }
 }
 
 #[derive(Serialize)]
@@ -417,14 +442,33 @@ struct PromptCacheOptions {
 }
 
 #[derive(Serialize)]
-struct RequestTool {
+#[serde(untagged)]
+enum RequestTool {
+    Function {
+        r#type: &'static str,
+        name: String,
+        description: String,
+        parameters: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        strict: Option<Option<bool>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+    },
+    Custom {
+        r#type: &'static str,
+        name: String,
+        description: String,
+        format: RequestGrammarFormat,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        defer_loading: Option<bool>,
+    },
+}
+
+#[derive(Serialize)]
+struct RequestGrammarFormat {
     r#type: &'static str,
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
-    strict: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    defer_loading: Option<bool>,
+    syntax: &'static str,
+    definition: String,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -458,6 +502,10 @@ enum StreamEvent {
         output_index: usize,
         arguments: String,
     },
+    #[serde(rename = "response.custom_tool_call_input.delta")]
+    CustomToolCallInputDelta { output_index: usize, delta: String },
+    #[serde(rename = "response.custom_tool_call_input.done")]
+    CustomToolCallInputDone { output_index: usize, input: String },
     #[serde(rename = "response.output_item.done")]
     OutputItemDone {
         output_index: usize,
@@ -490,6 +538,7 @@ struct OutputItem {
     call_id: Option<String>,
     name: Option<String>,
     arguments: Option<String>,
+    input: Option<String>,
     #[serde(default)]
     content: Vec<OutputContent>,
     #[serde(default)]
@@ -518,7 +567,15 @@ enum Slot {
     Reasoning(usize),
     ToolCall {
         content_index: usize,
-        arguments: String,
+        arguments: ToolArguments,
+    },
+}
+
+enum ToolArguments {
+    Json(String),
+    Grammar {
+        property: String,
+        buffer: GrammarInputBuffer,
     },
 }
 
@@ -608,14 +665,25 @@ pub async fn stream(
         options.deferred_tools_mode.is_some(),
         str::to_owned,
     );
+    let tool_options =
+        ResponseToolOptions::openai(options.supports_strict_mode, options.supports_grammar_tools);
+    let grammar_input_properties =
+        grammar_input_properties(context.tools(), options.supports_grammar_tools)
+            .map_err(Error::InvalidRequest)?;
     let input = response_input(
         &model.id,
         context,
-        true,
+        Some(if options.supports_developer_role {
+            "developer"
+        } else {
+            "system"
+        }),
         options.deferred_tools_mode.map(|mode| (&placement, mode)),
+        &grammar_input_properties,
+        tool_options,
     )
     .map_err(Error::InvalidRequest)?;
-    let tools = request_tools(&placement.immediate, false).map_err(Error::InvalidRequest)?;
+    let tools = request_tools(&placement.immediate, tool_options).map_err(Error::InvalidRequest)?;
     let request = Request {
         model: &model.id,
         input,
@@ -641,10 +709,12 @@ pub async fn stream(
             }
         },
         prompt_cache_retention: match options.cache_retention {
-            CacheRetention::Long => Some("24h"),
+            CacheRetention::Long if options.supports_long_cache_retention => Some("24h"),
             CacheRetention::None | CacheRetention::Short => None,
+            CacheRetention::Long => None,
         },
-        prompt_cache_options: matches!(options.cache_retention, CacheRetention::None)
+        prompt_cache_options: (matches!(options.cache_retention, CacheRetention::None)
+            && options.supports_explicit_prompt_cache_mode)
             .then_some(PromptCacheOptions { mode: "explicit" }),
     };
     let mut request =
@@ -691,6 +761,7 @@ pub async fn stream(
         options.first_event_timeout,
         options.idle_timeout,
         overall_deadline,
+        grammar_input_properties,
     ))
 }
 
@@ -705,14 +776,18 @@ fn openai_call_id(id: &str) -> String {
 pub(crate) fn response_input(
     model: &str,
     context: &Context,
-    include_system: bool,
+    system_role: Option<&str>,
     deferred_tools: Option<(&ToolPlacement, DeferredToolsMode)>,
+    grammar_input_properties: &BTreeMap<String, String>,
+    tool_options: ResponseToolOptions,
 ) -> Result<Vec<serde_json::Value>, String> {
     let mut input = Vec::new();
     let mut loaded_tools = std::collections::BTreeSet::new();
-    if include_system && let Some(system) = context.system() {
+    if let Some(role) = system_role
+        && let Some(system) = context.system()
+    {
         input.push(serde_json::json!({
-            "role": "developer",
+            "role": role,
             "content": [{"type": "input_text", "text": system}]
         }));
     }
@@ -771,13 +846,28 @@ pub(crate) fn response_input(
                         AssistantContent::ToolCall(call) => {
                             let mut ids = call.id.splitn(2, '|');
                             let call_id = ids.next().unwrap_or(&call.id);
-                            let mut item = serde_json::json!({
-                                "type": "function_call",
-                                "call_id": openai_call_id(call_id),
-                                "name": call.name,
-                                "arguments": serde_json::to_string(&call.arguments)
-                                    .expect("tool arguments serialize")
-                            });
+                            let mut item = if let Some(input_property) =
+                                grammar_input_properties.get(&call.name)
+                            {
+                                serde_json::json!({
+                                    "type": "custom_tool_call",
+                                    "call_id": openai_call_id(call_id),
+                                    "name": call.name,
+                                    "input": constrained_sampling::grammar_input(
+                                        &call.name,
+                                        &call.arguments,
+                                        input_property,
+                                    )?
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "type": "function_call",
+                                    "call_id": openai_call_id(call_id),
+                                    "name": call.name,
+                                    "arguments": serde_json::to_string(&call.arguments)
+                                        .expect("tool arguments serialize")
+                                })
+                            };
                             if let Some(item_id) = ids.next()
                                 && message.model == model
                             {
@@ -795,8 +885,13 @@ pub(crate) fn response_input(
                 }
             }
             Message::ToolResult(result) => {
+                let output_type = if grammar_input_properties.contains_key(&result.tool_name) {
+                    "custom_tool_call_output"
+                } else {
+                    "function_call_output"
+                };
                 input.push(serde_json::json!({
-                    "type": "function_call_output",
+                    "type": output_type,
                     "call_id": openai_call_id(&result.tool_call_id),
                     "output": tool_result_output(result)
                 }));
@@ -819,7 +914,7 @@ pub(crate) fn response_input(
                     DeferredToolsMode::AdditionalTools => input.push(serde_json::json!({
                         "type": "additional_tools",
                         "role": "developer",
-                        "tools": request_tools(&tools, false)?
+                        "tools": request_tools(&tools, tool_options)?
                     })),
                     DeferredToolsMode::ToolSearch => {
                         let names = tools
@@ -842,7 +937,7 @@ pub(crate) fn response_input(
                             "call_id": call_id,
                             "execution": "client",
                             "status": "completed",
-                            "tools": request_tools(&tools, true)?
+                            "tools": request_tools(&tools, tool_options.deferred(true))?
                         }));
                     }
                 }
@@ -854,31 +949,98 @@ pub(crate) fn response_input(
 
 pub(crate) fn response_tools(
     tools: &[crate::Tool],
-    defer_loading: bool,
+    options: ResponseToolOptions,
 ) -> Result<Vec<serde_json::Value>, String> {
-    request_tools(tools, defer_loading)?
+    request_tools(tools, options)?
         .into_iter()
         .map(|tool| serde_json::to_value(tool).map_err(|error| error.to_string()))
         .collect()
 }
 
-fn request_tools(tools: &[crate::Tool], defer_loading: bool) -> Result<Vec<RequestTool>, String> {
+#[derive(Clone, Copy)]
+pub(crate) struct ResponseToolOptions {
+    supports_strict_mode: bool,
+    supports_grammar_tools: bool,
+    default_strict: Option<Option<bool>>,
+    defer_loading: bool,
+}
+
+impl ResponseToolOptions {
+    fn openai(supports_strict_mode: bool, supports_grammar_tools: bool) -> Self {
+        Self {
+            supports_strict_mode,
+            supports_grammar_tools,
+            default_strict: supports_strict_mode.then_some(Some(false)),
+            defer_loading: false,
+        }
+    }
+
+    pub(crate) fn codex(supports_strict_mode: bool, supports_grammar_tools: bool) -> Self {
+        Self {
+            supports_strict_mode,
+            supports_grammar_tools,
+            default_strict: supports_strict_mode.then_some(None),
+            defer_loading: false,
+        }
+    }
+
+    fn deferred(mut self, defer_loading: bool) -> Self {
+        self.defer_loading = defer_loading;
+        self
+    }
+}
+
+pub(crate) fn grammar_input_properties(
+    tools: &[crate::Tool],
+    supported: bool,
+) -> Result<BTreeMap<String, String>, String> {
+    tools
+        .iter()
+        .filter_map(
+            |tool| match constrained_sampling::grammar(tool, supported) {
+                Ok(Some(grammar)) => Some(Ok((tool.name.clone(), grammar.input_property))),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
+        .collect()
+}
+
+fn request_tools(
+    tools: &[crate::Tool],
+    options: ResponseToolOptions,
+) -> Result<Vec<RequestTool>, String> {
     tools
         .iter()
         .map(|tool| {
-            Ok(RequestTool {
+            if let Some(grammar) =
+                constrained_sampling::grammar(tool, options.supports_grammar_tools)?
+            {
+                return Ok(RequestTool::Custom {
+                    r#type: "custom",
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    format: RequestGrammarFormat {
+                        r#type: "grammar",
+                        syntax: grammar.syntax,
+                        definition: grammar.definition,
+                    },
+                    defer_loading: options.defer_loading.then_some(true),
+                });
+            }
+            let sampling = constrained_sampling::json_schema(tool, options.supports_strict_mode)?;
+            Ok(RequestTool::Function {
                 r#type: "function",
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                parameters: if tool.strict() {
-                    schema::strict(&tool.parameters).map_err(|error| {
-                        format!("tool {:?} has an invalid strict schema: {error}", tool.name)
-                    })?
-                } else {
-                    tool.parameters.clone()
-                },
-                strict: tool.strict(),
-                defer_loading: defer_loading.then_some(true),
+                parameters: sampling.as_ref().map_or_else(
+                    || tool.parameters.clone(),
+                    |sampling| sampling.parameters.clone(),
+                ),
+                strict: sampling
+                    .map(|sampling| Some(sampling.strict))
+                    .or(options.default_strict),
+                defer_loading: options.defer_loading.then_some(true),
             })
         })
         .collect()
@@ -946,6 +1108,7 @@ pub(crate) fn decode_stream(
     first_event_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     overall_deadline: Option<Instant>,
+    grammar_input_properties: BTreeMap<String, String>,
 ) -> ResponseStream {
     let metadata = http::metadata(response.headers());
     let mut events = transport::EventStream::new(
@@ -967,7 +1130,12 @@ pub(crate) fn decode_stream(
             }
         }
     };
-    decode_events(Box::pin(events), response_model, metadata)
+    decode_events(
+        Box::pin(events),
+        response_model,
+        metadata,
+        grammar_input_properties,
+    )
 }
 
 pub(crate) type ProviderEvents =
@@ -977,6 +1145,7 @@ pub(crate) fn decode_events(
     mut events: ProviderEvents,
     response_model: String,
     metadata: ResponseMetadata,
+    grammar_input_properties: BTreeMap<String, String>,
 ) -> ResponseStream {
     let output = stream! {
         let mut result = Response::openai(response_model);
@@ -1050,7 +1219,36 @@ pub(crate) fn decode_events(
                                     output_index,
                                     Slot::ToolCall {
                                         content_index,
-                                        arguments,
+                                        arguments: ToolArguments::Json(arguments),
+                                    },
+                                );
+                            }
+                            "custom_tool_call" => {
+                                let (Some(id), Some(name)) = (item.call_id, item.name) else {
+                                    continue;
+                                };
+                                let property = grammar_input_properties
+                                    .get(&name)
+                                    .cloned()
+                                    .unwrap_or_else(|| "input".into());
+                                let input = item.input.unwrap_or_default();
+                                result.content.push(Content::ToolCall(ToolCall {
+                                    id,
+                                    name,
+                                    arguments: serde_json::json!({&property: input}),
+                                }));
+                                slots.insert(
+                                    output_index,
+                                    Slot::ToolCall {
+                                        content_index,
+                                        arguments: ToolArguments::Grammar {
+                                            property,
+                                            buffer: GrammarInputBuffer {
+                                                input: String::new(),
+                                                started: false,
+                                                closed: false,
+                                            },
+                                        },
                                     },
                                 );
                             }
@@ -1081,6 +1279,9 @@ pub(crate) fn decode_events(
                         let Some(Slot::ToolCall { content_index, arguments }) = slots.get_mut(&output_index) else {
                             continue;
                         };
+                        let ToolArguments::Json(arguments) = arguments else {
+                            continue;
+                        };
                         arguments.push_str(&delta);
                         if let Content::ToolCall(call) = &mut result.content[*content_index] {
                             call.arguments = parse_arguments(arguments);
@@ -1091,6 +1292,9 @@ pub(crate) fn decode_events(
                         let Some(Slot::ToolCall { content_index, arguments }) = slots.get_mut(&output_index) else {
                             continue;
                         };
+                        let ToolArguments::Json(arguments) = arguments else {
+                            continue;
+                        };
                         let delta = completed
                             .strip_prefix(arguments.as_str())
                             .filter(|delta| !delta.is_empty())
@@ -1098,6 +1302,59 @@ pub(crate) fn decode_events(
                         *arguments = completed;
                         if let Content::ToolCall(call) = &mut result.content[*content_index] {
                             call.arguments = parse_arguments(arguments);
+                        }
+                        if let Some(delta) = delta {
+                            yield Ok(Event::ToolCallDelta { content_index: *content_index, delta });
+                        }
+                    }
+                    StreamEvent::CustomToolCallInputDelta { output_index, delta } => {
+                        let Some(Slot::ToolCall { content_index, arguments }) = slots.get_mut(&output_index) else {
+                            continue;
+                        };
+                        let ToolArguments::Grammar { property, buffer } = arguments else {
+                            continue;
+                        };
+                        let next_input = format!("{}{delta}", buffer.input);
+                        let delta = match constrained_sampling::append_grammar_input_delta(
+                            buffer,
+                            property,
+                            &next_input,
+                            false,
+                        ) {
+                            Ok(delta) => delta,
+                            Err(message) => {
+                                yield Err(Error::Stream { message, partial: result });
+                                return;
+                            }
+                        };
+                        if let Content::ToolCall(call) = &mut result.content[*content_index] {
+                            call.arguments = serde_json::json!({property.as_str(): buffer.input});
+                        }
+                        if let Some(delta) = delta {
+                            yield Ok(Event::ToolCallDelta { content_index: *content_index, delta });
+                        }
+                    }
+                    StreamEvent::CustomToolCallInputDone { output_index, input } => {
+                        let Some(Slot::ToolCall { content_index, arguments }) = slots.get_mut(&output_index) else {
+                            continue;
+                        };
+                        let ToolArguments::Grammar { property, buffer } = arguments else {
+                            continue;
+                        };
+                        let delta = match constrained_sampling::append_grammar_input_delta(
+                            buffer,
+                            property,
+                            &input,
+                            true,
+                        ) {
+                            Ok(delta) => delta,
+                            Err(message) => {
+                                yield Err(Error::Stream { message, partial: result });
+                                return;
+                            }
+                        };
+                        if let Content::ToolCall(call) = &mut result.content[*content_index] {
+                            call.arguments = serde_json::json!({property.as_str(): input});
                         }
                         if let Some(delta) = delta {
                             yield Ok(Event::ToolCallDelta { content_index: *content_index, delta });
@@ -1159,6 +1416,9 @@ pub(crate) fn decode_events(
                         let Some(Slot::ToolCall { content_index, arguments }) = slots.get(&output_index) else {
                             continue;
                         };
+                        let ToolArguments::Json(arguments) = arguments else {
+                            continue;
+                        };
                         let final_arguments = item.arguments.as_deref().unwrap_or(arguments);
                         if let Content::ToolCall(call) = &mut result.content[*content_index] {
                             if let Some(id) = item.call_id {
@@ -1168,6 +1428,46 @@ pub(crate) fn decode_events(
                                 call.name = name;
                             }
                             call.arguments = parse_arguments(final_arguments);
+                        }
+                        if let Some(item_id) = item.id {
+                            result.add_openai_item(OpenAiReplay::ToolCall {
+                                content_index: *content_index,
+                                item_id,
+                                namespace: item.namespace,
+                            });
+                        }
+                    }
+                    StreamEvent::OutputItemDone { output_index, item } if item.r#type == "custom_tool_call" => {
+                        let Some(Slot::ToolCall { content_index, arguments }) = slots.get_mut(&output_index) else {
+                            continue;
+                        };
+                        let ToolArguments::Grammar { property, buffer } = arguments else {
+                            continue;
+                        };
+                        let input = item.input.unwrap_or_else(|| buffer.input.clone());
+                        let delta = match constrained_sampling::append_grammar_input_delta(
+                            buffer,
+                            property,
+                            &input,
+                            true,
+                        ) {
+                            Ok(delta) => delta,
+                            Err(message) => {
+                                yield Err(Error::Stream { message, partial: result });
+                                return;
+                            }
+                        };
+                        if let Content::ToolCall(call) = &mut result.content[*content_index] {
+                            if let Some(id) = item.call_id {
+                                call.id = id;
+                            }
+                            if let Some(name) = item.name {
+                                call.name = name;
+                            }
+                            call.arguments = serde_json::json!({property.as_str(): buffer.input});
+                        }
+                        if let Some(delta) = delta {
+                            yield Ok(Event::ToolCallDelta { content_index: *content_index, delta });
                         }
                         if let Some(item_id) = item.id {
                             result.add_openai_item(OpenAiReplay::ToolCall {

@@ -73,16 +73,20 @@ impl Provider {
                 .with_max_retries(stream_options.max_retries.unwrap_or_default())
                 .with_max_retry_delay(stream_options.max_retry_delay)
                 .with_cache_retention(stream_options.cache_retention);
-            if let Some(crate::ModelCompatibility::OpenAi(compat)) = &requested_model.compat {
-                let mode = if compat.supports_additional_tools == Some(true) {
-                    Some(DeferredToolsMode::AdditionalTools)
-                } else if compat.supports_tool_search == Some(true) {
-                    Some(DeferredToolsMode::ToolSearch)
-                } else {
-                    None
-                };
-                provider_options = provider_options.with_deferred_tools_mode(mode);
-            }
+            let compat = match &requested_model.compat {
+                Some(crate::ModelCompatibility::OpenAi(compat)) => compat.clone(),
+                _ => Default::default(),
+            };
+            let mode = if compat.supports_additional_tools == Some(true) {
+                Some(DeferredToolsMode::AdditionalTools)
+            } else if compat.supports_tool_search == Some(true) {
+                Some(DeferredToolsMode::ToolSearch)
+            } else {
+                None
+            };
+            provider_options = provider_options
+                .with_deferred_tools_mode(mode)
+                .with_compatibility(&compat);
             if let Some(temperature) = stream_options.temperature {
                 provider_options = provider_options.with_temperature(temperature);
             }
@@ -443,6 +447,8 @@ pub struct Options {
     text_verbosity: TextVerbosity,
     tool_choice: ToolChoice,
     deferred_tools_mode: Option<DeferredToolsMode>,
+    supports_strict_mode: bool,
+    supports_grammar_tools: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -490,6 +496,8 @@ impl Options {
             text_verbosity: TextVerbosity::Low,
             tool_choice: ToolChoice::Auto,
             deferred_tools_mode: None,
+            supports_strict_mode: true,
+            supports_grammar_tools: false,
         }
     }
 
@@ -582,6 +590,12 @@ impl Options {
         self.deferred_tools_mode = mode;
         self
     }
+
+    fn with_compatibility(mut self, compat: &crate::OpenAiResponsesCompatibility) -> Self {
+        self.supports_strict_mode = compat.supports_strict_mode.unwrap_or(true);
+        self.supports_grammar_tools = compat.supports_open_ai_grammar_tools.unwrap_or(false);
+        self
+    }
 }
 
 #[derive(Serialize)]
@@ -633,6 +647,7 @@ struct SseRequest {
     first_event_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     overall_deadline: Option<Instant>,
+    grammar_input_properties: BTreeMap<String, String>,
 }
 
 pub async fn stream(
@@ -655,6 +670,13 @@ pub async fn stream(
         options.deferred_tools_mode.is_some(),
         str::to_owned,
     );
+    let tool_options = openai::ResponseToolOptions::codex(
+        options.supports_strict_mode,
+        options.supports_grammar_tools,
+    );
+    let grammar_input_properties =
+        openai::grammar_input_properties(context.tools(), options.supports_grammar_tools)
+            .map_err(Error::InvalidRequest)?;
     let request = Request {
         model: &model.id,
         store: false,
@@ -663,11 +685,13 @@ pub async fn stream(
         input: openai::response_input(
             &model.id,
             context,
-            false,
+            None,
             options.deferred_tools_mode.map(|mode| (&placement, mode)),
+            &grammar_input_properties,
+            tool_options,
         )
         .map_err(Error::InvalidRequest)?,
-        tools: tools(&placement).map_err(Error::InvalidRequest)?,
+        tools: tools(&placement, tool_options).map_err(Error::InvalidRequest)?,
         text: TextOptions {
             verbosity: options.text_verbosity,
         },
@@ -700,6 +724,7 @@ pub async fn stream(
         first_event_timeout: options.first_event_timeout,
         idle_timeout: options.idle_timeout,
         overall_deadline,
+        grammar_input_properties: grammar_input_properties.clone(),
     };
     if options.transport != Transport::Sse {
         let mut websocket_value = value.clone();
@@ -715,6 +740,7 @@ pub async fn stream(
                 account_id: &account_id,
                 session_id: session_id.as_deref(),
                 body: websocket_value,
+                grammar_input_properties: &grammar_input_properties,
             },
             options,
             overall_deadline,
@@ -809,6 +835,7 @@ async fn sse_stream(request: &SseRequest) -> Result<ResponseStream, Error> {
         request.first_event_timeout,
         request.idle_timeout,
         request.overall_deadline,
+        request.grammar_input_properties.clone(),
     ))
 }
 
@@ -838,6 +865,7 @@ struct WebSocketRequest<'a> {
     account_id: &'a str,
     session_id: Option<&'a str>,
     body: serde_json::Value,
+    grammar_input_properties: &'a BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -1166,7 +1194,12 @@ async fn websocket_stream(
             }
         }
     };
-    let mut decoded = openai::decode_events(Box::pin(events), request.model.to_owned(), metadata);
+    let mut decoded = openai::decode_events(
+        Box::pin(events),
+        request.model.to_owned(),
+        metadata,
+        request.grammar_input_properties.clone(),
+    );
     let websocket_cache_ttl = options.websocket_cache_ttl;
     let output = async_stream::stream! {
         while let Some(event) = decoded.next().await {
@@ -1555,6 +1588,9 @@ fn websocket_url(base_url: &str) -> String {
         .replacen("http://", "ws://", 1)
 }
 
-fn tools(placement: &ToolPlacement) -> Result<Vec<serde_json::Value>, String> {
-    openai::response_tools(&placement.immediate, false)
+fn tools(
+    placement: &ToolPlacement,
+    options: openai::ResponseToolOptions,
+) -> Result<Vec<serde_json::Value>, String> {
+    openai::response_tools(&placement.immediate, options)
 }
