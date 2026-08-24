@@ -1247,10 +1247,16 @@ async fn times_out_while_reading_an_openai_error_body() {
     let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
     let options =
-        openai::Options::new("test-key").with_overall_timeout(std::time::Duration::from_millis(50));
+        openai::Options::new("test-key").with_overall_timeout(std::time::Duration::from_secs(5));
+    let request = tokio::spawn(async move { openai::stream(&model, &context, &options).await });
+
+    server.wait_for_requests(1).await;
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
 
     assert!(matches!(
-        openai::stream(&model, &context, &options).await,
+        request.await.unwrap(),
         Err(ds_ai::Error::Timeout {
             phase: ds_ai::TimeoutPhase::Overall,
             partial: None,
