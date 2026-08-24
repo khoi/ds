@@ -59,7 +59,7 @@ pub use overflow::{is_context_overflow, is_recoverable_length};
 pub use provider::{
     AnthropicOptions, ApiStreamOptions, Models, OpenAiCodexResponsesOptions,
     OpenAiResponsesOptions, PayloadHook, Provider, ProviderResponse, ResponseHook,
-    SimpleStreamOptions, StreamOptions, ToolChoice, Transport,
+    SimpleStreamOptions, StreamOptions, ThinkingBudgets, ToolChoice, Transport,
 };
 pub use retry::{RetryCallbacks, RetryPolicy, is_retryable_assistant_error, retry_assistant_call};
 pub use text::{ContentText, content_text, content_text_with_separator};

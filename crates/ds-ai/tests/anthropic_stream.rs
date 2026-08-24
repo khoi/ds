@@ -630,7 +630,7 @@ async fn keeps_anthropic_temperature_with_disabled_thinking_and_cache() {
     assert_eq!(body["thinking"], json!({"type": "disabled"}));
     assert!(body.get("output_config").is_none());
     assert!(!request.contains("cache_control"));
-    assert!(!request.contains("anthropic-beta"));
+    assert!(request.contains("anthropic-beta: interleaved-thinking-2025-05-14\r\n"));
 }
 
 #[tokio::test]
@@ -667,7 +667,9 @@ async fn encodes_legacy_tool_streaming_and_strict_schemas() {
         .await;
 
     let request = server.requests().await.pop().unwrap();
-    assert!(request.contains("anthropic-beta: fine-grained-tool-streaming-2025-05-14\r\n"));
+    assert!(request.contains(
+        "anthropic-beta: fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14\r\n"
+    ));
     let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert_eq!(
         body["tools"],

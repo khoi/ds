@@ -187,9 +187,18 @@ pub enum ToolChoice {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct ThinkingBudgets {
+    pub minimal: Option<u64>,
+    pub low: Option<u64>,
+    pub medium: Option<u64>,
+    pub high: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct SimpleStreamOptions {
     pub stream: StreamOptions,
     pub thinking: Option<ThinkingLevel>,
+    pub thinking_budgets: Option<ThinkingBudgets>,
     pub tool_choice: ToolChoice,
 }
 
@@ -463,6 +472,7 @@ impl Models {
                 &SimpleStreamOptions {
                     stream: stream_options,
                     thinking: options.thinking,
+                    thinking_budgets: options.thinking_budgets,
                     tool_choice: options.tool_choice,
                 },
             ))

@@ -4,8 +4,9 @@ use ds_ai::{
     AnthropicFallbackModel, AnthropicMessagesCompatibility, AnthropicOptions, Api,
     ApiStreamOptions, AssistantContent, AssistantMessage, AssistantToolCall, CacheRetention,
     Context, InputContent, Message, ModelCompatibility, ModelCost, ModelCostRates,
-    OpenAiCodexResponsesOptions, OpenAiResponsesOptions, Provider, ProviderId, StopReason,
-    StreamOptions, Tool, ToolResultMessage, Transport, Usage, builtin_model,
+    OpenAiCodexResponsesOptions, OpenAiResponsesOptions, Provider, ProviderId, SimpleStreamOptions,
+    StopReason, StreamOptions, ThinkingBudgets, Tool, ToolResultMessage, Transport, Usage,
+    builtin_model,
 };
 use serde_json::{Value, json};
 
@@ -303,6 +304,175 @@ async fn routes_anthropic_specific_options() {
 }
 
 #[tokio::test]
+async fn requests_interleaved_thinking_when_anthropic_reasoning_is_off() {
+    let server = serve([Reply::sse(anthropic_done())]).await;
+    let mut model = builtin_model("anthropic", "claude-sonnet-4-5").unwrap();
+    model.base_url = server.base_url.clone();
+    let provider = ds_ai::anthropic::Provider::new([model.clone()]);
+
+    provider
+        .stream_simple(
+            &model,
+            &Context::new([Message::user("Hello")]),
+            &SimpleStreamOptions {
+                stream: StreamOptions {
+                    api_key: Some("key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .result()
+        .await
+        .unwrap();
+
+    let request = server.requests().await.pop().unwrap();
+    assert!(request.contains("anthropic-beta: interleaved-thinking-2025-05-14\r\n"));
+    assert_eq!(
+        request_json(&request)["thinking"],
+        json!({"type": "disabled"})
+    );
+}
+
+#[tokio::test]
+async fn reserves_the_default_anthropic_thinking_budget_above_the_answer_cap() {
+    let server = serve([Reply::sse(anthropic_done())]).await;
+    let mut model = builtin_model("anthropic", "claude-sonnet-4-5").unwrap();
+    model.base_url = server.base_url.clone();
+    let provider = ds_ai::anthropic::Provider::new([model.clone()]);
+
+    provider
+        .stream_simple(
+            &model,
+            &Context::new([Message::user("Hello")]),
+            &SimpleStreamOptions {
+                stream: StreamOptions {
+                    api_key: Some("key".into()),
+                    max_tokens: Some(4096),
+                    ..Default::default()
+                },
+                thinking: Some(ds_ai::ThinkingLevel::Medium),
+                ..Default::default()
+            },
+        )
+        .result()
+        .await
+        .unwrap();
+
+    let request = server.requests().await.pop().unwrap();
+    let payload = request_json(&request);
+    assert_eq!(payload["max_tokens"], 12_288);
+    assert_eq!(
+        payload["thinking"],
+        json!({"type": "enabled", "budget_tokens": 8192, "display": "summarized"})
+    );
+}
+
+#[tokio::test]
+async fn applies_a_custom_anthropic_thinking_budget() {
+    let server = serve([Reply::sse(anthropic_done())]).await;
+    let mut model = builtin_model("anthropic", "claude-sonnet-4-5").unwrap();
+    model.base_url = server.base_url.clone();
+    let provider = ds_ai::anthropic::Provider::new([model.clone()]);
+
+    provider
+        .stream_simple(
+            &model,
+            &Context::new([Message::user("Hello")]),
+            &SimpleStreamOptions {
+                stream: StreamOptions {
+                    api_key: Some("key".into()),
+                    max_tokens: Some(4096),
+                    ..Default::default()
+                },
+                thinking: Some(ds_ai::ThinkingLevel::Medium),
+                thinking_budgets: Some(ThinkingBudgets {
+                    medium: Some(2048),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .result()
+        .await
+        .unwrap();
+
+    let request = server.requests().await.pop().unwrap();
+    let payload = request_json(&request);
+    assert_eq!(payload["max_tokens"], 6144);
+    assert_eq!(payload["thinking"]["budget_tokens"], 2048);
+}
+
+#[tokio::test]
+async fn defaults_a_zero_direct_anthropic_thinking_budget() {
+    let server = serve([Reply::sse(anthropic_done())]).await;
+    let mut model = builtin_model("anthropic", "claude-sonnet-4-5").unwrap();
+    model.base_url = server.base_url.clone();
+    let provider = ds_ai::anthropic::Provider::new([model.clone()]);
+
+    provider
+        .stream(
+            &model,
+            &Context::new([Message::user("Hello")]),
+            &ApiStreamOptions::AnthropicMessages(AnthropicOptions {
+                stream: StreamOptions {
+                    api_key: Some("key".into()),
+                    ..Default::default()
+                },
+                thinking_enabled: Some(true),
+                thinking_budget_tokens: Some(0),
+                ..Default::default()
+            }),
+        )
+        .result()
+        .await
+        .unwrap();
+
+    let request = server.requests().await.pop().unwrap();
+    assert_eq!(request_json(&request)["thinking"]["budget_tokens"], 1024);
+}
+
+#[tokio::test]
+async fn maps_anthropic_simple_effort_through_model_metadata() {
+    let server = serve([Reply::sse(anthropic_done())]).await;
+    let mut model = builtin_model("anthropic", "claude-sonnet-4-5").unwrap();
+    model.base_url = server.base_url.clone();
+    model
+        .thinking_level_map
+        .insert(ds_ai::ThinkingLevel::Minimal, Some("medium".into()));
+    model.compat = Some(ModelCompatibility::Anthropic(
+        AnthropicMessagesCompatibility {
+            force_adaptive_thinking: Some(true),
+            ..Default::default()
+        },
+    ));
+    let provider = ds_ai::anthropic::Provider::new([model.clone()]);
+
+    provider
+        .stream_simple(
+            &model,
+            &Context::new([Message::user("Hello")]),
+            &SimpleStreamOptions {
+                stream: StreamOptions {
+                    api_key: Some("key".into()),
+                    ..Default::default()
+                },
+                thinking: Some(ds_ai::ThinkingLevel::Minimal),
+                ..Default::default()
+            },
+        )
+        .result()
+        .await
+        .unwrap();
+
+    let request = server.requests().await.pop().unwrap();
+    assert_eq!(
+        request_json(&request)["output_config"],
+        json!({"effort": "medium"})
+    );
+}
+
+#[tokio::test]
 async fn applies_anthropic_model_compatibility() {
     let server = serve([Reply::sse(anthropic_done()), Reply::sse(anthropic_done())]).await;
     let mut model = builtin_model("anthropic", "claude-opus-4-5").unwrap();
@@ -432,7 +602,9 @@ async fn uses_anthropic_fallback_models_and_pricing() {
     assert_eq!(result.usage.cost.total, 2.75);
 
     let request = server.requests().await.pop().unwrap();
-    assert!(request.contains("anthropic-beta: server-side-fallback-2026-07-01\r\n"));
+    assert!(request.contains(
+        "anthropic-beta: interleaved-thinking-2025-05-14,server-side-fallback-2026-07-01\r\n"
+    ));
     assert_eq!(
         request_json(&request)["fallbacks"],
         json!([{"model": "claude-fallback"}])
@@ -513,7 +685,13 @@ async fn shapes_anthropic_oauth_requests_and_tool_names() {
     assert!(!request.contains("x-api-key:"));
     assert!(request.contains("user-agent: claude-cli/2.1.75\r\n"));
     assert!(request.contains("x-app: cli\r\n"));
-    assert!(request.contains("anthropic-beta: claude-code-20250219,oauth-2025-04-20\r\n"));
+    let expected_beta = [
+        "claude-code-20250219",
+        "oauth-2025-04-20",
+        concat!("interleaved-", "thinking-2025-05-14"),
+    ]
+    .join(",");
+    assert!(request.contains(&format!("anthropic-beta: {expected_beta}\r\n")));
     let payload = request_json(&request);
     assert_eq!(
         payload["system"][0]["text"],

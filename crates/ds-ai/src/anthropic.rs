@@ -176,18 +176,37 @@ impl crate::Provider for Provider {
         context: &Context,
         options: &crate::SimpleStreamOptions,
     ) -> crate::AssistantMessageEventStream {
-        let stream =
+        let mut stream =
             crate::provider::build_simple_stream_options(model, context, options.stream.clone());
         let thinking = options
             .thinking
             .map(|level| model.clamp_thinking_level(level));
+        let adaptive = matches!(
+            &model.compat,
+            Some(crate::ModelCompatibility::Anthropic(compat))
+                if compat.force_adaptive_thinking == Some(true)
+        );
+        let thinking_budget_tokens = thinking
+            .filter(|level| *level != crate::ThinkingLevel::Off && !adaptive)
+            .map(|level| {
+                let budget = thinking_budget(level, options.thinking_budgets.as_ref());
+                let max_tokens = stream
+                    .max_tokens
+                    .unwrap_or(model.max_tokens)
+                    .saturating_add(budget)
+                    .min(model.max_tokens);
+                let max_tokens = crate::clamp_max_tokens_to_context(model, context, max_tokens);
+                stream.max_tokens = Some(max_tokens);
+                budget.min(max_tokens.saturating_sub(1024))
+            });
         self.request(
             model,
             context,
             &crate::AnthropicOptions {
                 stream,
                 thinking_enabled: Some(!matches!(thinking, None | Some(crate::ThinkingLevel::Off))),
-                effort: thinking.and_then(anthropic_effort),
+                thinking_budget_tokens,
+                effort: thinking.and_then(|level| anthropic_effort(model, level)),
                 tool_choice: Some(match options.tool_choice {
                     crate::ToolChoice::Auto => ToolChoice::Auto,
                     crate::ToolChoice::None => ToolChoice::None,
@@ -198,11 +217,40 @@ impl crate::Provider for Provider {
     }
 }
 
+fn thinking_budget(level: crate::ThinkingLevel, budgets: Option<&crate::ThinkingBudgets>) -> u64 {
+    match level {
+        crate::ThinkingLevel::Off => 0,
+        crate::ThinkingLevel::Minimal => {
+            budgets.and_then(|budgets| budgets.minimal).unwrap_or(1024)
+        }
+        crate::ThinkingLevel::Low => budgets.and_then(|budgets| budgets.low).unwrap_or(2048),
+        crate::ThinkingLevel::Medium => budgets.and_then(|budgets| budgets.medium).unwrap_or(8192),
+        crate::ThinkingLevel::High | crate::ThinkingLevel::XHigh | crate::ThinkingLevel::Max => {
+            budgets.and_then(|budgets| budgets.high).unwrap_or(16_384)
+        }
+    }
+}
+
 pub fn provider() -> Arc<dyn crate::Provider> {
     Arc::new(Provider::new(crate::anthropic_models().iter().cloned()))
 }
 
-fn anthropic_effort(level: crate::ThinkingLevel) -> Option<Effort> {
+fn anthropic_effort(model: &crate::Model, level: crate::ThinkingLevel) -> Option<Effort> {
+    if let Some(Some(mapped)) = model.thinking_level_map.get(&level) {
+        let effort = match mapped.as_str() {
+            "low" => Effort::Low,
+            "medium" => Effort::Medium,
+            "high" => Effort::High,
+            "xhigh" => Effort::XHigh,
+            "max" => Effort::Max,
+            _ => return default_anthropic_effort(level),
+        };
+        return Some(effort);
+    }
+    default_anthropic_effort(level)
+}
+
+fn default_anthropic_effort(level: crate::ThinkingLevel) -> Option<Effort> {
     match level {
         crate::ThinkingLevel::Off => None,
         crate::ThinkingLevel::Minimal | crate::ThinkingLevel::Low => Some(Effort::Low),
@@ -238,7 +286,10 @@ fn resolve_thinking(model: &crate::Model, options: &crate::AnthropicOptions) -> 
             })
         }
         Some(true) => Some(Thinking::Enabled {
-            budget_tokens: options.thinking_budget_tokens.unwrap_or(1024),
+            budget_tokens: options
+                .thinking_budget_tokens
+                .filter(|budget| *budget > 0)
+                .unwrap_or(1024),
             display: options
                 .thinking_display
                 .unwrap_or(ThinkingDisplay::Summarized),
@@ -378,6 +429,7 @@ pub struct Model {
     session_affinity_headers: bool,
     cache_control_on_tools: bool,
     temperature: bool,
+    adaptive_thinking: bool,
     strict_tools: bool,
     empty_thinking_signatures: bool,
     tool_references: bool,
@@ -394,6 +446,7 @@ impl Model {
             session_affinity_headers: false,
             cache_control_on_tools: true,
             temperature: true,
+            adaptive_thinking: false,
             strict_tools: false,
             empty_thinking_signatures: false,
             tool_references: false,
@@ -411,6 +464,7 @@ impl Model {
             result.session_affinity_headers = compat.send_session_affinity_headers.unwrap_or(false);
             result.cache_control_on_tools = compat.supports_cache_control_on_tools.unwrap_or(true);
             result.temperature = compat.supports_temperature.unwrap_or(true);
+            result.adaptive_thinking = compat.force_adaptive_thinking == Some(true);
             result.strict_tools = compat.supports_strict_tools.unwrap_or(false);
             result.empty_thinking_signatures = compat.allow_empty_signature.unwrap_or(false);
             result.tool_references = compat
@@ -878,7 +932,10 @@ pub async fn stream(
     if legacy_tool_streaming {
         beta_features.push("fine-grained-tool-streaming-2025-05-14");
     }
-    if options.interleaved_thinking && matches!(options.thinking, Some(Thinking::Enabled { .. })) {
+    if options.interleaved_thinking
+        && !model.adaptive_thinking
+        && !matches!(options.thinking, Some(Thinking::Adaptive { .. }))
+    {
         beta_features.push("interleaved-thinking-2025-05-14");
     }
     if !model.fallback_models.is_empty() {
