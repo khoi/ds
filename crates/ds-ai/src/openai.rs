@@ -316,7 +316,7 @@ enum StreamEvent {
         output_index: usize,
         item: OutputItem,
     },
-    #[serde(rename = "response.completed")]
+    #[serde(rename = "response.completed", alias = "response.done")]
     Completed { response: CompletedResponse },
     #[serde(rename = "response.incomplete")]
     Incomplete { response: IncompleteResponse },
@@ -376,6 +376,9 @@ enum Slot {
 #[derive(Deserialize)]
 struct CompletedResponse {
     id: Option<String>,
+    status: Option<String>,
+    incomplete_details: Option<IncompleteDetails>,
+    error: Option<FailedDetail>,
     #[serde(default)]
     usage: CompletedUsage,
 }
@@ -866,6 +869,42 @@ pub(crate) fn decode_events(
                             result.id = response.id;
                         }
                         result.usage = usage(response.usage);
+                        if response.status.as_deref() == Some("incomplete") {
+                            let reason = response
+                                .incomplete_details
+                                .map(|details| details.reason)
+                                .unwrap_or_else(|| "unknown".into());
+                            if reason == "max_output_tokens" {
+                                result.stop_reason = StopReason::Length;
+                                result.raw_stop_reason =
+                                    Some("incomplete.max_output_tokens".into());
+                                yield Ok(Event::Done(Box::new(result)));
+                            } else {
+                                result.stop_reason = StopReason::Error;
+                                result.raw_stop_reason = Some(format!("incomplete.{reason}"));
+                                yield Err(Error::Response {
+                                    code: None,
+                                    message: format!("Response incomplete: {reason}"),
+                                    partial: result,
+                                });
+                            }
+                            return;
+                        }
+                        if matches!(response.status.as_deref(), Some("failed" | "cancelled")) {
+                            let code = response.error.as_ref().and_then(|error| error.code.clone());
+                            let message = response
+                                .error
+                                .and_then(|error| error.message)
+                                .unwrap_or_else(|| "Provider response failed".into());
+                            result.stop_reason = StopReason::Error;
+                            result.raw_stop_reason = response.status;
+                            yield Err(Error::Response {
+                                code,
+                                message,
+                                partial: result,
+                            });
+                            return;
+                        }
                         result.stop_reason = if result
                             .content
                             .iter()

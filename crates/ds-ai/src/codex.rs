@@ -1,14 +1,18 @@
 use crate::{
-    CacheRetention, Content, Context, Error, InputContent, Message, ResponseStream, http, openai,
-    retry, schema, transport, types::OpenAiReplay,
+    CacheRetention, Content, Context, Error, InputContent, Message, ResponseMetadata,
+    ResponseStream, http, openai, retry, schema, transport, types::OpenAiReplay,
 };
 use base64::prelude::*;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use std::time::Duration;
-use tokio::time::Instant;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex as StdMutex, OnceLock},
+    time::Duration,
+};
+use tokio::{net::TcpStream, sync::Mutex as AsyncMutex, time::Instant};
 use tokio_tungstenite::{
-    connect_async,
+    MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message as WebSocketMessage, client::IntoClientRequest, http::HeaderValue},
 };
 use tokio_util::sync::CancellationToken;
@@ -16,6 +20,25 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const WEBSOCKET_MAX_AGE: Duration = Duration::from_secs(55 * 60);
+
+type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+#[derive(Clone)]
+struct CachedWebSocket {
+    socket: Arc<AsyncMutex<WebSocket>>,
+    created_at: Instant,
+    metadata: ResponseMetadata,
+    continuation: Arc<StdMutex<Option<Continuation>>>,
+}
+
+struct Continuation {
+    request: serde_json::Value,
+    response_id: String,
+    response_items: Vec<serde_json::Value>,
+}
+
+static WEBSOCKETS: OnceLock<StdMutex<HashMap<String, CachedWebSocket>>> = OnceLock::new();
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Model {
@@ -194,8 +217,6 @@ pub async fn stream(
             .as_object_mut()
             .expect("request serializes as an object")
             .insert("type".into(), "response.create".into());
-        let websocket_body = serde_json::to_string(&websocket_value)
-            .map_err(|error| Error::InvalidRequest(error.to_string()))?;
         match websocket_stream(
             WebSocketRequest {
                 base_url: &model.base_url,
@@ -203,7 +224,7 @@ pub async fn stream(
                 access_token: &options.access_token,
                 account_id: &account_id,
                 session_id: session_id.as_deref(),
-                body: websocket_body,
+                body: websocket_value,
             },
             options,
             overall_deadline,
@@ -282,7 +303,7 @@ struct WebSocketRequest<'a> {
     access_token: &'a str,
     account_id: &'a str,
     session_id: Option<&'a str>,
-    body: String,
+    body: serde_json::Value,
 }
 
 async fn websocket_stream(
@@ -290,6 +311,12 @@ async fn websocket_stream(
     options: &Options,
     overall_deadline: Option<Instant>,
 ) -> Result<ResponseStream, WebSocketConnectError> {
+    let cache_key = request.session_id.map(|session_id| {
+        format!(
+            "{}\u{1f}{}\u{1f}{session_id}",
+            request.base_url, request.account_id
+        )
+    });
     let request_id = request
         .session_id
         .map(str::to_owned)
@@ -306,44 +333,89 @@ async fn websocket_stream(
             concat!("ds-ai/", env!("CARGO_PKG_VERSION")).into(),
         ),
         ("x-client-request-id", request_id),
+        ("openai-beta", "responses_websockets=2026-02-06".into()),
     ] {
         connection_request.headers_mut().insert(
             name,
             HeaderValue::from_str(&value).map_err(|_| WebSocketConnectError::Transport)?,
         );
     }
-    let connect_deadline = Instant::now() + options.websocket_connect_timeout;
-    let connection = tokio::select! {
+    let session_header = connection_request.headers()["x-client-request-id"].clone();
+    connection_request
+        .headers_mut()
+        .insert("session-id", session_header);
+    let cached = cache_key.as_deref().and_then(cached_websocket);
+    let connection = if let Some(cached) = cached {
+        cached
+    } else {
+        let connect_deadline = Instant::now() + options.websocket_connect_timeout;
+        let connection = tokio::select! {
+            biased;
+            _ = options.cancellation.cancelled() => return Err(WebSocketConnectError::Cancelled),
+            _ = transport::wait_until(overall_deadline) => {
+                return Err(WebSocketConnectError::OverallTimeout);
+            }
+            _ = tokio::time::sleep_until(connect_deadline) => {
+                return Err(WebSocketConnectError::Transport);
+            }
+            connection = connect_async(connection_request) => {
+                connection.map_err(|_| WebSocketConnectError::Transport)?
+            }
+        };
+        let (socket, response) = connection;
+        let connection = CachedWebSocket {
+            socket: Arc::new(AsyncMutex::new(socket)),
+            created_at: Instant::now(),
+            metadata: http::metadata(response.headers()),
+            continuation: Arc::new(StdMutex::new(None)),
+        };
+        if let Some(cache_key) = &cache_key {
+            websockets()
+                .lock()
+                .expect("websocket cache lock")
+                .insert(cache_key.clone(), connection.clone());
+        }
+        connection
+    };
+    let socket = connection.socket.clone();
+    let mut socket = tokio::select! {
         biased;
         _ = options.cancellation.cancelled() => return Err(WebSocketConnectError::Cancelled),
         _ = transport::wait_until(overall_deadline) => {
             return Err(WebSocketConnectError::OverallTimeout);
         }
-        _ = tokio::time::sleep_until(connect_deadline) => {
-            return Err(WebSocketConnectError::Transport);
-        }
-        connection = connect_async(connection_request) => {
-            connection.map_err(|_| WebSocketConnectError::Transport)?
-        }
+        socket = socket.lock_owned() => socket,
     };
-    let (mut socket, response) = connection;
+    let body = continuation_request(
+        &request.body,
+        connection
+            .continuation
+            .lock()
+            .expect("websocket continuation lock")
+            .as_ref(),
+    );
+    let body = serde_json::to_string(&body).map_err(|_| WebSocketConnectError::Transport)?;
     tokio::select! {
         biased;
         _ = options.cancellation.cancelled() => return Err(WebSocketConnectError::Cancelled),
         _ = transport::wait_until(overall_deadline) => {
             return Err(WebSocketConnectError::OverallTimeout);
         }
-        result = socket.send(WebSocketMessage::Text(request.body.into())) => {
+        result = socket.send(WebSocketMessage::Text(body.into())) => {
             result.map_err(|_| WebSocketConnectError::Transport)?;
         }
     }
-    let metadata = http::metadata(response.headers());
+    let full_request = request.body;
+    let continuation = connection.continuation;
+    let metadata = connection.metadata;
     let cancellation = options.cancellation.clone();
     let first_event_timeout = options.first_event_timeout;
     let idle_timeout = options.idle_timeout;
     let events = async_stream::stream! {
         let mut saw_event = false;
         let mut event_deadline = first_event_timeout.map(|timeout| Instant::now() + timeout);
+        let mut response_id = None;
+        let mut response_items = Vec::new();
         loop {
             let message = tokio::select! {
                 biased;
@@ -386,7 +458,24 @@ async fn websocket_stream(
             if let Some(data) = data {
                 saw_event = true;
                 event_deadline = idle_timeout.map(|timeout| Instant::now() + timeout);
+                let terminal = observe_websocket_event(
+                    &data,
+                    &mut response_id,
+                    &mut response_items,
+                );
+                if terminal
+                    && let Some(response_id) = response_id.take()
+                {
+                    *continuation.lock().expect("websocket continuation lock") = Some(Continuation {
+                        request: full_request.clone(),
+                        response_id,
+                        response_items: std::mem::take(&mut response_items),
+                    });
+                }
                 yield Ok(data);
+                if terminal {
+                    return;
+                }
             }
         }
     };
@@ -395,6 +484,90 @@ async fn websocket_stream(
         request.model.to_owned(),
         metadata,
     ))
+}
+
+fn websockets() -> &'static StdMutex<HashMap<String, CachedWebSocket>> {
+    WEBSOCKETS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn cached_websocket(key: &str) -> Option<CachedWebSocket> {
+    let mut cache = websockets().lock().expect("websocket cache lock");
+    let expired = cache
+        .get(key)
+        .is_some_and(|connection| connection.created_at.elapsed() >= WEBSOCKET_MAX_AGE);
+    if expired {
+        cache.remove(key);
+    }
+    cache.get(key).cloned()
+}
+
+fn continuation_request(
+    request: &serde_json::Value,
+    continuation: Option<&Continuation>,
+) -> serde_json::Value {
+    let Some(continuation) = continuation else {
+        return request.clone();
+    };
+    if request_configuration(request) != request_configuration(&continuation.request) {
+        return request.clone();
+    }
+    let Some(current) = request.get("input").and_then(serde_json::Value::as_array) else {
+        return request.clone();
+    };
+    let mut baseline = continuation
+        .request
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    baseline.extend(continuation.response_items.iter().cloned());
+    if current.len() < baseline.len() || current[..baseline.len()] != baseline {
+        return request.clone();
+    }
+    let mut request = request.clone();
+    let request = request.as_object_mut().expect("request is an object");
+    request.insert(
+        "previous_response_id".into(),
+        continuation.response_id.clone().into(),
+    );
+    request.insert("input".into(), current[baseline.len()..].to_vec().into());
+    serde_json::Value::Object(request.clone())
+}
+
+fn request_configuration(request: &serde_json::Value) -> serde_json::Value {
+    let mut request = request.clone();
+    if let Some(request) = request.as_object_mut() {
+        request.remove("input");
+        request.remove("previous_response_id");
+    }
+    request
+}
+
+fn observe_websocket_event(
+    data: &str,
+    response_id: &mut Option<String>,
+    response_items: &mut Vec<serde_json::Value>,
+) -> bool {
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+        return false;
+    };
+    let event_type = event.get("type").and_then(serde_json::Value::as_str);
+    if event_type == Some("response.output_item.done")
+        && let Some(item) = event.get("item")
+    {
+        response_items.push(item.clone());
+    }
+    if let Some(id) = event
+        .get("response")
+        .and_then(|response| response.get("id"))
+        .and_then(serde_json::Value::as_str)
+    {
+        *response_id = Some(id.to_owned());
+    }
+    matches!(
+        event_type,
+        Some("response.done" | "response.completed" | "response.incomplete")
+    )
 }
 
 fn account_id(token: &str) -> Result<String, String> {

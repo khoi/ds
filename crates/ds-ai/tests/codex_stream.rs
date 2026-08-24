@@ -99,7 +99,7 @@ async fn retries_and_compresses_a_codex_sse_request() {
 
 #[tokio::test]
 async fn streams_a_codex_websocket_request() {
-    let (base_url, capture) = serve_websocket([
+    let (base_url, capture) = serve_websocket([vec![
         json!({"type": "response.created", "response": {"id": "resp_ws"}}),
         json!({
             "type": "response.output_item.added",
@@ -120,7 +120,7 @@ async fn streams_a_codex_websocket_request() {
             "type": "response.completed",
             "response": {"id": "resp_ws", "status": "completed", "usage": {}}
         }),
-    ])
+    ]])
     .await;
     let token = token("acc_ws");
     let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
@@ -146,12 +146,67 @@ async fn streams_a_codex_websocket_request() {
     assert_eq!(capture.headers["originator"], "ds");
     assert_eq!(capture.headers["user-agent"], "ds-ai/0.1.0");
     assert_eq!(capture.headers["x-client-request-id"], "session_ws");
-    assert!(!capture.headers.contains_key("session-id"));
-    assert!(!capture.headers.contains_key("openai-beta"));
+    assert_eq!(capture.headers["session-id"], "session_ws");
+    assert_eq!(
+        capture.headers["openai-beta"],
+        "responses_websockets=2026-02-06"
+    );
     assert!(!capture.headers.contains_key("content-encoding"));
-    assert_eq!(capture.body["type"], "response.create");
-    assert_eq!(capture.body["model"], "gpt-5.6-codex");
-    assert_eq!(capture.body["input"][0]["content"][0]["text"], "Connect");
+    assert_eq!(capture.bodies[0]["type"], "response.create");
+    assert_eq!(capture.bodies[0]["model"], "gpt-5.6-codex");
+    assert_eq!(
+        capture.bodies[0]["input"][0]["content"][0]["text"],
+        "Connect"
+    );
+}
+
+#[tokio::test]
+async fn reuses_a_codex_websocket_with_an_input_delta() {
+    let (base_url, capture) = serve_websocket([
+        text_events("resp_first", "msg_first", "First"),
+        text_events("resp_second", "msg_second", "Second"),
+    ])
+    .await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let options = codex::Options::new(token("acc_reuse"))
+        .with_session_id("session_reuse")
+        .with_transport(codex::Transport::WebSocket);
+    let first_context = Context::new([Message::user("First")]).with_system("Be brief");
+    let first_events = codex::stream(&model, &first_context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    let first_response = done(&first_events).clone();
+    let second_context = Context::new([
+        Message::user("First"),
+        Message::assistant(first_response),
+        Message::user("Continue"),
+    ])
+    .with_system("Be brief");
+
+    let second_events = codex::stream(&model, &second_context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert_eq!(
+        done(&second_events).content,
+        [ds_ai::Content::Text("Second".into())]
+    );
+    let capture = capture.await.unwrap();
+    assert_eq!(capture.bodies.len(), 2);
+    assert!(capture.bodies[0].get("previous_response_id").is_none());
+    assert_eq!(capture.bodies[0]["input"].as_array().unwrap().len(), 1);
+    assert_eq!(capture.bodies[1]["previous_response_id"], "resp_first");
+    assert_eq!(
+        capture.bodies[1]["input"],
+        json!([{
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Continue"}]
+        }])
+    );
 }
 
 #[tokio::test]
@@ -218,17 +273,17 @@ fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {
 struct WebSocketCapture {
     path: String,
     headers: BTreeMap<String, String>,
-    body: Value,
+    bodies: Vec<Value>,
 }
 
 type CapturedHandshake = (String, BTreeMap<String, String>);
 
 async fn serve_websocket(
-    events: impl IntoIterator<Item = Value>,
+    event_batches: impl IntoIterator<Item = Vec<Value>>,
 ) -> (String, oneshot::Receiver<WebSocketCapture>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let events = events.into_iter().collect::<Vec<_>>();
+    let event_batches = event_batches.into_iter().collect::<Vec<_>>();
     let handshake = Arc::new(Mutex::new(None));
     let task_handshake = handshake.clone();
     let (sender, receiver) = oneshot::channel();
@@ -242,26 +297,64 @@ async fn serve_websocket(
         )
         .await
         .unwrap();
-        let body = match socket.next().await {
-            Some(Ok(WebSocketMessage::Text(body))) => serde_json::from_str(&body).unwrap(),
-            message => panic!("unexpected websocket request: {message:?}"),
-        };
-        for event in events {
-            socket
-                .send(WebSocketMessage::Text(event.to_string().into()))
-                .await
-                .unwrap();
+        let mut bodies = Vec::new();
+        for events in event_batches {
+            let body = match socket.next().await {
+                Some(Ok(WebSocketMessage::Text(body))) => serde_json::from_str(&body).unwrap(),
+                message => panic!("unexpected websocket request: {message:?}"),
+            };
+            bodies.push(body);
+            for event in events {
+                socket
+                    .send(WebSocketMessage::Text(event.to_string().into()))
+                    .await
+                    .unwrap();
+            }
         }
         let (path, headers) = handshake.lock().unwrap().take().unwrap();
         sender
             .send(WebSocketCapture {
                 path,
                 headers,
-                body,
+                bodies,
             })
             .ok();
     });
     (format!("http://{address}"), receiver)
+}
+
+fn text_events(response_id: &str, message_id: &str, text: &str) -> Vec<Value> {
+    vec![
+        json!({"type": "response.created", "response": {"id": response_id}}),
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": []
+            }
+        }),
+        json!({"type": "response.output_text.delta", "output_index": 0, "delta": text}),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+                "phase": null
+            }
+        }),
+        json!({
+            "type": "response.done",
+            "response": {"id": response_id, "status": "completed", "usage": {}}
+        }),
+    ]
 }
 
 struct CaptureHandshake {
