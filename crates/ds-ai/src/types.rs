@@ -429,6 +429,12 @@ impl Response {
         }
     }
 
+    pub(crate) fn set_anthropic_model(&mut self, model: String) {
+        if let ProviderState::Anthropic(state) = &mut self.provider {
+            state.model = model;
+        }
+    }
+
     pub fn into_assistant_message(self, timestamp: u64) -> AssistantMessage {
         let (api, provider, model) = match &self.provider {
             ProviderState::OpenAi(state) => (

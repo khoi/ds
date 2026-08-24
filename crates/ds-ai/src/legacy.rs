@@ -209,16 +209,21 @@ fn final_message(model: &Model, response: Response) -> AssistantMessage {
     message.api = model.api.clone();
     message.provider = model.provider.clone();
     message.model = model.id.clone();
-    model.calculate_cost(&mut message.usage);
-    if matches!(
-        model.api,
-        crate::Api::OpenAiResponses | crate::Api::OpenAiCodexResponses
-    ) {
-        crate::openai::apply_service_tier_pricing(
+    match model.api {
+        crate::Api::AnthropicMessages => crate::anthropic::calculate_cost(
             model,
+            message.response_model.as_deref(),
             &mut message.usage,
-            service_tier.as_deref(),
-        );
+        ),
+        crate::Api::OpenAiResponses | crate::Api::OpenAiCodexResponses => {
+            model.calculate_cost(&mut message.usage);
+            crate::openai::apply_service_tier_pricing(
+                model,
+                &mut message.usage,
+                service_tier.as_deref(),
+            );
+        }
+        crate::Api::Other(_) => model.calculate_cost(&mut message.usage),
     }
     message
 }

@@ -52,25 +52,7 @@ impl Provider {
             let api_key = stream_options
                 .api_key
                 .ok_or_else(|| Error::InvalidRequest("Anthropic API key is required".into()))?;
-            let mut provider_model = Model::new(&requested_model.id)
-                .with_base_url(requested_model.base_url.clone())
-                .with_tool_references(default_supports_tool_references(&requested_model));
-            if let Some(crate::ModelCompatibility::Anthropic(compat)) = &requested_model.compat {
-                provider_model = provider_model.with_eager_tool_input_streaming(
-                    compat.supports_eager_tool_input_streaming.unwrap_or(true),
-                );
-                if compat.supports_strict_tools == Some(true) {
-                    provider_model = provider_model.with_strict_tools();
-                }
-                if compat.allow_empty_signature == Some(true) {
-                    provider_model = provider_model.with_empty_thinking_signatures();
-                }
-                provider_model = provider_model.with_tool_references(
-                    compat
-                        .supports_tool_references
-                        .unwrap_or_else(|| default_supports_tool_references(&requested_model)),
-                );
-            }
+            let provider_model = Model::from_public(&requested_model);
             let max_tokens = stream_options
                 .max_tokens
                 .unwrap_or(requested_model.max_tokens)
@@ -82,6 +64,7 @@ impl Provider {
                 .with_max_retry_delay(stream_options.max_retry_delay)
                 .with_cache_retention(stream_options.cache_retention)
                 .with_interleaved_thinking(options.interleaved_thinking.unwrap_or(true))
+                .with_session_id(stream_options.session_id)
                 .with_request_options(stream_options.headers, request_hooks);
             if let Some(temperature) = stream_options.temperature {
                 provider_options = provider_options.with_temperature(temperature);
@@ -333,14 +316,19 @@ impl crate::ApiKeyAuth for AnthropicApiKeyAuth {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Model {
     id: String,
     base_url: String,
     eager_tool_input_streaming: bool,
+    long_cache_retention: bool,
+    session_affinity_headers: bool,
+    cache_control_on_tools: bool,
+    temperature: bool,
     strict_tools: bool,
     empty_thinking_signatures: bool,
     tool_references: bool,
+    fallback_models: Vec<String>,
 }
 
 impl Model {
@@ -349,10 +337,39 @@ impl Model {
             id: id.into(),
             base_url: DEFAULT_BASE_URL.into(),
             eager_tool_input_streaming: true,
+            long_cache_retention: true,
+            session_affinity_headers: false,
+            cache_control_on_tools: true,
+            temperature: true,
             strict_tools: false,
             empty_thinking_signatures: false,
             tool_references: false,
+            fallback_models: Vec::new(),
         }
+    }
+
+    fn from_public(model: &crate::Model) -> Self {
+        let mut result = Self::new(&model.id).with_base_url(&model.base_url);
+        result.tool_references = default_supports_tool_references(model);
+        if let Some(crate::ModelCompatibility::Anthropic(compat)) = &model.compat {
+            result.eager_tool_input_streaming =
+                compat.supports_eager_tool_input_streaming.unwrap_or(true);
+            result.long_cache_retention = compat.supports_long_cache_retention.unwrap_or(true);
+            result.session_affinity_headers = compat.send_session_affinity_headers.unwrap_or(false);
+            result.cache_control_on_tools = compat.supports_cache_control_on_tools.unwrap_or(true);
+            result.temperature = compat.supports_temperature.unwrap_or(true);
+            result.strict_tools = compat.supports_strict_tools.unwrap_or(false);
+            result.empty_thinking_signatures = compat.allow_empty_signature.unwrap_or(false);
+            result.tool_references = compat
+                .supports_tool_references
+                .unwrap_or(result.tool_references);
+            result.fallback_models = compat
+                .allowed_fallback_models
+                .iter()
+                .map(|fallback| fallback.model.clone())
+                .collect();
+        }
+        result
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -374,11 +391,6 @@ impl Model {
         self.empty_thinking_signatures = true;
         self
     }
-
-    pub(crate) fn with_tool_references(mut self, enabled: bool) -> Self {
-        self.tool_references = enabled;
-        self
-    }
 }
 
 pub struct Options {
@@ -398,6 +410,7 @@ pub struct Options {
     tool_choice: Option<ToolChoice>,
     cache_retention: CacheRetention,
     interleaved_thinking: bool,
+    session_id: Option<String>,
     headers: BTreeMap<String, Option<String>>,
     request_hooks: Option<crate::provider::RequestHooks>,
 }
@@ -459,6 +472,7 @@ impl Options {
             tool_choice: None,
             cache_retention: CacheRetention::Short,
             interleaved_thinking: true,
+            session_id: None,
             headers: BTreeMap::new(),
             request_hooks: None,
         }
@@ -542,6 +556,11 @@ impl Options {
         self
     }
 
+    pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
     fn with_request_options(
         mut self,
         headers: BTreeMap<String, Option<String>>,
@@ -575,6 +594,13 @@ struct Request<'a> {
     metadata: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    fallbacks: Vec<FallbackRequest<'a>>,
+}
+
+#[derive(Serialize)]
+struct FallbackRequest<'a> {
+    model: &'a str,
 }
 
 #[derive(Serialize)]
@@ -636,6 +662,7 @@ enum StreamEvent {
 #[derive(Deserialize)]
 struct StartedMessage {
     id: String,
+    model: Option<String>,
     #[serde(default)]
     usage: AnthropicUsage,
 }
@@ -686,7 +713,13 @@ struct AnthropicUsage {
     output_tokens: Option<u64>,
     cache_read_input_tokens: Option<u64>,
     cache_creation_input_tokens: Option<u64>,
+    cache_creation: Option<CacheCreationUsage>,
     output_tokens_details: Option<OutputTokenDetails>,
+}
+
+#[derive(Deserialize)]
+struct CacheCreationUsage {
+    ephemeral_1h_input_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -721,7 +754,7 @@ pub async fn stream(
     let overall_deadline = options
         .overall_timeout
         .map(|timeout| Instant::now() + timeout);
-    let cache_control = cache_control(options.cache_retention);
+    let cache_control = cache_control(options.cache_retention, model.long_cache_retention);
     let (thinking, output_config) = thinking(&options.thinking);
     let mut placement = crate::deferred_tools::split(context, model.tool_references, str::to_owned);
     if placement.immediate.is_empty() && !placement.deferred.is_empty() {
@@ -745,13 +778,14 @@ pub async fn stream(
         max_tokens: options.max_tokens,
         stream: true,
         stop_sequences: options.stop_sequences.clone(),
-        temperature: if matches!(
-            options.thinking.as_ref(),
-            Some(Thinking::Enabled { .. } | Thinking::Adaptive { .. })
-        ) {
-            None
-        } else {
+        temperature: if model.temperature
+            && !matches!(
+                options.thinking.as_ref(),
+                Some(Thinking::Enabled { .. } | Thinking::Adaptive { .. })
+            ) {
             options.temperature
+        } else {
+            None
         },
         thinking,
         output_config,
@@ -760,6 +794,11 @@ pub async fn stream(
             .as_ref()
             .map(|user_id| serde_json::json!({"user_id": user_id})),
         tool_choice: options.tool_choice.as_ref().map(tool_choice),
+        fallbacks: model
+            .fallback_models
+            .iter()
+            .map(|model| FallbackRequest { model })
+            .collect(),
     };
     let request =
         serde_json::to_value(request).map_err(|error| Error::InvalidRequest(error.to_string()))?;
@@ -778,6 +817,9 @@ pub async fn stream(
     if options.interleaved_thinking && matches!(options.thinking, Some(Thinking::Enabled { .. })) {
         beta_features.push("interleaved-thinking-2025-05-14");
     }
+    if !model.fallback_models.is_empty() {
+        beta_features.push("server-side-fallback-2026-07-01");
+    }
     let beta_features = beta_features.join(",");
     let mut default_headers = BTreeMap::from([
         ("x-api-key".into(), options.api_key.clone()),
@@ -786,6 +828,12 @@ pub async fn stream(
     ]);
     if !beta_features.is_empty() {
         default_headers.insert("anthropic-beta".into(), beta_features);
+    }
+    if model.session_affinity_headers
+        && options.cache_retention != CacheRetention::None
+        && let Some(session_id) = &options.session_id
+    {
+        default_headers.insert("x-session-affinity".into(), session_id.clone());
     }
     let headers =
         http::request_headers(default_headers, &options.headers).map_err(Error::InvalidRequest)?;
@@ -885,6 +933,17 @@ pub async fn stream(
             match event {
                     StreamEvent::MessageStart { message } => {
                         result.id = Some(message.id);
+                        if let Some(model) = message.model {
+                            result.set_anthropic_model(model);
+                        }
+                        result.usage.cache_write_1h = Some(
+                            message
+                                .usage
+                                .cache_creation
+                                .as_ref()
+                                .and_then(|cache| cache.ephemeral_1h_input_tokens)
+                                .unwrap_or_default(),
+                        );
                         apply_usage(&mut result.usage, message.usage);
                     }
                     StreamEvent::ContentBlockStart { index, content_block }
@@ -1227,7 +1286,10 @@ fn request_tools(
                 strict: strict.then_some(true),
                 input_schema,
                 defer_loading: deferred.then_some(true),
-                cache_control: if !deferred && index + 1 == immediate_count {
+                cache_control: if model.cache_control_on_tools
+                    && !deferred
+                    && index + 1 == immediate_count
+                {
                     cache_control.cloned()
                 } else {
                     None
@@ -1307,7 +1369,7 @@ fn input_content(content: &InputContent) -> serde_json::Value {
     }
 }
 
-fn cache_control(retention: CacheRetention) -> Option<CacheControl> {
+fn cache_control(retention: CacheRetention, supports_long_retention: bool) -> Option<CacheControl> {
     match retention {
         CacheRetention::None => None,
         CacheRetention::Short => Some(CacheControl {
@@ -1316,7 +1378,7 @@ fn cache_control(retention: CacheRetention) -> Option<CacheControl> {
         }),
         CacheRetention::Long => Some(CacheControl {
             r#type: "ephemeral",
-            ttl: Some("1h"),
+            ttl: supports_long_retention.then_some("1h"),
         }),
     }
 }
@@ -1406,6 +1468,12 @@ fn apply_usage(usage: &mut Usage, update: AnthropicUsage) {
     if let Some(cache_write) = update.cache_creation_input_tokens {
         usage.cache_write = cache_write;
     }
+    if let Some(cache_write_1h) = update
+        .cache_creation
+        .and_then(|cache| cache.ephemeral_1h_input_tokens)
+    {
+        usage.cache_write_1h = Some(cache_write_1h);
+    }
     if let Some(reasoning) = update
         .output_tokens_details
         .and_then(|details| details.thinking_tokens)
@@ -1413,4 +1481,26 @@ fn apply_usage(usage: &mut Usage, update: AnthropicUsage) {
         usage.reasoning = Some(reasoning);
     }
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
+}
+
+pub(crate) fn calculate_cost(
+    model: &crate::Model,
+    response_model: Option<&str>,
+    usage: &mut Usage,
+) {
+    let fallback = match (&model.compat, response_model) {
+        (Some(crate::ModelCompatibility::Anthropic(compat)), Some(response_model)) => {
+            compat.allowed_fallback_models.iter().find(|fallback| {
+                fallback.provider == model.provider && fallback.model == response_model
+            })
+        }
+        _ => None,
+    };
+    if let Some(fallback) = fallback {
+        let mut pricing_model = model.clone();
+        pricing_model.cost.clone_from(&fallback.cost);
+        pricing_model.calculate_cost(usage);
+    } else {
+        model.calculate_cost(usage);
+    }
 }

@@ -52,6 +52,7 @@ async fn streams_anthropic_text_until_message_stop() {
     assert_eq!(response.usage.output, 5);
     assert_eq!(response.usage.cache_read, 2);
     assert_eq!(response.usage.cache_write, 3);
+    assert_eq!(response.usage.cache_write_1h, Some(0));
     assert_eq!(
         response.metadata.request_id.as_deref(),
         Some("req_anthropic")

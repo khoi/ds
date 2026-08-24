@@ -1,9 +1,10 @@
 use crate::support::{Reply, serve};
 use base64::prelude::*;
 use ds_ai::{
-    AnthropicOptions, ApiStreamOptions, AssistantContent, Context, InputContent, Message,
-    OpenAiCodexResponsesOptions, OpenAiResponsesOptions, Provider, StopReason, StreamOptions, Tool,
-    ToolResultMessage, Transport, builtin_model,
+    AnthropicFallbackModel, AnthropicMessagesCompatibility, AnthropicOptions, ApiStreamOptions,
+    AssistantContent, CacheRetention, Context, InputContent, Message, ModelCompatibility,
+    ModelCost, ModelCostRates, OpenAiCodexResponsesOptions, OpenAiResponsesOptions, Provider,
+    ProviderId, StopReason, StreamOptions, Tool, ToolResultMessage, Transport, builtin_model,
 };
 use serde_json::{Value, json};
 
@@ -298,6 +299,143 @@ async fn routes_anthropic_specific_options() {
         json!({"type": "tool", "name": "search"})
     );
     assert!(payload.get("temperature").is_none());
+}
+
+#[tokio::test]
+async fn applies_anthropic_model_compatibility() {
+    let server = serve([Reply::sse(anthropic_done()), Reply::sse(anthropic_done())]).await;
+    let mut model = builtin_model("anthropic", "claude-opus-4-5").unwrap();
+    model.base_url = server.base_url.clone();
+    model.compat = Some(ModelCompatibility::Anthropic(
+        AnthropicMessagesCompatibility {
+            supports_eager_tool_input_streaming: Some(false),
+            supports_long_cache_retention: Some(false),
+            send_session_affinity_headers: Some(true),
+            supports_cache_control_on_tools: Some(false),
+            supports_temperature: Some(false),
+            force_adaptive_thinking: Some(true),
+            allow_empty_signature: Some(true),
+            supports_strict_tools: Some(true),
+            supports_tool_references: Some(false),
+            ..Default::default()
+        },
+    ));
+    let provider = ds_ai::anthropic::Provider::new([model.clone()]);
+    let context = Context::new([Message::user("Hello")])
+        .with_system("System")
+        .with_tools([Tool::new(
+            "lookup",
+            "Look up a value",
+            json!({"type": "object", "properties": {"value": {"type": "string"}}}),
+        )
+        .with_strict()]);
+    for thinking_enabled in [Some(true), None] {
+        provider
+            .stream(
+                &model,
+                &context,
+                &ApiStreamOptions::AnthropicMessages(AnthropicOptions {
+                    stream: StreamOptions {
+                        api_key: Some("test-key".into()),
+                        cache_retention: CacheRetention::Long,
+                        session_id: Some("session-1".into()),
+                        temperature: Some(0.25),
+                        ..Default::default()
+                    },
+                    thinking_enabled,
+                    ..Default::default()
+                }),
+            )
+            .result()
+            .await
+            .unwrap();
+    }
+
+    let requests = server.requests().await;
+    for request in &requests {
+        assert!(request.contains("anthropic-beta: fine-grained-tool-streaming-2025-05-14\r\n"));
+        assert!(request.contains("x-session-affinity: session-1\r\n"));
+        assert!(!request.contains("interleaved-thinking-2025-05-14"));
+        let payload = request_json(request);
+        assert_eq!(
+            payload["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert!(payload["tools"][0].get("eager_input_streaming").is_none());
+        assert_eq!(payload["tools"][0]["strict"], true);
+        assert!(payload["tools"][0].get("cache_control").is_none());
+        assert!(payload.get("temperature").is_none());
+    }
+    assert_eq!(
+        request_json(&requests[0])["thinking"],
+        json!({"type": "adaptive", "display": "summarized"})
+    );
+    assert!(request_json(&requests[1]).get("thinking").is_none());
+}
+
+#[tokio::test]
+async fn uses_anthropic_fallback_models_and_pricing() {
+    let sse = [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fallback\",\"model\":\"claude-fallback\",\"usage\":{\"input_tokens\":100000,\"output_tokens\":0,\"cache_read_input_tokens\":300000,\"cache_creation_input_tokens\":400000,\"cache_creation\":{\"ephemeral_1h_input_tokens\":250000}}}}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":200000}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let mut model = builtin_model("anthropic", "claude-opus-4-5").unwrap();
+    model.base_url = server.base_url.clone();
+    model.compat = Some(ModelCompatibility::Anthropic(
+        AnthropicMessagesCompatibility {
+            allowed_fallback_models: vec![AnthropicFallbackModel {
+                provider: ProviderId::new("anthropic"),
+                model: "claude-fallback".into(),
+                cost: ModelCost {
+                    rates: ModelCostRates {
+                        input: 2.0,
+                        output: 4.0,
+                        cache_read: 1.0,
+                        cache_write: 3.0,
+                    },
+                    tiers: Vec::new(),
+                },
+            }],
+            ..Default::default()
+        },
+    ));
+    let provider = ds_ai::anthropic::Provider::new([model.clone()]);
+    let result = provider
+        .stream(
+            &model,
+            &Context::new([Message::user("Hello")]),
+            &ApiStreamOptions::AnthropicMessages(AnthropicOptions {
+                stream: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .result()
+        .await
+        .unwrap();
+
+    assert_eq!(result.model, model.id);
+    assert_eq!(result.response_model.as_deref(), Some("claude-fallback"));
+    assert_eq!(result.response_id.as_deref(), Some("msg_fallback"));
+    assert_eq!(result.usage.total_tokens, 1_000_000);
+    assert_eq!(result.usage.cache_write_1h, Some(250_000));
+    assert_eq!(result.usage.cost.input, 0.2);
+    assert_eq!(result.usage.cost.output, 0.8);
+    assert_eq!(result.usage.cost.cache_read, 0.3);
+    assert_eq!(result.usage.cost.cache_write, 1.45);
+    assert_eq!(result.usage.cost.total, 2.75);
+
+    let request = server.requests().await.pop().unwrap();
+    assert!(request.contains("anthropic-beta: server-side-fallback-2026-07-01\r\n"));
+    assert_eq!(
+        request_json(&request)["fallbacks"],
+        json!([{"model": "claude-fallback"}])
+    );
 }
 
 #[tokio::test]
