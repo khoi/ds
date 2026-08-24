@@ -1,6 +1,6 @@
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
-use std::pin::Pin;
+use std::{pin::Pin, time::Duration};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -70,6 +70,11 @@ pub enum Error {
     IncompleteStream { partial: Response },
     #[error("request cancelled")]
     Cancelled,
+    #[error("provider retry delay {requested:?} exceeds {maximum:?}")]
+    RetryDelayExceeded {
+        requested: Duration,
+        maximum: Duration,
+    },
 }
 
 pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send>>;

@@ -9,6 +9,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Model {
@@ -195,6 +196,12 @@ pub async fn stream(
         if retries < options.max_retries && is_retryable(&response) {
             retries += 1;
             let delay = retry_delay(response.headers());
+            if delay > DEFAULT_MAX_RETRY_DELAY {
+                return Err(Error::RetryDelayExceeded {
+                    requested: delay,
+                    maximum: DEFAULT_MAX_RETRY_DELAY,
+                });
+            }
             if !delay.is_zero() {
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}

@@ -362,3 +362,30 @@ async fn retries_openai_network_failures_before_streaming_starts() {
     assert!(matches!(events.as_slice(), [Ok(Event::Done(_))]));
     assert_eq!(server.requests().await.len(), 2);
 }
+
+#[tokio::test(start_paused = true)]
+async fn rejects_an_openai_retry_delay_above_the_limit() {
+    let server = serve([Reply::json(
+        429,
+        json!({"error": {"type": "rate_limit_error", "message": "retry later"}}),
+    )
+    .with_header("retry-after", "61")])
+    .await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options = openai::Options::new("test-key").with_max_retries(1);
+
+    let error = match openai::stream(&model, &context, &options).await {
+        Ok(_) => panic!("retry delay was accepted"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error,
+        ds_ai::Error::RetryDelayExceeded {
+            requested: std::time::Duration::from_secs(61),
+            maximum: std::time::Duration::from_secs(60),
+        }
+    );
+    assert_eq!(server.requests().await.len(), 1);
+}
