@@ -1,3 +1,4 @@
+mod event_stream;
 mod frame;
 mod http;
 mod json;
@@ -13,6 +14,7 @@ pub mod anthropic;
 pub mod codex;
 pub mod openai;
 
+pub use event_stream::{AssistantMessageEventStream, AssistantMessageStreamError};
 pub use frame::{
     AssistantMessageFrame, AssistantMessageFrameError, assistant_message_event_to_frame,
     reduce_assistant_message_frames,

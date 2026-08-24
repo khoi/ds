@@ -8,6 +8,8 @@ mod codex_stream;
 mod complete;
 #[path = "cross_provider.rs"]
 mod cross_provider;
+#[path = "event_stream.rs"]
+mod event_stream;
 #[path = "live.rs"]
 mod live;
 #[path = "message_frame.rs"]
