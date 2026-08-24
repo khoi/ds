@@ -321,6 +321,12 @@ struct ContentDelta {
 #[derive(Deserialize)]
 struct MessageDelta {
     stop_reason: Option<String>,
+    stop_details: Option<StopDetails>,
+}
+
+#[derive(Deserialize)]
+struct StopDetails {
+    explanation: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -446,6 +452,7 @@ pub async fn stream(
         let mut result = Response::anthropic(response_model);
         result.metadata = metadata;
         let mut slots = HashMap::new();
+        let mut terminal_error = None;
 
         loop {
             let data = match events.next().await {
@@ -495,18 +502,29 @@ pub async fn stream(
                         if content_block.r#type == "text" =>
                     {
                         let content_index = result.content.len();
-                        result.content.push(Content::Text(content_block.text));
+                        let text = content_block.text;
+                        result.content.push(Content::Text(text.clone()));
                         slots.insert(index, Slot::Text(content_index));
+                        if !text.is_empty() {
+                            yield Ok(Event::TextDelta { content_index, delta: text });
+                        }
                     }
                     StreamEvent::ContentBlockStart { index, content_block }
                         if content_block.r#type == "thinking" =>
                     {
                         let content_index = result.content.len();
-                        result.content.push(Content::Reasoning(content_block.thinking));
+                        let thinking = content_block.thinking;
+                        result.content.push(Content::Reasoning(thinking.clone()));
                         slots.insert(index, Slot::Thinking {
                             content_index,
                             signature: content_block.signature,
                         });
+                        if !thinking.is_empty() {
+                            yield Ok(Event::ReasoningDelta {
+                                content_index,
+                                delta: thinking,
+                            });
+                        }
                     }
                     StreamEvent::ContentBlockStart { index, content_block }
                         if content_block.r#type == "redacted_thinking" =>
@@ -518,6 +536,10 @@ pub async fn stream(
                             data: content_block.data,
                         });
                         slots.insert(index, Slot::Redacted);
+                        yield Ok(Event::ReasoningDelta {
+                            content_index,
+                            delta: "[Reasoning redacted]".into(),
+                        });
                     }
                     StreamEvent::ContentBlockStart { index, content_block }
                         if content_block.r#type == "tool_use" =>
@@ -526,15 +548,25 @@ pub async fn stream(
                             continue;
                         };
                         let content_index = result.content.len();
+                        let arguments = content_block.input.unwrap_or_else(|| serde_json::json!({}));
+                        let initial = (!arguments
+                            .as_object()
+                            .is_some_and(serde_json::Map::is_empty))
+                        .then(|| {
+                            serde_json::to_string(&arguments).expect("tool arguments serialize")
+                        });
                         result.content.push(Content::ToolCall(crate::ToolCall {
                             id,
                             name,
-                            arguments: content_block.input.unwrap_or_else(|| serde_json::json!({})),
+                            arguments,
                         }));
                         slots.insert(index, Slot::ToolCall {
                             content_index,
                             partial_json: String::new(),
                         });
+                        if let Some(delta) = initial {
+                            yield Ok(Event::ToolCallDelta { content_index, delta });
+                        }
                     }
                     StreamEvent::ContentBlockDelta { index, delta } => {
                         match (delta.r#type.as_str(), slots.get_mut(&index)) {
@@ -593,11 +625,38 @@ pub async fn stream(
                     StreamEvent::MessageDelta { delta, usage } => {
                         apply_usage(&mut result.usage, usage);
                         if let Some(reason) = delta.stop_reason {
+                            terminal_error = None;
                             result.stop_reason = match reason.as_str() {
+                                "end_turn" | "stop_sequence" => StopReason::Stop,
                                 "max_tokens" => StopReason::Length,
                                 "tool_use" => StopReason::ToolUse,
                                 "pause_turn" => StopReason::Pause,
-                                _ => StopReason::Stop,
+                                "refusal" => {
+                                    terminal_error = Some((
+                                        reason.clone(),
+                                        delta.stop_details
+                                            .and_then(|details| details.explanation)
+                                            .filter(|message| !message.is_empty())
+                                            .unwrap_or_else(|| {
+                                                "The model refused to complete the request".into()
+                                            }),
+                                    ));
+                                    StopReason::Error
+                                }
+                                "sensitive" => {
+                                    terminal_error = Some((
+                                        reason.clone(),
+                                        "Provider stopped with: sensitive".into(),
+                                    ));
+                                    StopReason::Error
+                                }
+                                _ => {
+                                    terminal_error = Some((
+                                        reason.clone(),
+                                        format!("Unhandled stop reason: {reason}"),
+                                    ));
+                                    StopReason::Error
+                                }
                             };
                             result.raw_stop_reason = Some(reason);
                         }
@@ -606,6 +665,12 @@ pub async fn stream(
                         if result.stop_reason == StopReason::Pending {
                             yield Err(Error::Stream {
                                 message: "message_stop arrived without a stop reason".into(),
+                                partial: result,
+                            });
+                        } else if let Some((code, message)) = terminal_error {
+                            yield Err(Error::Response {
+                                code: Some(code),
+                                message,
                                 partial: result,
                             });
                         } else {

@@ -111,11 +111,25 @@ async fn streams_and_replays_anthropic_thinking_and_tool_calls() {
         first_events.first(),
         Some(&Ok(Event::ReasoningDelta {
             content_index: 0,
-            delta: " think".into(),
+            delta: "I".into(),
         }))
     );
     assert_eq!(
         first_events.get(1),
+        Some(&Ok(Event::ReasoningDelta {
+            content_index: 0,
+            delta: " think".into(),
+        }))
+    );
+    assert_eq!(
+        first_events.get(2),
+        Some(&Ok(Event::ReasoningDelta {
+            content_index: 1,
+            delta: "[Reasoning redacted]".into(),
+        }))
+    );
+    assert_eq!(
+        first_events.get(3),
         Some(&Ok(Event::ToolCallDelta {
             content_index: 2,
             delta: "{\"path\":\"README.md\"".into(),
@@ -193,6 +207,86 @@ async fn streams_and_replays_anthropic_thinking_and_tool_calls() {
             }
         ])
     );
+}
+
+#[tokio::test]
+async fn preserves_anthropic_start_content_and_refusal_details() {
+    let sse = [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_refusal\",\"usage\":{}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"Blocked\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"type\":\"refusal\",\"category\":\"policy\",\"explanation\":\"Request denied\"}},\"usage\":{}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let model = anthropic::Model::new("claude-fable-5").with_base_url(&server.base_url);
+    let events = anthropic::stream(
+        &model,
+        &Context::new([Message::user("Blocked request")]),
+        &anthropic::Options::new("test-key"),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+
+    assert_eq!(
+        events.first(),
+        Some(&Ok(Event::TextDelta {
+            content_index: 0,
+            delta: "Blocked".into(),
+        }))
+    );
+    match events.last() {
+        Some(Err(ds_ai::Error::Response {
+            code,
+            message,
+            partial,
+        })) => {
+            assert_eq!(code.as_deref(), Some("refusal"));
+            assert_eq!(message, "Request denied");
+            assert_eq!(partial.stop_reason, StopReason::Error);
+            assert_eq!(partial.raw_stop_reason.as_deref(), Some("refusal"));
+            assert_eq!(partial.content, [ds_ai::Content::Text("Blocked".into())]);
+        }
+        event => panic!("unexpected terminal event: {event:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rejects_sensitive_and_unknown_anthropic_stop_reasons() {
+    for (reason, expected) in [
+        ("sensitive", "Provider stopped with: sensitive"),
+        ("new_reason", "Unhandled stop reason: new_reason"),
+    ] {
+        let sse = [
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"",
+            reason,
+            "\"},\"usage\":{}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ]
+        .concat();
+        let server = serve([Reply::sse(sse)]).await;
+        let model = anthropic::Model::new("claude-haiku-4-5").with_base_url(&server.base_url);
+        let events = anthropic::stream(
+            &model,
+            &Context::new([Message::user("Blocked request")]),
+            &anthropic::Options::new("test-key"),
+        )
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+        assert!(matches!(
+            events.last(),
+            Some(Err(ds_ai::Error::Response { code, message, partial }))
+                if code.as_deref() == Some(reason)
+                    && message == expected
+                    && partial.stop_reason == StopReason::Error
+                    && partial.raw_stop_reason.as_deref() == Some(reason)
+        ));
+    }
 }
 
 #[tokio::test]
