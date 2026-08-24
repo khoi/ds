@@ -27,6 +27,9 @@ bytes = "1.11.1"
 futures-core = "0.3.31"
 futures-util = "0.3.34"
 httpdate = "1.0.3"
+jsonschema = { version = "0.17.1", default-features = false, features = [
+  "draft202012",
+] }
 rand = "0.10.2"
 reqwest = { version = "0.13.4", default-features = false, features = [
   "json",

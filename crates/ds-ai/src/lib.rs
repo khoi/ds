@@ -12,6 +12,7 @@ mod schema;
 mod sse;
 mod transport;
 mod types;
+mod validation;
 
 pub mod anthropic;
 pub mod codex;
@@ -45,6 +46,7 @@ pub use types::{
     ResponseStream, StopReason, TimeoutPhase, Tool, ToolCall, ToolResultMessage, ToolResultRole,
     Usage, UsageCost, UserContent, UserMessage, UserRole,
 };
+pub use validation::{ToolValidationError, validate_tool_arguments, validate_tool_call};
 
 pub async fn complete(mut stream: ResponseStream) -> Result<Response, Error> {
     use futures_util::StreamExt;

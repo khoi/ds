@@ -21,6 +21,7 @@ bytes.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 httpdate.workspace = true
+jsonschema.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true

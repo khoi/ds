@@ -24,3 +24,4 @@ mod models;
 mod openai_stream;
 mod support;
 mod transcript;
+mod validation;
