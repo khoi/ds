@@ -10,6 +10,10 @@ mod complete;
 mod cross_provider;
 #[path = "live.rs"]
 mod live;
+#[path = "message_frame.rs"]
+mod message_frame;
+#[path = "model.rs"]
+mod model;
 #[path = "openai_stream.rs"]
 mod openai_stream;
 mod support;

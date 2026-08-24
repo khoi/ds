@@ -10,6 +10,57 @@ pub(crate) fn value(input: &str) -> serde_json::Value {
     parse(input).unwrap_or_else(|_| serde_json::json!({}))
 }
 
+pub(crate) fn streaming_value(input: &str) -> serde_json::Value {
+    parse(input)
+        .or_else(|_| parse(&complete(&repair(input))))
+        .unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn complete(input: &str) -> String {
+    let mut output = String::with_capacity(input.len() + 8);
+    let mut closers = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in input.chars() {
+        output.push(character);
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' => closers.push('}'),
+            '[' => closers.push(']'),
+            '}' | ']' if closers.last() == Some(&character) => {
+                closers.pop();
+            }
+            _ => {}
+        }
+    }
+    if escaped {
+        output.push('\\');
+    }
+    if in_string {
+        output.push('"');
+    }
+    while output.chars().last().is_some_and(char::is_whitespace) {
+        output.pop();
+    }
+    if output.ends_with(':') {
+        output.push_str("null");
+    } else if output.ends_with(',') {
+        output.pop();
+    }
+    output.extend(closers.into_iter().rev());
+    output
+}
+
 fn repair(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();

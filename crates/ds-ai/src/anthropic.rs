@@ -1005,6 +1005,7 @@ fn apply_usage(usage: &mut Usage, update: AnthropicUsage) {
         .output_tokens_details
         .and_then(|details| details.thinking_tokens)
     {
-        usage.reasoning = reasoning;
+        usage.reasoning = Some(reasoning);
     }
+    usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 }

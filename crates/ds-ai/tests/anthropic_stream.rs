@@ -194,7 +194,7 @@ async fn streams_and_replays_anthropic_thinking_and_tool_calls() {
     );
     let response = done(&first_events);
     assert_eq!(response.stop_reason, StopReason::ToolUse);
-    assert_eq!(response.usage.reasoning, 3);
+    assert_eq!(response.usage.reasoning, Some(3));
     assert_eq!(
         response.content,
         [

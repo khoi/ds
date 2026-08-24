@@ -45,7 +45,10 @@ async fn streams_openai_text_until_the_provider_completes() {
             output: 1,
             cache_read: 0,
             cache_write: 0,
-            reasoning: 0,
+            cache_write_1h: None,
+            reasoning: Some(0),
+            total_tokens: 5,
+            cost: Default::default(),
         }
     );
 
@@ -150,7 +153,10 @@ async fn decodes_openai_sse_across_arbitrary_chunks() {
             output: 1,
             cache_read: 0,
             cache_write: 0,
-            reasoning: 0,
+            cache_write_1h: None,
+            reasoning: Some(0),
+            total_tokens: 4,
+            cost: Default::default(),
         }
     );
     server.requests().await;
@@ -182,7 +188,13 @@ async fn retries_openai_before_streaming_starts() {
     let response = done(&events);
     assert_eq!(response.id.as_deref(), Some("resp_retry"));
     assert!(response.content.is_empty());
-    assert_eq!(response.usage, ds_ai::Usage::default());
+    assert_eq!(
+        response.usage,
+        ds_ai::Usage {
+            reasoning: Some(0),
+            ..Default::default()
+        }
+    );
     assert_eq!(server.requests().await.len(), 2);
 }
 
@@ -531,7 +543,10 @@ async fn streams_openai_reasoning_and_text_in_content_order() {
             output: 4,
             cache_read: 0,
             cache_write: 0,
-            reasoning: 3,
+            cache_write_1h: None,
+            reasoning: Some(3),
+            total_tokens: 9,
+            cost: Default::default(),
         }
     );
 }

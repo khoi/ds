@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{pin::Pin, time::Duration};
 use thiserror::Error;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Message {
     User(Vec<InputContent>),
     Assistant(Box<Response>),
@@ -75,7 +75,7 @@ impl InputContent {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Context {
     system: Option<String>,
     messages: Vec<Message>,
@@ -160,16 +160,30 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Usage {
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
-    pub reasoning: u64,
+    pub cache_write_1h: Option<u64>,
+    pub reasoning: Option<u64>,
+    pub total_tokens: u64,
+    pub cost: UsageCost,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageCost {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+    pub total: f64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Response {
     pub id: Option<String>,
     pub content: Vec<Content>,
@@ -200,6 +214,7 @@ pub struct RateLimits {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum StopReason {
     #[default]
     Pending,
@@ -333,7 +348,7 @@ pub(crate) enum AnthropicReasoning {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     TextDelta { content_index: usize, delta: String },
     ReasoningDelta { content_index: usize, delta: String },
@@ -341,7 +356,7 @@ pub enum Event {
     Done(Box<Response>),
 }
 
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Debug, Error, PartialEq)]
 pub enum Error {
     #[error("HTTP request failed: {0}")]
     Http(String),
