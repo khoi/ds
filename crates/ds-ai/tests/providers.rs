@@ -38,4 +38,5 @@ mod openai_stream;
 mod request_options;
 mod support;
 mod transcript;
+mod uuid;
 mod validation;

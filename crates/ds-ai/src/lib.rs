@@ -18,6 +18,7 @@ mod sse;
 mod text;
 mod transport;
 mod types;
+mod uuid;
 mod validation;
 
 pub mod anthropic;
@@ -69,6 +70,7 @@ pub use types::{
     ResponseStream, StopReason, TimeoutPhase, Tool, ToolCall, ToolResultMessage, ToolResultRole,
     Usage, UsageCost, UserContent, UserMessage, UserRole,
 };
+pub use uuid::{UuidV7Error, uuid_v7, uuid_v7_at};
 pub use validation::{ToolValidationError, validate_tool_arguments, validate_tool_call};
 
 pub async fn complete(mut stream: ResponseStream) -> Result<Response, Error> {

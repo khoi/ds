@@ -340,6 +340,8 @@ pub struct Response {
     pub service_tier: Option<String>,
     pub end_turn: Option<bool>,
     pub metadata: ResponseMetadata,
+    #[serde(default, skip_serializing)]
+    diagnostics: Option<Vec<crate::AssistantMessageDiagnostic>>,
     #[serde(default, rename = "_provider")]
     provider: ProviderState,
 }
@@ -382,6 +384,12 @@ impl Response {
             }),
             ..Self::default()
         }
+    }
+
+    pub(crate) fn add_diagnostic(&mut self, diagnostic: crate::AssistantMessageDiagnostic) {
+        self.diagnostics
+            .get_or_insert_with(Vec::new)
+            .push(diagnostic);
     }
 
     pub(crate) fn add_openai_item(&mut self, item: OpenAiReplay) {
@@ -466,7 +474,7 @@ impl Response {
             model,
             response_model: None,
             response_id: self.id,
-            diagnostics: None,
+            diagnostics: self.diagnostics,
             usage: self.usage,
             stop_reason: self.stop_reason,
             error_message: None,
