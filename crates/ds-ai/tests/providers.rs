@@ -4,6 +4,8 @@ mod anthropic_stream;
 mod codex_auth;
 #[path = "codex_stream.rs"]
 mod codex_stream;
+#[path = "complete.rs"]
+mod complete;
 #[path = "cross_provider.rs"]
 mod cross_provider;
 #[path = "live.rs"]
