@@ -1,5 +1,8 @@
 use crate::support::{Reply, serve};
-use ds_ai::{Context, Event, InputContent, Message, StopReason, ToolCall, ToolResult, anthropic};
+use ds_ai::{
+    CacheRetention, Context, Event, InputContent, Message, StopReason, Tool, ToolCall, ToolResult,
+    anthropic,
+};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
@@ -55,10 +58,18 @@ async fn streams_anthropic_text_until_message_stop() {
         body,
         json!({
             "model": "claude-sonnet-4-5",
-            "system": "Be brief",
+            "system": [{
+                "type": "text",
+                "text": "Be brief",
+                "cache_control": {"type": "ephemeral"}
+            }],
             "messages": [{
                 "role": "user",
-                "content": [{"type": "text", "text": "Hello"}]
+                "content": [{
+                    "type": "text",
+                    "text": "Hello",
+                    "cache_control": {"type": "ephemeral"}
+                }]
             }],
             "max_tokens": 1024,
             "stream": true
@@ -176,7 +187,8 @@ async fn streams_and_replays_anthropic_thinking_and_tool_calls() {
                     "type": "tool_result",
                     "tool_use_id": "toolu_1",
                     "content": [{"type": "text", "text": "done"}],
-                    "is_error": false
+                    "is_error": false,
+                    "cache_control": {"type": "ephemeral"}
                 }]
             }
         ])
@@ -358,6 +370,111 @@ async fn rejects_an_anthropic_error_event_with_partial_content() {
         }
         event => panic!("unexpected error event: {event:?}"),
     }
+}
+
+#[tokio::test]
+async fn encodes_anthropic_generation_thinking_and_cache_options() {
+    let completed = [
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(completed)]).await;
+    let model = anthropic::Model::new("claude-opus-4-8").with_base_url(&server.base_url);
+    let context = Context::new([Message::user_content([
+        InputContent::text("Inspect"),
+        InputContent::image("image/png", "iVBORw0KGgo="),
+    ])])
+    .with_system("Be brief")
+    .with_tools([Tool::new(
+        "inspect",
+        "Inspect the input",
+        json!({"type": "object", "properties": {}}),
+    )]);
+    let options = anthropic::Options::new("test-key")
+        .with_temperature(0.2)
+        .with_stop_sequences(["END"])
+        .with_thinking(anthropic::Thinking::Adaptive {
+            effort: anthropic::Effort::High,
+            display: anthropic::ThinkingDisplay::Summarized,
+        })
+        .with_metadata_user_id("user_1")
+        .with_tool_choice(anthropic::ToolChoice::Tool("inspect".into()))
+        .with_cache_retention(CacheRetention::Long);
+
+    anthropic::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    let request = server.requests().await.pop().unwrap();
+    let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        body,
+        json!({
+            "model": "claude-opus-4-8",
+            "system": [{
+                "type": "text",
+                "text": "Be brief",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Inspect"},
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="},
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                    }
+                ]
+            }],
+            "tools": [{
+                "name": "inspect",
+                "description": "Inspect the input",
+                "input_schema": {"type": "object", "properties": {}},
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }],
+            "max_tokens": 4096,
+            "stream": true,
+            "stop_sequences": ["END"],
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": "high"},
+            "metadata": {"user_id": "user_1"},
+            "tool_choice": {"type": "tool", "name": "inspect"}
+        })
+    );
+    assert!(body.get("temperature").is_none());
+}
+
+#[tokio::test]
+async fn keeps_anthropic_temperature_with_disabled_thinking_and_cache() {
+    let completed = [
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(completed)]).await;
+    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]).with_system("Be brief");
+    let options = anthropic::Options::new("test-key")
+        .with_temperature(0.0)
+        .with_thinking(anthropic::Thinking::Disabled)
+        .with_cache_retention(CacheRetention::None);
+
+    anthropic::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    let request = server.requests().await.pop().unwrap();
+    let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["temperature"], 0.0);
+    assert_eq!(body["thinking"], json!({"type": "disabled"}));
+    assert!(body.get("output_config").is_none());
+    assert!(!request.contains("cache_control"));
 }
 
 fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {

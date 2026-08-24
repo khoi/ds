@@ -1,6 +1,7 @@
 use crate::{
-    Content, Context, Error, Event, InputContent, Message, Response, ResponseStream, StopReason,
-    ToolResult, Usage, http, retry, transport, types::AnthropicReasoning,
+    CacheRetention, Content, Context, Error, Event, InputContent, Message, Response,
+    ResponseStream, StopReason, ToolResult, Usage, http, retry, transport,
+    types::AnthropicReasoning,
 };
 use async_stream::stream;
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,50 @@ pub struct Options {
     first_event_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     overall_timeout: Option<Duration>,
+    temperature: Option<f64>,
+    stop_sequences: Vec<String>,
+    thinking: Option<Thinking>,
+    metadata_user_id: Option<String>,
+    tool_choice: Option<ToolChoice>,
+    cache_retention: CacheRetention,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Thinking {
+    Disabled,
+    Enabled {
+        budget_tokens: u64,
+        display: ThinkingDisplay,
+    },
+    Adaptive {
+        effort: Effort,
+        display: ThinkingDisplay,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingDisplay {
+    Summarized,
+    Omitted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Max,
+    XHigh,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolChoice {
+    Auto,
+    Any,
+    None,
+    Tool(String),
 }
 
 impl Options {
@@ -55,6 +100,12 @@ impl Options {
             first_event_timeout: None,
             idle_timeout: None,
             overall_timeout: None,
+            temperature: None,
+            stop_sequences: Vec::new(),
+            thinking: None,
+            metadata_user_id: None,
+            tool_choice: None,
+            cache_retention: CacheRetention::Short,
         }
     }
 
@@ -97,18 +148,63 @@ impl Options {
         self.overall_timeout = Some(timeout);
         self
     }
+
+    pub fn with_temperature(mut self, temperature: f64) -> Self {
+        self.temperature = Some(temperature);
+        self
+    }
+
+    pub fn with_stop_sequences(
+        mut self,
+        stop_sequences: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.stop_sequences = stop_sequences.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_thinking(mut self, thinking: Thinking) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
+
+    pub fn with_metadata_user_id(mut self, user_id: impl Into<String>) -> Self {
+        self.metadata_user_id = Some(user_id.into());
+        self
+    }
+
+    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+        self.tool_choice = Some(tool_choice);
+        self
+    }
+
+    pub fn with_cache_retention(mut self, retention: CacheRetention) -> Self {
+        self.cache_retention = retention;
+        self
+    }
 }
 
 #[derive(Serialize)]
 struct Request<'a> {
     model: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    system: Vec<serde_json::Value>,
     messages: Vec<RequestMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<RequestTool<'a>>,
     max_tokens: u64,
     stream: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    stop_sequences: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -122,6 +218,15 @@ struct RequestTool<'a> {
     name: &'a str,
     description: &'a str,
     input_schema: &'a serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+#[derive(Clone, Serialize)]
+struct CacheControl {
+    r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<&'static str>,
 }
 
 #[derive(Deserialize)]
@@ -234,21 +339,53 @@ pub async fn stream(
     let overall_deadline = options
         .overall_timeout
         .map(|timeout| Instant::now() + timeout);
+    let cache_control = cache_control(options.cache_retention);
+    let (thinking, output_config) = thinking(&options.thinking);
+    let tool_count = context.tools().len();
     let request = Request {
         model: &model.id,
-        system: context.system(),
-        messages: messages(model, context),
+        system: context
+            .system()
+            .map(|system| {
+                let mut block = serde_json::json!({"type": "text", "text": system});
+                add_cache_control(&mut block, cache_control.as_ref());
+                vec![block]
+            })
+            .unwrap_or_default(),
+        messages: messages(model, context, cache_control.as_ref()),
         tools: context
             .tools()
             .iter()
-            .map(|tool| RequestTool {
+            .enumerate()
+            .map(|(index, tool)| RequestTool {
                 name: &tool.name,
                 description: &tool.description,
                 input_schema: &tool.parameters,
+                cache_control: if index + 1 == tool_count {
+                    cache_control.clone()
+                } else {
+                    None
+                },
             })
             .collect(),
         max_tokens: options.max_tokens,
         stream: true,
+        stop_sequences: options.stop_sequences.clone(),
+        temperature: if matches!(
+            options.thinking.as_ref(),
+            Some(Thinking::Enabled { .. } | Thinking::Adaptive { .. })
+        ) {
+            None
+        } else {
+            options.temperature
+        },
+        thinking,
+        output_config,
+        metadata: options
+            .metadata_user_id
+            .as_ref()
+            .map(|user_id| serde_json::json!({"user_id": user_id})),
+        tool_choice: options.tool_choice.as_ref().map(tool_choice),
     };
     let client = reqwest::Client::new();
     let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
@@ -478,8 +615,12 @@ pub async fn stream(
     Ok(Box::pin(output))
 }
 
-fn messages(model: &Model, context: &Context) -> Vec<RequestMessage> {
-    context
+fn messages(
+    model: &Model,
+    context: &Context,
+    cache_control: Option<&CacheControl>,
+) -> Vec<RequestMessage> {
+    let mut messages = context
         .messages()
         .iter()
         .map(|message| match message {
@@ -496,7 +637,16 @@ fn messages(model: &Model, context: &Context) -> Vec<RequestMessage> {
                 content: vec![tool_result(result)],
             },
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if let Some(message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == "user")
+        && let Some(content) = message.content.last_mut()
+    {
+        add_cache_control(content, cache_control);
+    }
+    messages
 }
 
 fn assistant_content(model: &Model, response: &Response) -> Vec<serde_json::Value> {
@@ -550,6 +700,61 @@ fn input_content(content: &InputContent) -> serde_json::Value {
             "type": "image",
             "source": {"type": "base64", "media_type": media_type, "data": data}
         }),
+    }
+}
+
+fn cache_control(retention: CacheRetention) -> Option<CacheControl> {
+    match retention {
+        CacheRetention::None => None,
+        CacheRetention::Short => Some(CacheControl {
+            r#type: "ephemeral",
+            ttl: None,
+        }),
+        CacheRetention::Long => Some(CacheControl {
+            r#type: "ephemeral",
+            ttl: Some("1h"),
+        }),
+    }
+}
+
+fn add_cache_control(content: &mut serde_json::Value, cache_control: Option<&CacheControl>) {
+    let (Some(content), Some(cache_control)) = (content.as_object_mut(), cache_control) else {
+        return;
+    };
+    content.insert(
+        "cache_control".into(),
+        serde_json::to_value(cache_control).expect("cache control serializes"),
+    );
+}
+
+fn thinking(thinking: &Option<Thinking>) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    match thinking {
+        None => (None, None),
+        Some(Thinking::Disabled) => (Some(serde_json::json!({"type": "disabled"})), None),
+        Some(Thinking::Enabled {
+            budget_tokens,
+            display,
+        }) => (
+            Some(serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": budget_tokens,
+                "display": display
+            })),
+            None,
+        ),
+        Some(Thinking::Adaptive { effort, display }) => (
+            Some(serde_json::json!({"type": "adaptive", "display": display})),
+            Some(serde_json::json!({"effort": effort})),
+        ),
+    }
+}
+
+fn tool_choice(choice: &ToolChoice) -> serde_json::Value {
+    match choice {
+        ToolChoice::Auto => serde_json::json!({"type": "auto"}),
+        ToolChoice::Any => serde_json::json!({"type": "any"}),
+        ToolChoice::None => serde_json::json!({"type": "none"}),
+        ToolChoice::Tool(name) => serde_json::json!({"type": "tool", "name": name}),
     }
 }
 
