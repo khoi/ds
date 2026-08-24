@@ -9,7 +9,7 @@ use tokio::{
     sync::{Notify, oneshot},
 };
 
-pub struct Reply {
+pub(crate) struct Reply {
     status: u16,
     reason: &'static str,
     content_type: &'static str,
@@ -21,11 +21,11 @@ pub struct Reply {
 }
 
 impl Reply {
-    pub fn sse(body: impl Into<Vec<u8>>) -> Self {
+    pub(crate) fn sse(body: impl Into<Vec<u8>>) -> Self {
         Self::sse_chunks([body.into()])
     }
 
-    pub fn sse_chunks(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+    pub(crate) fn sse_chunks(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
         Self {
             status: 200,
             reason: "OK",
@@ -38,7 +38,7 @@ impl Reply {
         }
     }
 
-    pub fn json(status: u16, body: Value) -> Self {
+    pub(crate) fn json(status: u16, body: Value) -> Self {
         Self {
             status,
             reason: match status {
@@ -57,7 +57,7 @@ impl Reply {
         }
     }
 
-    pub fn disconnect() -> Self {
+    pub(crate) fn disconnect() -> Self {
         Self {
             status: 0,
             reason: "",
@@ -70,7 +70,7 @@ impl Reply {
         }
     }
 
-    pub fn pending() -> Self {
+    pub(crate) fn pending() -> Self {
         Self {
             status: 0,
             reason: "",
@@ -83,20 +83,20 @@ impl Reply {
         }
     }
 
-    pub fn open_sse(body: impl Into<Vec<u8>>) -> Self {
+    pub(crate) fn open_sse(body: impl Into<Vec<u8>>) -> Self {
         Self {
             finish: false,
             ..Self::sse(body)
         }
     }
 
-    pub fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+    pub(crate) fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
         self.headers.push((name, value.into()));
         self
     }
 }
 
-pub struct Server {
+pub(crate) struct Server {
     pub base_url: String,
     requests: oneshot::Receiver<Vec<Vec<u8>>>,
     request_count: Arc<AtomicUsize>,
@@ -104,11 +104,11 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn request_count(&self) -> usize {
+    pub(crate) fn request_count(&self) -> usize {
         self.request_count.load(Ordering::SeqCst)
     }
 
-    pub async fn wait_for_requests(&self, count: usize) {
+    pub(crate) async fn wait_for_requests(&self, count: usize) {
         loop {
             let notified = self.request_notify.notified();
             if self.request_count() >= count {
@@ -118,7 +118,7 @@ impl Server {
         }
     }
 
-    pub async fn requests(self) -> Vec<String> {
+    pub(crate) async fn requests(self) -> Vec<String> {
         self.requests
             .await
             .unwrap()
@@ -127,12 +127,12 @@ impl Server {
             .collect()
     }
 
-    pub async fn request_bytes(self) -> Vec<Vec<u8>> {
+    pub(crate) async fn request_bytes(self) -> Vec<Vec<u8>> {
         self.requests.await.unwrap()
     }
 }
 
-pub async fn serve(replies: impl IntoIterator<Item = Reply>) -> Server {
+pub(crate) async fn serve(replies: impl IntoIterator<Item = Reply>) -> Server {
     let replies = replies.into_iter().collect::<Vec<_>>();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

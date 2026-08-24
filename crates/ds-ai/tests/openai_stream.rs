@@ -72,7 +72,7 @@ async fn rejects_an_openai_stream_that_ends_without_a_terminal_event() {
     let sse = [
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\"}}\n\n",
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_partial\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
-        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hel\"}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Part\"}\n\n",
     ]
     .concat();
     let server = serve([Reply::sse(sse)]).await;
@@ -91,12 +91,12 @@ async fn rejects_an_openai_stream_that_ends_without_a_terminal_event() {
         events.first(),
         Some(&Ok(Event::TextDelta {
             content_index: 0,
-            delta: "Hel".into(),
+            delta: "Part".into(),
         }))
     );
     let partial = incomplete(&events);
     assert_eq!(partial.id.as_deref(), Some("resp_partial"));
-    assert_eq!(partial.content, [ds_ai::Content::Text("Hel".into())]);
+    assert_eq!(partial.content, [ds_ai::Content::Text("Part".into())]);
     assert_eq!(partial.usage, ds_ai::Usage::default());
     server.requests().await;
 }

@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 autotests = false
 
+[lints]
+workspace = true
+
 [[test]]
 name = "providers"
 path = "tests/providers.rs"

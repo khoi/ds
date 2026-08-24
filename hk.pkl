@@ -1,0 +1,45 @@
+amends "package://github.com/jdx/hk/releases/download/v1.56.1/hk@1.56.1#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v1.56.1/hk@1.56.1#/Builtins.pkl"
+
+min_hk_version = "1.56.1"
+fail_fast = false
+
+local fileChecks = new Mapping<String, Step> {
+  ["check-added-large-files"] = (Builtins.check_added_large_files) {
+    check = "hk util check-added-large-files --maxkb 2048 {{ files }}"
+  }
+  ["check-case-conflict"] = Builtins.check_case_conflict
+  ["check-merge-conflict"] = Builtins.check_merge_conflict
+  ["detect-private-key"] = Builtins.detect_private_key
+  ["newlines"] = Builtins.newlines
+  ["trailing-whitespace"] = Builtins.trailing_whitespace
+  ["cargo-fmt"] = Builtins.cargo_fmt
+  ["taplo-format"] = Builtins.taplo_format
+  ["typos"] = Builtins.typos
+  ["actionlint"] = Builtins.actionlint
+  ["zizmor"] = Builtins.zizmor
+}
+
+hooks {
+  ["pre-commit"] {
+    fix = true
+    stash = "git"
+    steps = fileChecks
+  }
+  ["pre-push"] {
+    steps {
+      ["ci"] {
+        check = "mise run ci"
+        exclusive = true
+      }
+    }
+  }
+  ["check"] {
+    steps = fileChecks
+  }
+  ["fix"] {
+    fix = true
+    stash = "git"
+    steps = fileChecks
+  }
+}

@@ -1,0 +1,73 @@
+min_version = "2026.8.10"
+
+[settings]
+locked = true
+lockfile_platforms = ["linux-x64", "macos-arm64"]
+
+[tools]
+rust = "1.95.0"
+hk = "1.56.1"
+actionlint = "1.7.12"
+shellcheck = "0.11.0"
+taplo = "0.10.0"
+zizmor = "1.29.0"
+"github:nextest-rs/nextest" = "cargo-nextest-0.9.143"
+"aqua:EmbarkStudios/cargo-deny" = "0.20.2"
+"github:Boshen/cargo-shear" = "1.13.4"
+"aqua:taiki-e/cargo-llvm-cov" = "0.9.0"
+typos = "1.49.0"
+
+[env]
+HK_MISE = "1"
+
+[hooks]
+postinstall = "hk install --mise"
+
+[tasks.fix]
+description = "Fix formatting and file hygiene"
+run = "hk fix --all"
+
+[tasks.check]
+description = "Check formatting, files, spelling, and workflows"
+run = "hk check --all"
+
+[tasks.lint]
+description = "Lint all Rust targets"
+run = "cargo clippy --workspace --all-targets --all-features --locked"
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo nextest run --workspace --all-features --locked"
+
+[tasks.doctest]
+description = "Run documentation tests"
+run = "cargo test --workspace --all-features --locked --doc"
+
+[tasks.docs]
+description = "Build documentation with warnings denied"
+env = { RUSTDOCFLAGS = "-D warnings" }
+run = "cargo doc --workspace --all-features --locked --no-deps"
+
+[tasks.deps]
+description = "Check dependency advisories, licenses, bans, and sources"
+run = "cargo deny check"
+
+[tasks.dead-code]
+description = "Find unused dependencies"
+run = "cargo shear --deny-warnings"
+
+[tasks.coverage]
+description = "Run tests with coverage"
+run = "rustup component add llvm-tools-preview && cargo llvm-cov nextest --workspace --all-features --locked"
+
+[tasks.ci]
+description = "Run the full local and remote gate"
+run = [
+  "mise run check",
+  "mise run lint",
+  "mise run test",
+  "mise run doctest",
+  "mise run docs",
+  "mise run deps",
+  "mise run dead-code",
+]
