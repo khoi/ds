@@ -8,11 +8,47 @@ use futures_util::StreamExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
+    pin::Pin,
 };
+
+pub(crate) enum ProviderEvent {
+    TextStart {
+        content_index: usize,
+        stop_reason: Option<StopReason>,
+    },
+    TextEnd {
+        content_index: usize,
+        content: TextContent,
+        stop_reason: Option<StopReason>,
+    },
+    TextDelta {
+        content_index: usize,
+        delta: String,
+    },
+    ReasoningDelta {
+        content_index: usize,
+        delta: String,
+    },
+    ToolCallDelta {
+        content_index: usize,
+        delta: String,
+    },
+    Done(Box<Response>),
+}
+
+pub(crate) type ProviderEventStream =
+    Pin<Box<dyn futures_core::Stream<Item = Result<ProviderEvent, Error>> + Send>>;
 
 pub(crate) fn adapt(
     model: Model,
     setup: impl Future<Output = Result<ResponseStream, Error>> + Send + 'static,
+) -> AssistantMessageEventStream {
+    adapt_provider(model, async move { setup.await.map(provider_event_stream) })
+}
+
+pub(crate) fn adapt_provider(
+    model: Model,
+    setup: impl Future<Output = Result<ProviderEventStream, Error>> + Send + 'static,
 ) -> AssistantMessageEventStream {
     let output = stream! {
         let mut source = match setup.await {
@@ -24,13 +60,60 @@ pub(crate) fn adapt(
         };
         let mut partial = empty_message(&model);
         let mut started = BTreeSet::new();
+        let mut ended = BTreeSet::new();
         let mut tool_json = BTreeMap::<usize, String>::new();
         yield AssistantMessageEvent::Start {
             partial: partial.clone(),
         };
         while let Some(event) = source.next().await {
             match event {
-                Ok(Event::TextDelta { content_index, delta }) => {
+                Ok(ProviderEvent::TextStart {
+                    content_index,
+                    stop_reason,
+                }) => {
+                    if let Some(stop_reason) = stop_reason {
+                        partial.stop_reason = stop_reason;
+                    }
+                    if started.insert(content_index) {
+                        partial.content.push(AssistantContent::Text(TextContent {
+                            text: String::new(),
+                            text_signature: None,
+                        }));
+                        yield AssistantMessageEvent::TextStart {
+                            content_index,
+                            partial: partial.clone(),
+                        };
+                    }
+                }
+                Ok(ProviderEvent::TextEnd {
+                    content_index,
+                    content,
+                    stop_reason,
+                }) => {
+                    if let Some(stop_reason) = stop_reason {
+                        partial.stop_reason = stop_reason;
+                    }
+                    if started.insert(content_index) {
+                        partial.content.push(AssistantContent::Text(TextContent {
+                            text: String::new(),
+                            text_signature: None,
+                        }));
+                        yield AssistantMessageEvent::TextStart {
+                            content_index,
+                            partial: partial.clone(),
+                        };
+                    }
+                    if let Some(slot) = partial.content.get_mut(content_index) {
+                        *slot = AssistantContent::Text(content.clone());
+                    }
+                    ended.insert(content_index);
+                    yield AssistantMessageEvent::TextEnd {
+                        content_index,
+                        content: content.text,
+                        partial: partial.clone(),
+                    };
+                }
+                Ok(ProviderEvent::TextDelta { content_index, delta }) => {
                     if started.insert(content_index) {
                         partial.content.push(AssistantContent::Text(TextContent {
                             text: String::new(),
@@ -50,7 +133,7 @@ pub(crate) fn adapt(
                         partial: partial.clone(),
                     };
                 }
-                Ok(Event::ReasoningDelta { content_index, delta }) => {
+                Ok(ProviderEvent::ReasoningDelta { content_index, delta }) => {
                     if started.insert(content_index) {
                         partial.content.push(AssistantContent::Thinking(ThinkingContent {
                             thinking: String::new(),
@@ -71,7 +154,7 @@ pub(crate) fn adapt(
                         partial: partial.clone(),
                     };
                 }
-                Ok(Event::ToolCallDelta { content_index, delta }) => {
+                Ok(ProviderEvent::ToolCallDelta { content_index, delta }) => {
                     if started.insert(content_index) {
                         partial.content.push(AssistantContent::ToolCall(AssistantToolCall {
                             id: String::new(),
@@ -96,9 +179,9 @@ pub(crate) fn adapt(
                         partial: partial.clone(),
                     };
                 }
-                Ok(Event::Done(response)) => {
+                Ok(ProviderEvent::Done(response)) => {
                     let message = final_message(&model, *response);
-                    for event in end_events(&mut partial, &message, &mut started) {
+                    for event in end_events(&mut partial, &message, &mut started, &ended) {
                         yield event;
                     }
                     yield AssistantMessageEvent::Done {
@@ -122,6 +205,49 @@ pub(crate) fn adapt(
     AssistantMessageEventStream::new(output)
 }
 
+pub(crate) fn provider_event_stream(mut source: ResponseStream) -> ProviderEventStream {
+    Box::pin(stream! {
+        while let Some(event) = source.next().await {
+            yield event.map(|event| match event {
+                Event::TextDelta { content_index, delta } => ProviderEvent::TextDelta {
+                    content_index,
+                    delta,
+                },
+                Event::ReasoningDelta { content_index, delta } => ProviderEvent::ReasoningDelta {
+                    content_index,
+                    delta,
+                },
+                Event::ToolCallDelta { content_index, delta } => ProviderEvent::ToolCallDelta {
+                    content_index,
+                    delta,
+                },
+                Event::Done(response) => ProviderEvent::Done(response),
+            });
+        }
+    })
+}
+
+pub(crate) fn response_stream(mut source: ProviderEventStream) -> ResponseStream {
+    Box::pin(stream! {
+        while let Some(event) = source.next().await {
+            match event {
+                Ok(ProviderEvent::TextStart { .. } | ProviderEvent::TextEnd { .. }) => {}
+                Ok(ProviderEvent::TextDelta { content_index, delta }) => {
+                    yield Ok(Event::TextDelta { content_index, delta });
+                }
+                Ok(ProviderEvent::ReasoningDelta { content_index, delta }) => {
+                    yield Ok(Event::ReasoningDelta { content_index, delta });
+                }
+                Ok(ProviderEvent::ToolCallDelta { content_index, delta }) => {
+                    yield Ok(Event::ToolCallDelta { content_index, delta });
+                }
+                Ok(ProviderEvent::Done(response)) => yield Ok(Event::Done(response)),
+                Err(error) => yield Err(error),
+            }
+        }
+    })
+}
+
 #[derive(Clone, Copy)]
 enum ContentKind {
     Text,
@@ -133,9 +259,13 @@ fn end_events(
     partial: &mut AssistantMessage,
     message: &AssistantMessage,
     started: &mut BTreeSet<usize>,
+    ended: &BTreeSet<usize>,
 ) -> Vec<AssistantMessageEvent> {
     let mut events = Vec::new();
     for (content_index, content) in message.content.iter().enumerate() {
+        if ended.contains(&content_index) {
+            continue;
+        }
         if started.insert(content_index) {
             if partial.content.len() == content_index {
                 partial.content.push(content.clone());

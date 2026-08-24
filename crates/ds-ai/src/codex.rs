@@ -1056,7 +1056,7 @@ async fn sse_stream(request: &SseRequest) -> Result<ResponseStream, Error> {
         )
         .await);
     }
-    Ok(openai::decode_stream(
+    Ok(crate::legacy::response_stream(openai::decode_stream(
         response,
         request.model.clone(),
         request.cancellation.clone(),
@@ -1071,7 +1071,7 @@ async fn sse_stream(request: &SseRequest) -> Result<ResponseStream, Error> {
             use_requested_for_default: true,
             codex: true,
         },
-    ))
+    )))
 }
 
 fn should_fallback_to_sse(event: &Result<crate::Event, Error>) -> bool {
@@ -1628,7 +1628,7 @@ async fn websocket_stream(
             }
         }
     };
-    let mut decoded = openai::decode_events(
+    let mut decoded = crate::legacy::response_stream(openai::decode_events(
         Box::pin(events),
         request.model.to_owned(),
         metadata,
@@ -1640,7 +1640,7 @@ async fn websocket_stream(
             use_requested_for_default: true,
             codex: true,
         },
-    );
+    ));
     let websocket_cache_ttl = options.websocket_cache_ttl;
     let output = async_stream::stream! {
         while let Some(event) = decoded.next().await {

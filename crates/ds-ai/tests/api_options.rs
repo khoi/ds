@@ -8,7 +8,102 @@ use ds_ai::{
     StopReason, StreamOptions, ThinkingBudgets, Tool, ToolResultMessage, Transport, Usage,
     builtin_model,
 };
+use futures_util::StreamExt;
 use serde_json::{Value, json};
+
+#[tokio::test]
+async fn tracks_openai_message_phases() {
+    for (added, done, expected) in [
+        (
+            "commentary",
+            "commentary",
+            [StopReason::Pending, StopReason::Pending],
+        ),
+        (
+            "final_answer",
+            "final_answer",
+            [StopReason::Stop, StopReason::Stop],
+        ),
+        (
+            "commentary",
+            "final_answer",
+            [StopReason::Pending, StopReason::Stop],
+        ),
+    ] {
+        let server = serve([Reply::sse(openai_phased_done(added, done, false))]).await;
+        let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+        model.base_url = server.base_url.clone();
+        let provider = ds_ai::openai::Provider::new([model.clone()]);
+        let mut stream = provider.stream(
+            &model,
+            &Context::new([Message::user("Hello")]),
+            &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        );
+        let mut observed = Vec::new();
+
+        while let Some(event) = stream.next().await {
+            match event {
+                ds_ai::AssistantMessageEvent::TextStart { partial, .. }
+                | ds_ai::AssistantMessageEvent::TextEnd { partial, .. } => {
+                    observed.push(partial.stop_reason);
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(observed, expected);
+        assert_eq!(stream.result().await.unwrap().stop_reason, StopReason::Stop);
+        server.requests().await;
+    }
+}
+
+#[tokio::test]
+async fn replaces_openai_phase_stop_with_incomplete_reason() {
+    let server = serve([Reply::sse(openai_phased_done(
+        "final_answer",
+        "final_answer",
+        true,
+    ))])
+    .await;
+    let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    model.base_url = server.base_url.clone();
+    let provider = ds_ai::openai::Provider::new([model.clone()]);
+    let mut stream = provider.stream(
+        &model,
+        &Context::new([Message::user("Hello")]),
+        &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+    );
+    let mut observed = Vec::new();
+
+    while let Some(event) = stream.next().await {
+        match event {
+            ds_ai::AssistantMessageEvent::TextStart { partial, .. }
+            | ds_ai::AssistantMessageEvent::TextEnd { partial, .. } => {
+                observed.push(partial.stop_reason);
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(observed, [StopReason::Stop, StopReason::Stop]);
+    assert_eq!(
+        stream.result().await.unwrap().stop_reason,
+        StopReason::Length
+    );
+    server.requests().await;
+}
 
 #[tokio::test]
 async fn routes_openai_specific_options() {
@@ -1067,6 +1162,17 @@ fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
 
 fn openai_done() -> &'static str {
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n"
+}
+
+fn openai_phased_done(added: &str, done: &str, incomplete: bool) -> String {
+    let terminal = if incomplete {
+        "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_phase\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n"
+    } else {
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_phase\",\"status\":\"completed\"}}\n\n"
+    };
+    format!(
+        "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"message\",\"id\":\"msg_phase\",\"content\":[],\"phase\":\"{added}\"}}}}\n\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"type\":\"message\",\"id\":\"msg_phase\",\"content\":[{{\"type\":\"output_text\",\"text\":\"answer\"}}],\"phase\":\"{done}\"}}}}\n\n{terminal}"
+    )
 }
 
 fn anthropic_done() -> &'static str {

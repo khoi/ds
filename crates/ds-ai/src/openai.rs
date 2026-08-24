@@ -1,7 +1,7 @@
 use crate::{
-    AssistantContent, CacheRetention, Content, Context, Error, Event, InputContent, Message,
-    Response, ResponseMetadata, ResponseStream, StopReason, TimeoutPhase, ToolCall,
-    ToolResultMessage, Usage, UserContent,
+    AssistantContent, CacheRetention, Content, Context, Error, InputContent, Message, Response,
+    ResponseMetadata, ResponseStream, StopReason, TimeoutPhase, ToolCall, ToolResultMessage, Usage,
+    UserContent,
     constrained_sampling::{self, GrammarInputBuffer},
     deferred_tools::{DeferredToolsMode, ToolPlacement},
     http, json, retry, transport,
@@ -48,7 +48,7 @@ impl Provider {
         let requested_model = model.clone();
         let context = context.for_model(&requested_model);
         let options = options.clone();
-        crate::legacy::adapt(requested_model.clone(), async move {
+        crate::legacy::adapt_provider(requested_model.clone(), async move {
             let stream_options = options.stream;
             let request_hooks = stream_options.request_hooks(&requested_model);
             let api_key = stream_options
@@ -110,7 +110,7 @@ impl Provider {
             if let Some(tool_choice) = options.tool_choice {
                 provider_options = provider_options.with_tool_choice(tool_choice);
             }
-            stream(&provider_model, &context, &provider_options).await
+            response_events(&provider_model, &context, &provider_options).await
         })
     }
 }
@@ -773,6 +773,16 @@ pub async fn stream(
     context: &Context,
     options: &Options,
 ) -> Result<ResponseStream, Error> {
+    response_events(model, context, options)
+        .await
+        .map(crate::legacy::response_stream)
+}
+
+async fn response_events(
+    model: &Model,
+    context: &Context,
+    options: &Options,
+) -> Result<crate::legacy::ProviderEventStream, Error> {
     let overall_deadline = options
         .overall_timeout
         .map(|timeout| Instant::now() + timeout);
@@ -1444,7 +1454,7 @@ pub(crate) fn decode_stream(
     idle_timeout: Option<Duration>,
     overall_deadline: Option<Instant>,
     options: ResponseEventOptions,
-) -> ResponseStream {
+) -> crate::legacy::ProviderEventStream {
     let metadata = http::metadata(response.headers());
     let mut events = transport::EventStream::new(
         response,
@@ -1476,7 +1486,7 @@ pub(crate) fn decode_events(
     response_model: String,
     metadata: ResponseMetadata,
     options: ResponseEventOptions,
-) -> ResponseStream {
+) -> crate::legacy::ProviderEventStream {
     let output = stream! {
         let mut result = if options.codex {
             Response::codex(response_model)
@@ -1540,6 +1550,15 @@ pub(crate) fn decode_events(
                             "message" => {
                                 result.content.push(Content::Text(String::new()));
                                 slots.insert(output_index, Slot::Text(content_index));
+                                let stop_reason = (item.phase.as_deref() == Some("final_answer"))
+                                    .then_some(StopReason::Stop);
+                                if let Some(stop_reason) = stop_reason {
+                                    result.stop_reason = stop_reason;
+                                }
+                                yield Ok(crate::legacy::ProviderEvent::TextStart {
+                                    content_index,
+                                    stop_reason,
+                                });
                             }
                             "reasoning" => {
                                 result.content.push(Content::Reasoning(String::new()));
@@ -1603,7 +1622,10 @@ pub(crate) fn decode_events(
                         if let Content::Text(text) = &mut result.content[*content_index] {
                             text.push_str(&delta);
                         }
-                        yield Ok(Event::TextDelta { content_index: *content_index, delta });
+                        yield Ok(crate::legacy::ProviderEvent::TextDelta {
+                            content_index: *content_index,
+                            delta,
+                        });
                     }
                     StreamEvent::ReasoningSummaryTextDelta { output_index, delta }
                     | StreamEvent::ReasoningTextDelta { output_index, delta } => {
@@ -1613,7 +1635,10 @@ pub(crate) fn decode_events(
                         if let Content::Reasoning(reasoning) = &mut result.content[*content_index] {
                             reasoning.push_str(&delta);
                         }
-                        yield Ok(Event::ReasoningDelta { content_index: *content_index, delta });
+                        yield Ok(crate::legacy::ProviderEvent::ReasoningDelta {
+                            content_index: *content_index,
+                            delta,
+                        });
                     }
                     StreamEvent::FunctionCallArgumentsDelta { output_index, delta } => {
                         let Some(Slot::ToolCall { content_index, arguments }) = slots.get_mut(&output_index) else {
@@ -1626,7 +1651,10 @@ pub(crate) fn decode_events(
                         if let Content::ToolCall(call) = &mut result.content[*content_index] {
                             call.arguments = parse_arguments(arguments);
                         }
-                        yield Ok(Event::ToolCallDelta { content_index: *content_index, delta });
+                        yield Ok(crate::legacy::ProviderEvent::ToolCallDelta {
+                            content_index: *content_index,
+                            delta,
+                        });
                     }
                     StreamEvent::FunctionCallArgumentsDone { output_index, arguments: completed } => {
                         let Some(Slot::ToolCall { content_index, arguments }) = slots.get_mut(&output_index) else {
@@ -1644,7 +1672,10 @@ pub(crate) fn decode_events(
                             call.arguments = parse_arguments(arguments);
                         }
                         if let Some(delta) = delta {
-                            yield Ok(Event::ToolCallDelta { content_index: *content_index, delta });
+                            yield Ok(crate::legacy::ProviderEvent::ToolCallDelta {
+                                content_index: *content_index,
+                                delta,
+                            });
                         }
                     }
                     StreamEvent::CustomToolCallInputDelta { output_index, delta } => {
@@ -1671,7 +1702,10 @@ pub(crate) fn decode_events(
                             call.arguments = serde_json::json!({property.as_str(): buffer.input});
                         }
                         if let Some(delta) = delta {
-                            yield Ok(Event::ToolCallDelta { content_index: *content_index, delta });
+                            yield Ok(crate::legacy::ProviderEvent::ToolCallDelta {
+                                content_index: *content_index,
+                                delta,
+                            });
                         }
                     }
                     StreamEvent::CustomToolCallInputDone { output_index, input } => {
@@ -1697,13 +1731,17 @@ pub(crate) fn decode_events(
                             call.arguments = serde_json::json!({property.as_str(): input});
                         }
                         if let Some(delta) = delta {
-                            yield Ok(Event::ToolCallDelta { content_index: *content_index, delta });
+                            yield Ok(crate::legacy::ProviderEvent::ToolCallDelta {
+                                content_index: *content_index,
+                                delta,
+                            });
                         }
                     }
                     StreamEvent::OutputItemDone { output_index, item } if item.r#type == "message" => {
                         let Some(Slot::Text(content_index)) = slots.get(&output_index) else {
                             continue;
                         };
+                        let content_index = *content_index;
                         let text = item
                             .content
                             .iter()
@@ -1713,16 +1751,36 @@ pub(crate) fn decode_events(
                                 _ => None,
                             })
                             .collect::<String>();
-                        if !text.is_empty() {
-                            result.content[*content_index] = Content::Text(text);
-                        }
+                        result.content[content_index] = Content::Text(text.clone());
+                        let phase = item.phase;
+                        let stop_reason = (phase.as_deref() == Some("final_answer"))
+                            .then_some(StopReason::Stop);
+                        let text_signature = item.id.as_ref().and_then(|id| {
+                            serde_json::to_string(&serde_json::json!({
+                                "v": 1,
+                                "id": id,
+                                "phase": phase
+                            }))
+                            .ok()
+                        });
                         if let Some(id) = item.id {
                             result.add_openai_item(OpenAiReplay::Message {
-                                content_index: *content_index,
+                                content_index,
                                 id,
-                                phase: item.phase,
+                                phase,
                             });
                         }
+                        if stop_reason.is_some() {
+                            result.stop_reason = StopReason::Stop;
+                        }
+                        yield Ok(crate::legacy::ProviderEvent::TextEnd {
+                            content_index,
+                            content: crate::TextContent {
+                                text,
+                                text_signature,
+                            },
+                            stop_reason,
+                        });
                     }
                     StreamEvent::OutputItemDone { output_index, item } if item.r#type == "reasoning" => {
                         let Some(Slot::Reasoning(content_index)) = slots.get(&output_index) else {
@@ -1807,7 +1865,10 @@ pub(crate) fn decode_events(
                             call.arguments = serde_json::json!({property.as_str(): buffer.input});
                         }
                         if let Some(delta) = delta {
-                            yield Ok(Event::ToolCallDelta { content_index: *content_index, delta });
+                            yield Ok(crate::legacy::ProviderEvent::ToolCallDelta {
+                                content_index: *content_index,
+                                delta,
+                            });
                         }
                         if let Some(item_id) = item.id {
                             result.add_openai_item(OpenAiReplay::ToolCall {
@@ -1833,7 +1894,7 @@ pub(crate) fn decode_events(
                                     result.stop_reason = StopReason::Length;
                                     result.raw_stop_reason =
                                         Some("incomplete.max_output_tokens".into());
-                                    yield Ok(Event::Done(Box::new(result)));
+                                    yield Ok(crate::legacy::ProviderEvent::Done(Box::new(result)));
                                 } else {
                                     result.stop_reason = StopReason::Error;
                                     result.raw_stop_reason = Some(reason.as_ref().map_or_else(
@@ -1888,7 +1949,7 @@ pub(crate) fn decode_events(
                             StopReason::Stop
                         };
                         result.raw_stop_reason = response.status;
-                        yield Ok(Event::Done(Box::new(result)));
+                        yield Ok(crate::legacy::ProviderEvent::Done(Box::new(result)));
                         return;
                     }
                     StreamEvent::Incomplete { response } => {
@@ -1905,7 +1966,7 @@ pub(crate) fn decode_events(
                                 result.stop_reason = StopReason::Length;
                                 result.raw_stop_reason =
                                     Some("incomplete.max_output_tokens".into());
-                                yield Ok(Event::Done(Box::new(result)));
+                                yield Ok(crate::legacy::ProviderEvent::Done(Box::new(result)));
                             return;
                         }
                         result.stop_reason = StopReason::Error;
