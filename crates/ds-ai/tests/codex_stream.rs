@@ -2,7 +2,8 @@ use crate::support::{Reply, serve};
 use base64::prelude::*;
 use ds_ai::{
     ApiStreamOptions, Context, Event, Message, OpenAiCodexResponsesOptions, Provider as _,
-    StopReason, StreamOptions, Transport as ProviderTransport, builtin_model, codex,
+    SimpleStreamOptions, StopReason, StreamOptions, ThinkingLevel, Transport as ProviderTransport,
+    builtin_model, codex,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -299,6 +300,252 @@ async fn uses_fixed_exponential_backoff_for_codex_retries() {
         done(&task.await.unwrap()).content,
         [ds_ai::Content::Text("Done".into())]
     );
+}
+
+#[tokio::test]
+async fn does_not_retry_codex_requests_by_default() {
+    let server = serve([
+        Reply::json(503, json!({"error": {"message": "busy"}})),
+        Reply::sse(sse_text_events(
+            "resp_unexpected",
+            "msg_unexpected",
+            "Unexpected",
+        )),
+    ])
+    .await;
+    let mut model = builtin_model("openai-codex", "gpt-5.6-sol").unwrap();
+    model.base_url = server.base_url.clone();
+    let provider = codex::Provider::new([model.clone()]);
+
+    let message = provider
+        .stream(
+            &model,
+            &Context::new([Message::user("Retry")]),
+            &ApiStreamOptions::OpenAiCodexResponses(OpenAiCodexResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some(token("acc_default_retry")),
+                    transport: Some(ProviderTransport::Sse),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .result()
+        .await
+        .unwrap();
+
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert_eq!(server.request_count(), 1);
+}
+
+#[tokio::test]
+async fn finishes_codex_sse_at_a_terminal_event_while_the_body_stays_open() {
+    for (terminal, expected_reason) in [
+        (
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_open_completed",
+                    "status": "completed",
+                    "end_turn": false,
+                    "usage": {}
+                }
+            }),
+            StopReason::Stop,
+        ),
+        (
+            json!({
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp_open_incomplete",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "usage": {}
+                }
+            }),
+            StopReason::Length,
+        ),
+    ] {
+        let sse = [
+            json!({"type": "response.created", "response": {"id": "resp_open"}}),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "msg_open", "type": "message", "content": []}
+            }),
+            json!({"type": "response.output_text.delta", "output_index": 0, "delta": "Done"}),
+            terminal,
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+        let server = serve([Reply::open_sse(sse)]).await;
+        let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
+
+        let events = tokio::time::timeout(Duration::from_secs(1), async {
+            codex::stream(
+                &model,
+                &Context::new([Message::user("Finish")]),
+                &codex::Options::new(token("acc_open_terminal"))
+                    .with_transport(codex::Transport::Sse),
+            )
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+        })
+        .await
+        .unwrap();
+
+        let response = done(&events);
+        assert_eq!(response.content, [ds_ai::Content::Text("Done".into())]);
+        assert_eq!(response.stop_reason, expected_reason);
+        if expected_reason == StopReason::Stop {
+            assert_eq!(response.end_turn, Some(false));
+        }
+        server.request_bytes().await;
+    }
+}
+
+#[tokio::test]
+async fn cancels_an_active_codex_sse_body_with_partial_content() {
+    let server = serve([Reply::open_sse(
+        [
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cancel\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_cancel\",\"type\":\"message\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Visible\"}\n\n",
+        ]
+        .concat(),
+    )])
+    .await;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
+    let mut stream = codex::stream(
+        &model,
+        &Context::new([Message::user("Cancel")]),
+        &codex::Options::new(token("acc_cancel"))
+            .with_cancellation(cancellation.clone())
+            .with_transport(codex::Transport::Sse),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        stream.next().await,
+        Some(Ok(Event::TextDelta {
+            content_index: 0,
+            delta: "Visible".into(),
+        }))
+    );
+    cancellation.cancel();
+
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(ds_ai::Error::Cancelled {
+            partial: Some(partial),
+        })) if partial.id.as_deref() == Some("resp_cancel")
+            && partial.content == [ds_ai::Content::Text("Visible".into())]
+    ));
+    drop(stream);
+    server.request_bytes().await;
+}
+
+#[tokio::test]
+async fn applies_codex_sse_cache_affinity_rules() {
+    let long_session = "x".repeat(67);
+    for (retention, session, expected) in [
+        (
+            ds_ai::CacheRetention::Short,
+            Some(long_session.as_str()),
+            Some("x".repeat(64)),
+        ),
+        (ds_ai::CacheRetention::None, Some("one-shot"), None),
+        (ds_ai::CacheRetention::Short, None, None),
+    ] {
+        let server = serve([Reply::sse(sse_text_events(
+            "resp_affinity",
+            "msg_affinity",
+            "Done",
+        ))])
+        .await;
+        let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
+        let mut options = codex::Options::new(token("acc_affinity"))
+            .with_cache_retention(retention)
+            .with_transport(codex::Transport::Sse);
+        if let Some(session) = session {
+            options = options.with_session_id(session);
+        }
+
+        codex::stream(&model, &Context::new([Message::user("Cache")]), &options)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        let request_bytes = server.request_bytes().await.pop().unwrap();
+        let (headers, body) = request(&request_bytes);
+        let body: Value = serde_json::from_slice(&zstd::stream::decode_all(body).unwrap()).unwrap();
+        match expected {
+            Some(expected) => {
+                assert!(headers.contains(&format!("session-id: {expected}\r\n")));
+                assert!(headers.contains(&format!("x-client-request-id: {expected}\r\n")));
+                assert_eq!(body["prompt_cache_key"], expected);
+            }
+            None => {
+                assert!(!headers.contains("session-id:"));
+                assert!(!headers.contains("x-client-request-id:"));
+                assert!(body.get("prompt_cache_key").is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn routes_simple_codex_options_to_cached_websocket_transport() {
+    codex::reset_websocket_debug_stats(Some("session_simple"));
+    let (base_url, capture) =
+        serve_websocket([text_events("resp_simple", "msg_simple", "Done")]).await;
+    let mut model = builtin_model("openai-codex", "gpt-5.5").unwrap();
+    model.base_url = base_url;
+    let provider = codex::Provider::new([model.clone()]);
+
+    let message = provider
+        .stream_simple(
+            &model,
+            &Context::new([Message::user("Connect")]),
+            &SimpleStreamOptions {
+                stream: StreamOptions {
+                    api_key: Some(token("acc_simple")),
+                    session_id: Some("session_simple".into()),
+                    transport: Some(ProviderTransport::Auto),
+                    ..Default::default()
+                },
+                thinking: Some(ThinkingLevel::XHigh),
+                ..Default::default()
+            },
+        )
+        .result()
+        .await
+        .unwrap();
+
+    assert_eq!(message.stop_reason, StopReason::Stop);
+    let capture = capture.await.unwrap();
+    assert_eq!(capture.headers["session-id"], "session_simple");
+    assert_eq!(capture.headers["x-client-request-id"], "session_simple");
+    assert_eq!(capture.bodies[0]["reasoning"]["effort"], "xhigh");
+    assert_eq!(
+        codex::websocket_debug_stats("session_simple"),
+        Some(codex::WebSocketDebugStats {
+            requests: 1,
+            connections_created: 1,
+            cached_context_requests: 1,
+            full_context_requests: 1,
+            last_input_items: 1,
+            ..Default::default()
+        })
+    );
+    codex::close_websocket_sessions(Some("session_simple"));
+    codex::reset_websocket_debug_stats(Some("session_simple"));
 }
 
 #[tokio::test]
@@ -966,6 +1213,34 @@ async fn falls_back_to_sse_when_codex_websocket_connect_fails() {
     let (_, body) = request(&requests[1]);
     let body: Value = serde_json::from_slice(&zstd::stream::decode_all(body).unwrap()).unwrap();
     assert_eq!(body["input"][0]["content"][0]["text"], "Connect");
+}
+
+#[tokio::test]
+async fn falls_back_to_sse_after_the_codex_websocket_connect_timeout() {
+    let base_url = serve_stalled_websocket_handshake_then_sse().await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+
+    let events = tokio::time::timeout(Duration::from_secs(1), async {
+        codex::stream(
+            &model,
+            &Context::new([Message::user("Connect")]),
+            &codex::Options::new(token("acc_connect_timeout"))
+                .with_timeout(Duration::from_millis(500))
+                .with_websocket_connect_timeout(Duration::from_millis(10))
+                .with_transport(codex::Transport::Auto),
+        )
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        done(&events).content,
+        [ds_ai::Content::Text("Fallback".into())]
+    );
 }
 
 #[tokio::test]
@@ -1643,6 +1918,30 @@ async fn serve_idle_websocket_then_sse() -> (String, oneshot::Receiver<Vec<Vec<u
         drop(websocket);
     });
     (format!("http://{address}"), receiver)
+}
+
+async fn serve_stalled_websocket_handshake_then_sse() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stalled, _) = listener.accept().await.unwrap();
+        read_http_request(&mut stalled).await;
+
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_http_request(&mut socket).await;
+        let sse = sse_text_events("resp_connect_timeout", "msg_connect_timeout", "Fallback");
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                    sse.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    format!("http://{address}")
 }
 
 async fn serve_started_idle_websocket() -> String {
