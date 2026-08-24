@@ -1669,7 +1669,10 @@ pub(crate) fn decode_events(
             };
 
             match event {
-                    StreamEvent::Created { response } => result.id = Some(response.id),
+                    StreamEvent::Created { response } => {
+                        result.id = Some(response.id.clone());
+                        yield Ok(crate::legacy::ProviderEvent::ResponseId(response.id));
+                    }
                     StreamEvent::OutputItemAdded { output_index, item } => {
                         let content_index = result.content.len();
                         if let Some((content, slot, start)) =

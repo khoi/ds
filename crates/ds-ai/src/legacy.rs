@@ -12,6 +12,7 @@ use std::{
 };
 
 pub(crate) enum ProviderEvent {
+    ResponseId(String),
     TextStart {
         content_index: usize,
         stop_reason: Option<StopReason>,
@@ -82,6 +83,9 @@ pub(crate) fn adapt_provider(
         };
         while let Some(event) = source.next().await {
             match event {
+                Ok(ProviderEvent::ResponseId(response_id)) => {
+                    partial.response_id = Some(response_id);
+                }
                 Ok(ProviderEvent::TextStart {
                     content_index,
                     stop_reason,
@@ -317,7 +321,8 @@ pub(crate) fn response_stream(mut source: ProviderEventStream) -> ResponseStream
     Box::pin(stream! {
         while let Some(event) = source.next().await {
             match event {
-                Ok(ProviderEvent::TextStart { .. }
+                Ok(ProviderEvent::ResponseId(_)
+                | ProviderEvent::TextStart { .. }
                 | ProviderEvent::TextEnd { .. }
                 | ProviderEvent::ThinkingStart { .. }
                 | ProviderEvent::ThinkingEnd { .. }

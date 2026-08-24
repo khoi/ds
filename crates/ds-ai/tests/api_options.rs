@@ -33,7 +33,10 @@ async fn emits_openai_content_events_from_done_items() {
     while let Some(event) = stream.next().await {
         match event {
             ds_ai::AssistantMessageEvent::Start { .. } => events.push("start"),
-            ds_ai::AssistantMessageEvent::ThinkingStart { .. } => events.push("thinking_start"),
+            ds_ai::AssistantMessageEvent::ThinkingStart { partial, .. } => {
+                events.push("thinking_start");
+                assert_eq!(partial.response_id.as_deref(), Some("resp_done"));
+            }
             ds_ai::AssistantMessageEvent::ThinkingEnd {
                 content, partial, ..
             } => {
@@ -1253,7 +1256,7 @@ fn openai_done() -> &'static str {
 }
 
 fn openai_done_items() -> &'static str {
-    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_done\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Think\"}],\"encrypted_content\":\"secret\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_done\",\"content\":[{\"type\":\"output_text\",\"text\":\"Answer\"}],\"phase\":\"final_answer\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_done\",\"call_id\":\"call_done\",\"name\":\"lookup\",\"arguments\":\"{\\\"value\\\":\\\"x\\\"}\",\"namespace\":\"dynamic_tools\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_done\",\"status\":\"completed\"}}\n\n"
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_done\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_done\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Think\"}],\"encrypted_content\":\"secret\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_done\",\"content\":[{\"type\":\"output_text\",\"text\":\"Answer\"}],\"phase\":\"final_answer\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_done\",\"call_id\":\"call_done\",\"name\":\"lookup\",\"arguments\":\"{\\\"value\\\":\\\"x\\\"}\",\"namespace\":\"dynamic_tools\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_done\",\"status\":\"completed\"}}\n\n"
 }
 
 fn openai_phased_done(added: &str, done: &str, incomplete: bool) -> String {
