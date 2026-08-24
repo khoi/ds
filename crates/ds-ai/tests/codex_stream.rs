@@ -263,6 +263,118 @@ async fn retries_a_missing_codex_continuation_with_full_context() {
 }
 
 #[tokio::test]
+async fn reconnects_once_when_the_codex_websocket_limit_is_reached() {
+    let (base_url, capture) = serve_websocket_connections([
+        vec![json!({
+            "type": "error",
+            "error": {"code": "websocket_connection_limit_reached"}
+        })],
+        text_events("resp_reconnected", "msg_reconnected", "Reconnected"),
+    ])
+    .await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let events = codex::stream(
+        &model,
+        &Context::new([Message::user("Connect")]),
+        &codex::Options::new(token("acc_limit"))
+            .with_session_id("session_limit")
+            .with_transport(codex::Transport::WebSocket),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+
+    assert_eq!(
+        done(&events).content,
+        [ds_ai::Content::Text("Reconnected".into())]
+    );
+    let bodies = capture.await.unwrap();
+    assert_eq!(bodies.len(), 2);
+    assert!(
+        bodies
+            .iter()
+            .all(|body| body.get("previous_response_id").is_none())
+    );
+    assert!(
+        bodies
+            .iter()
+            .all(|body| body["input"].as_array().unwrap().len() == 1)
+    );
+}
+
+#[tokio::test]
+async fn surfaces_a_second_codex_websocket_limit_error() {
+    let (base_url, capture) = serve_websocket_connections([
+        vec![json!({
+            "type": "error",
+            "error": {"code": "websocket_connection_limit_reached"}
+        })],
+        vec![json!({
+            "type": "error",
+            "error": {
+                "code": "websocket_connection_limit_reached",
+                "message": "Still full"
+            }
+        })],
+    ])
+    .await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let events = codex::stream(
+        &model,
+        &Context::new([Message::user("Connect")]),
+        &codex::Options::new(token("acc_limit_twice"))
+            .with_cache_retention(ds_ai::CacheRetention::None)
+            .with_transport(codex::Transport::WebSocket),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+
+    assert!(matches!(
+        events.last(),
+        Some(Err(ds_ai::Error::Response { code, message, partial }))
+            if code.as_deref() == Some("websocket_connection_limit_reached")
+                && message == "Still full"
+                && partial.content.is_empty()
+    ));
+    assert_eq!(capture.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn replaces_a_stale_cached_codex_websocket() {
+    let (base_url, capture) = serve_websocket_connections([
+        text_events("resp_stale_seed", "msg_stale_seed", "First"),
+        text_events("resp_stale_fresh", "msg_stale_fresh", "Second"),
+    ])
+    .await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let options = codex::Options::new(token("acc_stale"))
+        .with_session_id("session_stale")
+        .with_transport(codex::Transport::WebSocket);
+    let context = Context::new([Message::user("Connect")]);
+    let first = codex::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    assert_eq!(done(&first).content, [ds_ai::Content::Text("First".into())]);
+
+    let second = codex::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert_eq!(
+        done(&second).content,
+        [ds_ai::Content::Text("Second".into())]
+    );
+    assert_eq!(capture.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn falls_back_to_sse_when_codex_websocket_connect_fails() {
     let sse = [
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_fallback\",\"type\":\"message\",\"content\":[]}}\n\n",
@@ -445,6 +557,36 @@ async fn serve_websocket_close(events: impl IntoIterator<Item = Value>) -> Strin
             .unwrap();
     });
     format!("http://{address}")
+}
+
+async fn serve_websocket_connections(
+    event_batches: impl IntoIterator<Item = Vec<Value>>,
+) -> (String, oneshot::Receiver<Vec<Value>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let event_batches = event_batches.into_iter().collect::<Vec<_>>();
+    let (sender, receiver) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut bodies = Vec::new();
+        for events in event_batches {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let body = match socket.next().await {
+                Some(Ok(WebSocketMessage::Text(body))) => serde_json::from_str(&body).unwrap(),
+                message => panic!("unexpected websocket request: {message:?}"),
+            };
+            bodies.push(body);
+            for event in events {
+                socket
+                    .send(WebSocketMessage::Text(event.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            socket.close(None).await.unwrap();
+        }
+        sender.send(bodies).ok();
+    });
+    (format!("http://{address}"), receiver)
 }
 
 fn text_events(response_id: &str, message_id: &str, text: &str) -> Vec<Value> {

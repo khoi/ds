@@ -10,7 +10,11 @@ use std::{
     sync::{Arc, Mutex as StdMutex, OnceLock},
     time::Duration,
 };
-use tokio::{net::TcpStream, sync::Mutex as AsyncMutex, time::Instant};
+use tokio::{
+    net::TcpStream,
+    sync::{Mutex as AsyncMutex, OwnedMutexGuard},
+    time::Instant,
+};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message as WebSocketMessage, client::IntoClientRequest, http::HeaderValue},
@@ -306,6 +310,14 @@ struct WebSocketRequest<'a> {
     body: serde_json::Value,
 }
 
+#[derive(Clone)]
+struct WebSocketHandshake {
+    url: String,
+    access_token: String,
+    account_id: String,
+    request_id: String,
+}
+
 async fn websocket_stream(
     request: WebSocketRequest<'_>,
     options: &Options,
@@ -321,54 +333,24 @@ async fn websocket_stream(
         .session_id
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
-    let mut connection_request = websocket_url(request.base_url)
-        .into_client_request()
-        .map_err(|_| WebSocketConnectError::Transport)?;
-    for (name, value) in [
-        ("authorization", format!("Bearer {}", request.access_token)),
-        ("chatgpt-account-id", request.account_id.to_owned()),
-        ("originator", "ds".into()),
-        (
-            "user-agent",
-            concat!("ds-ai/", env!("CARGO_PKG_VERSION")).into(),
-        ),
-        ("x-client-request-id", request_id),
-        ("openai-beta", "responses_websockets=2026-02-06".into()),
-    ] {
-        connection_request.headers_mut().insert(
-            name,
-            HeaderValue::from_str(&value).map_err(|_| WebSocketConnectError::Transport)?,
-        );
-    }
-    let session_header = connection_request.headers()["x-client-request-id"].clone();
-    connection_request
-        .headers_mut()
-        .insert("session-id", session_header);
+    let handshake = WebSocketHandshake {
+        url: websocket_url(request.base_url),
+        access_token: request.access_token.to_owned(),
+        account_id: request.account_id.to_owned(),
+        request_id,
+    };
     let cached = cache_key.as_deref().and_then(cached_websocket);
+    let reused = cached.is_some();
     let connection = if let Some(cached) = cached {
         cached
     } else {
-        let connect_deadline = Instant::now() + options.websocket_connect_timeout;
-        let connection = tokio::select! {
-            biased;
-            _ = options.cancellation.cancelled() => return Err(WebSocketConnectError::Cancelled),
-            _ = transport::wait_until(overall_deadline) => {
-                return Err(WebSocketConnectError::OverallTimeout);
-            }
-            _ = tokio::time::sleep_until(connect_deadline) => {
-                return Err(WebSocketConnectError::Transport);
-            }
-            connection = connect_async(connection_request) => {
-                connection.map_err(|_| WebSocketConnectError::Transport)?
-            }
-        };
-        let (socket, response) = connection;
-        let connection = CachedWebSocket {
-            socket: Arc::new(AsyncMutex::new(socket)),
-            created_at: Instant::now(),
-            metadata: http::metadata(response.headers()),
-            continuation: Arc::new(StdMutex::new(None)),
-        };
+        let connection = connect_websocket(
+            &handshake,
+            &options.cancellation,
+            options.websocket_connect_timeout,
+            overall_deadline,
+        )
+        .await?;
         if let Some(cache_key) = &cache_key {
             websockets()
                 .lock()
@@ -377,7 +359,12 @@ async fn websocket_stream(
         }
         connection
     };
-    let socket = connection.socket.clone();
+    let CachedWebSocket {
+        socket,
+        metadata,
+        mut continuation,
+        ..
+    } = connection;
     let mut socket = tokio::select! {
         biased;
         _ = options.cancellation.cancelled() => return Err(WebSocketConnectError::Cancelled),
@@ -386,35 +373,51 @@ async fn websocket_stream(
         }
         socket = socket.lock_owned() => socket,
     };
+    let full_request = request.body;
+    let full_body =
+        serde_json::to_string(&full_request).map_err(|_| WebSocketConnectError::Transport)?;
     let body = continuation_request(
-        &request.body,
-        connection
-            .continuation
+        &full_request,
+        continuation
             .lock()
             .expect("websocket continuation lock")
             .as_ref(),
     );
-    let used_continuation = body.get("previous_response_id").is_some();
+    let mut used_continuation = body.get("previous_response_id").is_some();
     let body = serde_json::to_string(&body).map_err(|_| WebSocketConnectError::Transport)?;
-    tokio::select! {
+    let sent = tokio::select! {
         biased;
         _ = options.cancellation.cancelled() => return Err(WebSocketConnectError::Cancelled),
         _ = transport::wait_until(overall_deadline) => {
             return Err(WebSocketConnectError::OverallTimeout);
         }
-        result = socket.send(WebSocketMessage::Text(body.into())) => {
-            result.map_err(|_| WebSocketConnectError::Transport)?;
+        result = socket.send(WebSocketMessage::Text(body.into())) => result,
+    };
+    let mut retried_socket = false;
+    if sent.is_err() {
+        if !reused {
+            return Err(WebSocketConnectError::Transport);
         }
+        (socket, continuation) = replace_websocket(
+            socket,
+            cache_key.as_deref(),
+            &handshake,
+            &options.cancellation,
+            options.websocket_connect_timeout,
+            overall_deadline,
+            &full_body,
+        )
+        .await?;
+        used_continuation = false;
+        retried_socket = true;
     }
-    let full_request = request.body;
-    let full_body =
-        serde_json::to_string(&full_request).map_err(|_| WebSocketConnectError::Transport)?;
-    let continuation = connection.continuation;
-    let metadata = connection.metadata;
     let cancellation = options.cancellation.clone();
+    let websocket_connect_timeout = options.websocket_connect_timeout;
     let first_event_timeout = options.first_event_timeout;
     let idle_timeout = options.idle_timeout;
     let events = async_stream::stream! {
+        let mut continuation = continuation;
+        let mut retried_socket = retried_socket;
         let mut saw_event = false;
         let mut event_deadline = first_event_timeout.map(|timeout| Instant::now() + timeout);
         let mut response_id = None;
@@ -442,6 +445,50 @@ async fn websocket_stream(
                 }
                 message = socket.next() => message,
             };
+            if reused
+                && !emitted
+                && !retried_socket
+                && matches!(
+                    &message,
+                    Some(Ok(WebSocketMessage::Close(_))) | Some(Err(_)) | None
+                )
+            {
+                match replace_websocket(
+                    socket,
+                    cache_key.as_deref(),
+                    &handshake,
+                    &cancellation,
+                    websocket_connect_timeout,
+                    overall_deadline,
+                    &full_body,
+                )
+                .await
+                {
+                    Ok((fresh_socket, fresh_continuation)) => {
+                        socket = fresh_socket;
+                        continuation = fresh_continuation;
+                    }
+                    Err(WebSocketConnectError::Cancelled) => {
+                        yield Err(transport::ReadError::Cancelled);
+                        return;
+                    }
+                    Err(WebSocketConnectError::OverallTimeout) => {
+                        yield Err(transport::ReadError::Timeout(crate::TimeoutPhase::Overall));
+                        return;
+                    }
+                    Err(WebSocketConnectError::Transport) => {
+                        yield Err(transport::ReadError::Stream("websocket reconnect failed".into()));
+                        return;
+                    }
+                }
+                retried_socket = true;
+                used_continuation = false;
+                saw_event = false;
+                event_deadline = first_event_timeout.map(|timeout| Instant::now() + timeout);
+                response_id = None;
+                response_items.clear();
+                continue;
+            }
             let data = match message {
                 Some(Ok(WebSocketMessage::Text(text))) => Some(text.to_string()),
                 Some(Ok(WebSocketMessage::Binary(bytes))) => {
@@ -480,10 +527,52 @@ async fn websocket_stream(
                 }
             };
             if let Some(mut data) = data {
+                let code = codex_error_code(&data);
+                if !emitted
+                    && !retried_socket
+                    && code.as_deref() == Some("websocket_connection_limit_reached")
+                {
+                    *continuation.lock().expect("websocket continuation lock") = None;
+                    match replace_websocket(
+                        socket,
+                        cache_key.as_deref(),
+                        &handshake,
+                        &cancellation,
+                        websocket_connect_timeout,
+                        overall_deadline,
+                        &full_body,
+                    )
+                    .await
+                    {
+                        Ok((fresh_socket, fresh_continuation)) => {
+                            socket = fresh_socket;
+                            continuation = fresh_continuation;
+                        }
+                        Err(WebSocketConnectError::Cancelled) => {
+                            yield Err(transport::ReadError::Cancelled);
+                            return;
+                        }
+                        Err(WebSocketConnectError::OverallTimeout) => {
+                            yield Err(transport::ReadError::Timeout(crate::TimeoutPhase::Overall));
+                            return;
+                        }
+                        Err(WebSocketConnectError::Transport) => {
+                            yield Err(transport::ReadError::Stream("websocket reconnect failed".into()));
+                            return;
+                        }
+                    }
+                    retried_socket = true;
+                    used_continuation = false;
+                    saw_event = false;
+                    event_deadline = first_event_timeout.map(|timeout| Instant::now() + timeout);
+                    response_id = None;
+                    response_items.clear();
+                    continue;
+                }
                 if used_continuation
                     && !emitted
                     && !retried_missing_continuation
-                    && codex_error_code(&data).as_deref() == Some("previous_response_not_found")
+                    && code.as_deref() == Some("previous_response_not_found")
                 {
                     *continuation.lock().expect("websocket continuation lock") = None;
                     let sent = tokio::select! {
@@ -539,6 +628,116 @@ async fn websocket_stream(
         request.model.to_owned(),
         metadata,
     ))
+}
+
+async fn connect_websocket(
+    handshake: &WebSocketHandshake,
+    cancellation: &CancellationToken,
+    connect_timeout: Duration,
+    overall_deadline: Option<Instant>,
+) -> Result<CachedWebSocket, WebSocketConnectError> {
+    let mut connection_request = handshake
+        .url
+        .as_str()
+        .into_client_request()
+        .map_err(|_| WebSocketConnectError::Transport)?;
+    for (name, value) in [
+        (
+            "authorization",
+            format!("Bearer {}", handshake.access_token),
+        ),
+        ("chatgpt-account-id", handshake.account_id.clone()),
+        ("originator", "ds".into()),
+        (
+            "user-agent",
+            concat!("ds-ai/", env!("CARGO_PKG_VERSION")).into(),
+        ),
+        ("x-client-request-id", handshake.request_id.clone()),
+        ("openai-beta", "responses_websockets=2026-02-06".into()),
+    ] {
+        connection_request.headers_mut().insert(
+            name,
+            HeaderValue::from_str(&value).map_err(|_| WebSocketConnectError::Transport)?,
+        );
+    }
+    let session_header = connection_request.headers()["x-client-request-id"].clone();
+    connection_request
+        .headers_mut()
+        .insert("session-id", session_header);
+    let connect_deadline = Instant::now() + connect_timeout;
+    let (socket, response) = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(WebSocketConnectError::Cancelled),
+        _ = transport::wait_until(overall_deadline) => {
+            return Err(WebSocketConnectError::OverallTimeout);
+        }
+        _ = tokio::time::sleep_until(connect_deadline) => {
+            return Err(WebSocketConnectError::Transport);
+        }
+        connection = connect_async(connection_request) => {
+            connection.map_err(|_| WebSocketConnectError::Transport)?
+        }
+    };
+    Ok(CachedWebSocket {
+        socket: Arc::new(AsyncMutex::new(socket)),
+        created_at: Instant::now(),
+        metadata: http::metadata(response.headers()),
+        continuation: Arc::new(StdMutex::new(None)),
+    })
+}
+
+async fn replace_websocket(
+    mut socket: OwnedMutexGuard<WebSocket>,
+    cache_key: Option<&str>,
+    handshake: &WebSocketHandshake,
+    cancellation: &CancellationToken,
+    connect_timeout: Duration,
+    overall_deadline: Option<Instant>,
+    body: &str,
+) -> Result<
+    (
+        OwnedMutexGuard<WebSocket>,
+        Arc<StdMutex<Option<Continuation>>>,
+    ),
+    WebSocketConnectError,
+> {
+    if let Some(cache_key) = cache_key {
+        websockets()
+            .lock()
+            .expect("websocket cache lock")
+            .remove(cache_key);
+    }
+    let _ = socket.close(None).await;
+    drop(socket);
+    let connection =
+        connect_websocket(handshake, cancellation, connect_timeout, overall_deadline).await?;
+    let continuation = connection.continuation.clone();
+    let fresh_socket = connection.socket.clone();
+    let mut socket = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(WebSocketConnectError::Cancelled),
+        _ = transport::wait_until(overall_deadline) => {
+            return Err(WebSocketConnectError::OverallTimeout);
+        }
+        socket = fresh_socket.lock_owned() => socket,
+    };
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(WebSocketConnectError::Cancelled),
+        _ = transport::wait_until(overall_deadline) => {
+            return Err(WebSocketConnectError::OverallTimeout);
+        }
+        sent = socket.send(WebSocketMessage::Text(body.to_owned().into())) => {
+            sent.map_err(|_| WebSocketConnectError::Transport)?;
+        }
+    }
+    if let Some(cache_key) = cache_key {
+        websockets()
+            .lock()
+            .expect("websocket cache lock")
+            .insert(cache_key.to_owned(), connection);
+    }
+    Ok((socket, continuation))
 }
 
 fn codex_error_code(data: &str) -> Option<String> {
