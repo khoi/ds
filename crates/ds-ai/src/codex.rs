@@ -453,7 +453,26 @@ async fn websocket_stream(
                         }
                     }
                 }
-                Some(Ok(WebSocketMessage::Close(_))) | None => return,
+                Some(Ok(WebSocketMessage::Close(frame))) => {
+                    let message = frame.map_or_else(
+                        || "websocket closed before a terminal event".into(),
+                        |frame| {
+                            format!(
+                                "websocket closed with code {}: {}",
+                                u16::from(frame.code),
+                                frame.reason
+                            )
+                        },
+                    );
+                    yield Err(transport::ReadError::Stream(message));
+                    return;
+                }
+                None => {
+                    yield Err(transport::ReadError::Stream(
+                        "websocket closed before a terminal event".into(),
+                    ));
+                    return;
+                }
                 Some(Ok(_)) => None,
                 Some(Err(error)) => {
                     yield Err(transport::ReadError::Stream(error.to_string()));

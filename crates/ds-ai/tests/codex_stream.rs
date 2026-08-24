@@ -13,6 +13,7 @@ use tokio_tungstenite::{
     tungstenite::{
         Message as WebSocketMessage,
         handshake::server::{Callback, ErrorResponse, Request, Response},
+        protocol::{CloseFrame, frame::coding::CloseCode},
     },
 };
 
@@ -294,6 +295,49 @@ async fn falls_back_to_sse_when_codex_websocket_connect_fails() {
     assert_eq!(body["input"][0]["content"][0]["text"], "Connect");
 }
 
+#[tokio::test]
+async fn preserves_partial_content_after_an_oversized_websocket_close() {
+    let base_url = serve_websocket_close([
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "msg_partial", "type": "message", "content": []}
+        }),
+        json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "delta": "Partial"
+        }),
+    ])
+    .await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let events = codex::stream(
+        &model,
+        &Context::new([Message::user("Large response")]),
+        &codex::Options::new(token("acc_large"))
+            .with_cache_retention(ds_ai::CacheRetention::None)
+            .with_transport(codex::Transport::WebSocket),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+
+    assert_eq!(
+        events.first(),
+        Some(&Ok(Event::TextDelta {
+            content_index: 0,
+            delta: "Partial".into(),
+        }))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(Err(ds_ai::Error::Stream { message, partial }))
+            if message.contains("code 1009")
+                && partial.content == [ds_ai::Content::Text("Partial".into())]
+    ));
+}
+
 fn token(account_id: &str) -> String {
     let payload = BASE64_URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&json!({
@@ -373,6 +417,34 @@ async fn serve_websocket(
             .ok();
     });
     (format!("http://{address}"), receiver)
+}
+
+async fn serve_websocket_close(events: impl IntoIterator<Item = Value>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let events = events.into_iter().collect::<Vec<_>>();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        assert!(matches!(
+            socket.next().await,
+            Some(Ok(WebSocketMessage::Text(_)))
+        ));
+        for event in events {
+            socket
+                .send(WebSocketMessage::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        socket
+            .close(Some(CloseFrame {
+                code: CloseCode::Size,
+                reason: "too large".into(),
+            }))
+            .await
+            .unwrap();
+    });
+    format!("http://{address}")
 }
 
 fn text_events(response_id: &str, message_id: &str, text: &str) -> Vec<Value> {
