@@ -341,6 +341,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "http",
  "httpdate",
  "jsonschema",
  "rand",

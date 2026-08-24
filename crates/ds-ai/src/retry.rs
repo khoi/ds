@@ -1,13 +1,19 @@
 use crate::{AssistantMessage, Error, StopReason};
 use async_trait::async_trait;
+use bytes::BytesMut;
+use futures_util::StreamExt;
 use regex::RegexSet;
 use reqwest::{Response, header::HeaderMap};
 use std::{
-    future::Future,
+    future::{Future, pending},
     sync::LazyLock,
     time::{Duration, SystemTime},
 };
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+const ERROR_BODY_LIMIT: usize = 1024 * 1024;
+const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 static NON_RETRYABLE: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
@@ -68,6 +74,17 @@ static RETRYABLE: LazyLock<RegexSet> = LazyLock::new(|| {
         r"(?i)ResourceExhausted",
     ])
     .expect("valid retryable patterns")
+});
+
+static CODEX_RETRYABLE: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
+        r"(?i)rate.?limit",
+        r"(?i)overloaded",
+        r"(?i)service.?unavailable",
+        r"(?i)upstream.?connect",
+        r"(?i)connection.?refused",
+    ])
+    .expect("valid Codex retryable patterns")
 });
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -194,6 +211,15 @@ pub(crate) struct Policy<'a> {
     pub max_retries: usize,
     pub max_delay: Option<Duration>,
     pub cancellation: &'a CancellationToken,
+    pub deadline: Option<Instant>,
+    pub profile: Profile,
+    pub request_timeout: Option<Duration>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Profile {
+    Standard,
+    Codex,
 }
 
 pub(crate) async fn send<F, Fut, O, OFut>(
@@ -214,29 +240,60 @@ where
             _ = policy.cancellation.cancelled() => {
                 return Err(Error::Cancelled { partial: None });
             }
-            response = request() => response,
+            _ = wait_for(policy.request_timeout) => Err(RequestFailure::Timeout),
+            response = request() => response.map_err(RequestFailure::Http),
         };
         let response = match requested {
             Ok(response) => response,
             Err(_) if retries < policy.max_retries => {
-                let delay = backoff(retries);
+                let delay = backoff(policy.profile, retries);
                 retries += 1;
                 wait(delay, policy.cancellation).await?;
                 continue;
             }
-            Err(error) => return Err(Error::Http(error.to_string())),
+            Err(RequestFailure::Http(error)) => return Err(Error::Http(error.to_string())),
+            Err(RequestFailure::Timeout) => {
+                return Err(Error::Timeout {
+                    phase: crate::TimeoutPhase::Connection,
+                    partial: None,
+                });
+            }
         };
         observe(crate::http::provider_response(&response)).await?;
         if response.status().is_success() {
             return Ok(response);
         }
-        if retries >= policy.max_retries || !is_retryable(&response) {
+        let (response, retryable) = match policy.profile {
+            Profile::Standard => {
+                let retryable = is_retryable(&response);
+                (response, retryable)
+            }
+            Profile::Codex => {
+                match buffer_error_response(response, policy.cancellation, policy.deadline).await {
+                    Ok((response, body)) => {
+                        let retryable = is_retryable_codex(response.status().as_u16(), &body);
+                        (response, retryable)
+                    }
+                    Err(Error::Http(_)) if retries < policy.max_retries => {
+                        let delay = backoff(policy.profile, retries);
+                        retries += 1;
+                        wait(delay, policy.cancellation).await?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        if retries >= policy.max_retries || !retryable {
             return Ok(response);
         }
 
-        let delay = delay(response.headers(), retries);
+        let requested = requested_delay(response.headers());
+        let delay = requested.unwrap_or_else(|| backoff(policy.profile, retries));
         retries += 1;
         if let Some(maximum) = policy.max_delay
+            && !maximum.is_zero()
+            && requested.is_some()
             && delay > maximum
         {
             return Err(Error::RetryDelayExceeded {
@@ -246,6 +303,11 @@ where
         }
         wait(delay, policy.cancellation).await?;
     }
+}
+
+enum RequestFailure {
+    Http(reqwest::Error),
+    Timeout,
 }
 
 fn is_retryable(response: &Response) -> bool {
@@ -260,8 +322,11 @@ fn is_retryable(response: &Response) -> bool {
     }
 }
 
-fn delay(headers: &HeaderMap, retry_index: usize) -> Duration {
-    requested_delay(headers).unwrap_or_else(|| backoff(retry_index))
+fn is_retryable_codex(status: u16, body: &str) -> bool {
+    if status == 429 && NON_RETRYABLE.is_match(body) {
+        return false;
+    }
+    matches!(status, 429 | 500 | 502 | 503 | 504) || CODEX_RETRYABLE.is_match(body)
 }
 
 pub(crate) fn requested_delay(headers: &HeaderMap) -> Option<Duration> {
@@ -285,12 +350,58 @@ pub(crate) fn requested_delay(headers: &HeaderMap) -> Option<Duration> {
 
 fn parse_duration(value: &str, seconds_per_unit: f64) -> Option<Duration> {
     let value = value.parse::<f64>().ok()?;
-    Duration::try_from_secs_f64(value * seconds_per_unit).ok()
+    Duration::try_from_secs_f64((value * seconds_per_unit).max(0.0)).ok()
 }
 
-fn backoff(retry_index: usize) -> Duration {
-    let base_seconds = (0.5 * 2_f64.powi(retry_index as i32)).min(8.0);
-    Duration::from_secs_f64(base_seconds * (1.0 - rand::random::<f64>() * 0.25))
+fn backoff(profile: Profile, retry_index: usize) -> Duration {
+    match profile {
+        Profile::Standard => {
+            let base_seconds = (0.5 * 2_f64.powi(retry_index as i32)).min(8.0);
+            Duration::from_secs_f64(base_seconds * (1.0 - rand::random::<f64>() * 0.25))
+        }
+        Profile::Codex => Duration::from_secs(1_u64 << retry_index.min(31)),
+    }
+}
+
+async fn buffer_error_response(
+    response: Response,
+    cancellation: &CancellationToken,
+    deadline: Option<Instant>,
+) -> Result<(Response, String), Error> {
+    let status = response.status();
+    let version = response.version();
+    let headers = response.headers().clone();
+    let mut chunks = response.bytes_stream();
+    let mut body = BytesMut::new();
+    let timeout = Instant::now() + ERROR_BODY_TIMEOUT;
+    let deadline = deadline.map_or(timeout, |deadline| deadline.min(timeout));
+    while body.len() < ERROR_BODY_LIMIT {
+        let chunk = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(Error::Cancelled { partial: None }),
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(Error::Timeout {
+                    phase: crate::TimeoutPhase::Overall,
+                    partial: None,
+                });
+            }
+            chunk = chunks.next() => chunk,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let chunk = chunk.map_err(|error| Error::Http(error.to_string()))?;
+        let remaining = ERROR_BODY_LIMIT - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    let text = String::from_utf8_lossy(&body).into_owned();
+    let mut rebuilt = ::http::Response::builder()
+        .status(status)
+        .version(version)
+        .body(body.freeze())
+        .expect("valid provider response");
+    *rebuilt.headers_mut() = headers;
+    Ok((Response::from(rebuilt), text))
 }
 
 async fn wait(delay: Duration, cancellation: &CancellationToken) -> Result<(), Error> {
@@ -300,5 +411,12 @@ async fn wait(delay: Duration, cancellation: &CancellationToken) -> Result<(), E
     tokio::select! {
         _ = tokio::time::sleep(delay) => Ok(()),
         _ = cancellation.cancelled() => Err(Error::Cancelled { partial: None }),
+    }
+}
+
+async fn wait_for(timeout: Option<Duration>) {
+    match timeout.filter(|timeout| !timeout.is_zero()) {
+        Some(timeout) => tokio::time::sleep(timeout).await,
+        None => pending().await,
     }
 }

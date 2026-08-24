@@ -978,6 +978,9 @@ pub async fn stream(
                 max_retries: options.max_retries,
                 max_delay: options.max_retry_delay,
                 cancellation: &options.cancellation,
+                deadline: overall_deadline,
+                profile: retry::Profile::Standard,
+                request_timeout: None,
             },
             || {
                 client

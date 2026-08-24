@@ -155,7 +155,7 @@ impl Default for StreamOptions {
             on_payload: None,
             on_response: None,
             timeout: None,
-            max_retries: Some(2),
+            max_retries: None,
             max_retry_delay: Some(Duration::from_secs(60)),
             temperature: None,
             sampling_params: BTreeMap::new(),

@@ -5,7 +5,10 @@ use reqwest::{
     Response,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -29,6 +32,39 @@ pub(crate) async fn provider_error(
     cancellation: &CancellationToken,
     overall_deadline: Option<Instant>,
 ) -> Error {
+    provider_error_with(
+        response,
+        response_metadata,
+        cancellation,
+        overall_deadline,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn codex_provider_error(
+    response: Response,
+    response_metadata: ResponseMetadata,
+    cancellation: &CancellationToken,
+    overall_deadline: Option<Instant>,
+) -> Error {
+    provider_error_with(
+        response,
+        response_metadata,
+        cancellation,
+        overall_deadline,
+        true,
+    )
+    .await
+}
+
+async fn provider_error_with(
+    response: Response,
+    response_metadata: ResponseMetadata,
+    cancellation: &CancellationToken,
+    overall_deadline: Option<Instant>,
+    codex: bool,
+) -> Error {
     let status = response.status().as_u16();
     let retry_after = retry::requested_delay(response.headers());
     let body = tokio::select! {
@@ -51,12 +87,18 @@ pub(crate) async fn provider_error(
         })
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
-    let message = parsed
-        .as_ref()
-        .and_then(|body| body.pointer("/error/message"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .filter(|message| !message.is_empty())
+    let friendly_message = codex
+        .then(|| codex_usage_limit_message(status, parsed.as_ref()))
+        .flatten();
+    let message = friendly_message
+        .or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|body| body.pointer("/error/message"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .filter(|message| !message.is_empty())
+        })
         .unwrap_or_else(|| {
             if body.is_empty() {
                 format!("provider returned HTTP {status}")
@@ -72,6 +114,48 @@ pub(crate) async fn provider_error(
         retry_after,
         rate_limits: response_metadata.rate_limits,
     }
+}
+
+fn codex_usage_limit_message(status: u16, body: Option<&serde_json::Value>) -> Option<String> {
+    let error = body?.pointer("/error")?;
+    let code = error
+        .get("code")
+        .or_else(|| error.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let code = code.to_ascii_lowercase();
+    if status != 429
+        && ![
+            "usage_limit_reached",
+            "usage_not_included",
+            "rate_limit_exceeded",
+        ]
+        .iter()
+        .any(|candidate| code.contains(candidate))
+    {
+        return None;
+    }
+    let plan = error
+        .get("plan_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .map(|plan| format!(" ({plan} plan)"))
+        .unwrap_or_default();
+    let when = error
+        .get("resets_at")
+        .and_then(serde_json::Value::as_f64)
+        .map(|reset| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+            let minutes = ((reset - now) / 60.0).round().max(0.0) as u64;
+            format!(" Try again in ~{minutes} min.")
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "You have hit your ChatGPT usage limit{plan}.{when}"
+    ))
 }
 
 pub(crate) fn header(headers: &HeaderMap, name: &str) -> Option<String> {

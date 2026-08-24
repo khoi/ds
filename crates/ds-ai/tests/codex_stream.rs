@@ -107,6 +107,201 @@ async fn retries_and_compresses_a_codex_sse_request() {
 }
 
 #[tokio::test]
+async fn follows_codex_specific_retry_statuses_and_error_text() {
+    for (status, message, should_retry) in [
+        (408, "failed", false),
+        (409, "failed", false),
+        (429, "failed", true),
+        (500, "failed", true),
+        (501, "failed", false),
+        (502, "failed", true),
+        (503, "failed", true),
+        (504, "failed", true),
+        (599, "failed", false),
+        (400, "upstream connect failed", true),
+    ] {
+        let mut replies = vec![
+            Reply::json(status, json!({"error": {"message": message}}))
+                .with_header("retry-after-ms", "0"),
+        ];
+        if should_retry {
+            replies.push(Reply::sse(sse_text_events(
+                &format!("resp_retry_{status}"),
+                &format!("msg_retry_{status}"),
+                "Done",
+            )));
+        }
+        let server = serve(replies).await;
+        let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
+        let result = codex::stream(
+            &model,
+            &Context::new([Message::user("Retry")]),
+            &codex::Options::new(token("acc_retry_matrix"))
+                .with_max_retries(1)
+                .with_transport(codex::Transport::Sse),
+        )
+        .await;
+
+        if should_retry {
+            let events = result.unwrap().collect::<Vec<_>>().await;
+            assert_eq!(done(&events).content, [ds_ai::Content::Text("Done".into())]);
+            assert_eq!(server.request_count(), 2);
+        } else {
+            assert!(matches!(
+                result,
+                Err(ds_ai::Error::Provider { status: actual, .. }) if actual == status
+            ));
+            assert_eq!(server.request_count(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn does_not_retry_a_terminal_codex_quota_error() {
+    let reset_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    let failure = || {
+        Reply::json(
+            429,
+            json!({
+                "error": {
+                    "code": "usage_limit_reached",
+                    "message": "Monthly usage limit reached",
+                    "plan_type": "PLUS",
+                    "resets_at": reset_at
+                }
+            }),
+        )
+        .with_header("retry-after-ms", "0")
+    };
+    let server = serve([failure(), failure(), failure()]).await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
+
+    let error = match codex::stream(
+        &model,
+        &Context::new([Message::user("Quota")]),
+        &codex::Options::new(token("acc_quota"))
+            .with_max_retries(2)
+            .with_transport(codex::Transport::Sse),
+    )
+    .await
+    {
+        Ok(_) => panic!("terminal quota error was accepted"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        ds_ai::Error::Provider { status: 429, message, .. }
+            if message == "You have hit your ChatGPT usage limit (plus plan). Try again in ~10 min."
+    ));
+    assert_eq!(server.request_count(), 1);
+}
+
+#[tokio::test]
+async fn disables_the_codex_retry_delay_cap_with_zero() {
+    let server = serve([
+        Reply::json(429, json!({"error": {"message": "retry"}})).with_header("retry-after-ms", "1"),
+        Reply::sse(sse_text_events("resp_no_cap", "msg_no_cap", "Done")),
+    ])
+    .await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
+
+    let events = codex::stream(
+        &model,
+        &Context::new([Message::user("Retry")]),
+        &codex::Options::new(token("acc_no_cap"))
+            .with_max_retries(1)
+            .with_max_retry_delay(Some(Duration::ZERO))
+            .with_transport(codex::Transport::Sse),
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+
+    assert_eq!(done(&events).content, [ds_ai::Content::Text("Done".into())]);
+    assert_eq!(server.request_count(), 2);
+}
+
+#[tokio::test]
+async fn rejects_a_codex_retry_delay_above_the_cap() {
+    let server = serve([Reply::json(429, json!({"error": {"message": "retry"}}))
+        .with_header("retry-after-ms", "1000")])
+    .await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
+
+    let error = match codex::stream(
+        &model,
+        &Context::new([Message::user("Retry")]),
+        &codex::Options::new(token("acc_capped"))
+            .with_max_retries(1)
+            .with_max_retry_delay(Some(Duration::from_millis(999)))
+            .with_transport(codex::Transport::Sse),
+    )
+    .await
+    {
+        Ok(_) => panic!("retry delay above the cap was accepted"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error,
+        ds_ai::Error::RetryDelayExceeded {
+            requested: Duration::from_secs(1),
+            maximum: Duration::from_millis(999),
+        }
+    );
+    assert_eq!(server.request_count(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn uses_fixed_exponential_backoff_for_codex_retries() {
+    let server = serve([
+        Reply::json(503, json!({"error": {"message": "busy"}})),
+        Reply::json(503, json!({"error": {"message": "busy"}})),
+        Reply::json(503, json!({"error": {"message": "busy"}})),
+        Reply::sse(sse_text_events("resp_backoff", "msg_backoff", "Done")),
+    ])
+    .await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(&server.base_url);
+    let task = tokio::spawn(async move {
+        codex::stream(
+            &model,
+            &Context::new([Message::user("Retry")]),
+            &codex::Options::new(token("acc_backoff"))
+                .with_max_retries(3)
+                .with_transport(codex::Transport::Sse),
+        )
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await
+    });
+
+    server.wait_for_requests(1).await;
+    for (before, after, count) in [
+        (Duration::from_millis(999), Duration::from_millis(1), 2),
+        (Duration::from_millis(1999), Duration::from_millis(1), 3),
+        (Duration::from_millis(3999), Duration::from_millis(1), 4),
+    ] {
+        tokio::time::advance(before).await;
+        tokio::task::yield_now().await;
+        assert_eq!(server.request_count(), count - 1);
+        tokio::time::advance(after).await;
+        server.wait_for_requests(count).await;
+    }
+
+    assert_eq!(
+        done(&task.await.unwrap()).content,
+        [ds_ai::Content::Text("Done".into())]
+    );
+}
+
+#[tokio::test]
 async fn streams_a_codex_websocket_request() {
     let (base_url, capture) = serve_websocket([vec![
         json!({"type": "response.created", "response": {"id": "resp_ws"}}),
@@ -343,6 +538,70 @@ async fn scopes_cached_codex_websockets_to_the_account() {
         [ds_ai::Content::Text("Second".into())]
     );
     assert_eq!(capture.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn opens_a_one_shot_codex_websocket_while_the_cached_session_is_busy() {
+    codex::reset_websocket_debug_stats(Some("session_busy"));
+    let (base_url, first_received, second_received) = serve_concurrent_session_websockets().await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let context = Context::new([Message::user("Connect")]);
+    let first_model = model.clone();
+    let first_context = context.clone();
+    let first = tokio::spawn(async move {
+        codex::stream(
+            &first_model,
+            &first_context,
+            &codex::Options::new(token("acc_busy"))
+                .with_session_id("session_busy")
+                .with_transport(codex::Transport::WebSocketCached),
+        )
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await
+    });
+    first_received.await.unwrap();
+
+    let second = tokio::spawn(async move {
+        codex::stream(
+            &model,
+            &context,
+            &codex::Options::new(token("acc_busy"))
+                .with_session_id("session_busy")
+                .with_transport(codex::Transport::WebSocketCached),
+        )
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), second_received)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        done(&first.await.unwrap()).content,
+        [ds_ai::Content::Text("First".into())]
+    );
+    assert_eq!(
+        done(&second.await.unwrap()).content,
+        [ds_ai::Content::Text("Second".into())]
+    );
+    assert_eq!(
+        codex::websocket_debug_stats("session_busy"),
+        Some(codex::WebSocketDebugStats {
+            requests: 2,
+            connections_created: 2,
+            cached_context_requests: 2,
+            full_context_requests: 2,
+            last_input_items: 1,
+            ..Default::default()
+        })
+    );
+    codex::close_websocket_sessions(Some("session_busy"));
+    codex::reset_websocket_debug_stats(Some("session_busy"));
 }
 
 #[tokio::test]
@@ -755,6 +1014,72 @@ async fn reports_a_codex_websocket_fallback_on_the_assistant_message() {
     assert_eq!(details["eventsEmitted"], false);
     assert_eq!(details["phase"], "before_message_stream_start");
     assert!(details["requestBytes"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn applies_the_provider_timeout_to_codex_sse_response_headers() {
+    let server = serve([Reply::pending()]).await;
+    let mut model = builtin_model("openai-codex", "gpt-5.6-sol").unwrap();
+    model.base_url = server.base_url.clone();
+    let provider = codex::Provider::new([model.clone()]);
+
+    let message = provider
+        .stream(
+            &model,
+            &Context::new([Message::user("Connect")]),
+            &ApiStreamOptions::OpenAiCodexResponses(OpenAiCodexResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some(token("acc_sse_timeout")),
+                    timeout: Some(Duration::from_millis(10)),
+                    max_retries: Some(0),
+                    transport: Some(ProviderTransport::Sse),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .result()
+        .await
+        .unwrap();
+
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert_eq!(
+        message.error_message.as_deref(),
+        Some("provider timed out during Connection")
+    );
+}
+
+#[tokio::test]
+async fn applies_the_provider_timeout_to_codex_websocket_idle_time() {
+    let base_url = serve_started_idle_websocket().await;
+    let mut model = builtin_model("openai-codex", "gpt-5.6-sol").unwrap();
+    model.base_url = base_url;
+    let provider = codex::Provider::new([model.clone()]);
+
+    let message = provider
+        .stream(
+            &model,
+            &Context::new([Message::user("Connect")]),
+            &ApiStreamOptions::OpenAiCodexResponses(OpenAiCodexResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some(token("acc_websocket_timeout")),
+                    timeout: Some(Duration::from_millis(10)),
+                    max_retries: Some(0),
+                    transport: Some(ProviderTransport::WebSocket),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .result()
+        .await
+        .unwrap();
+
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert_eq!(
+        message.error_message.as_deref(),
+        Some("provider timed out during Idle")
+    );
 }
 
 #[tokio::test]
@@ -1241,6 +1566,48 @@ async fn serve_session_isolation_websockets() -> (String, oneshot::Receiver<bool
         }
     });
     (format!("http://{address}"), receiver)
+}
+
+async fn serve_concurrent_session_websockets()
+-> (String, oneshot::Receiver<()>, oneshot::Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (first_sender, first_receiver) = oneshot::channel();
+    let (second_sender, second_receiver) = oneshot::channel();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut first = tokio_tungstenite::accept_async(socket).await.unwrap();
+        assert!(matches!(
+            first.next().await,
+            Some(Ok(WebSocketMessage::Text(_)))
+        ));
+        first_sender.send(()).ok();
+
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut second = tokio_tungstenite::accept_async(socket).await.unwrap();
+        assert!(matches!(
+            second.next().await,
+            Some(Ok(WebSocketMessage::Text(_)))
+        ));
+        second_sender.send(()).ok();
+        for event in text_events("resp_busy_second", "msg_busy_second", "Second") {
+            second
+                .send(WebSocketMessage::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        for event in text_events("resp_busy_first", "msg_busy_first", "First") {
+            first
+                .send(WebSocketMessage::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            second.next().await,
+            Some(Ok(WebSocketMessage::Close(_)))
+        ));
+    });
+    (format!("http://{address}"), first_receiver, second_receiver)
 }
 
 async fn serve_idle_websocket_then_sse() -> (String, oneshot::Receiver<Vec<Vec<u8>>>) {

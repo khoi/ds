@@ -26,6 +26,7 @@ base64 = "0.23.1"
 bytes = "1.11.1"
 futures-core = "0.3.31"
 futures-util = "0.3.34"
+http = "1.4.0"
 httpdate = "1.0.3"
 jsonschema = { version = "0.17.1", default-features = false, features = [
   "draft202012",

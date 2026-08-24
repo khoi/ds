@@ -9,7 +9,10 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::{Arc, Mutex as StdMutex, OnceLock},
+    sync::{
+        Arc, Mutex as StdMutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -97,7 +100,7 @@ impl Provider {
                 provider_options = provider_options.with_temperature(temperature);
             }
             if let Some(timeout) = stream_options.timeout {
-                provider_options = provider_options.with_overall_timeout(timeout);
+                provider_options = provider_options.with_timeout(timeout);
             }
             if let Some(session_id) = stream_options.session_id {
                 provider_options = provider_options.with_session_id(session_id);
@@ -367,6 +370,7 @@ type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 #[derive(Clone)]
 struct CachedWebSocket {
     socket: Arc<AsyncMutex<WebSocket>>,
+    busy: Arc<AtomicBool>,
     created_at: Instant,
     session_id: Option<String>,
     metadata: ResponseMetadata,
@@ -382,11 +386,16 @@ struct Continuation {
 
 struct WebSocketLease {
     key: Option<String>,
+    busy: Option<Arc<AtomicBool>>,
 }
 
 impl WebSocketLease {
     fn complete(&mut self, idle_ttl: Duration) {
         if let Some(key) = self.key.take() {
+            self.busy
+                .take()
+                .expect("cached websocket busy state")
+                .store(false, Ordering::Release);
             schedule_websocket_expiry(key, idle_ttl);
         }
     }
@@ -437,6 +446,11 @@ struct WebSocketDebugState {
     fallback_sessions: HashSet<String>,
 }
 
+struct CachedWebSocketLookup {
+    connection: Option<CachedWebSocket>,
+    cacheable: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Model {
     id: String,
@@ -463,6 +477,7 @@ pub struct Options {
     max_retry_delay: Option<Duration>,
     cancellation: CancellationToken,
     connection_timeout: Option<Duration>,
+    timeout: Option<Duration>,
     first_event_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     overall_timeout: Option<Duration>,
@@ -535,6 +550,7 @@ impl Options {
             max_retry_delay: Some(DEFAULT_MAX_RETRY_DELAY),
             cancellation: CancellationToken::new(),
             connection_timeout: None,
+            timeout: None,
             first_event_timeout: None,
             idle_timeout: None,
             overall_timeout: None,
@@ -573,6 +589,11 @@ impl Options {
 
     pub fn with_connection_timeout(mut self, timeout: Duration) -> Self {
         self.connection_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = (!timeout.is_zero()).then_some(timeout);
         self
     }
 
@@ -792,7 +813,7 @@ pub async fn stream(
         max_retries: options.max_retries,
         max_retry_delay: options.max_retry_delay,
         cancellation: options.cancellation.clone(),
-        connection_timeout: options.connection_timeout,
+        connection_timeout: options.timeout.or(options.connection_timeout),
         first_event_timeout: options.first_event_timeout,
         idle_timeout: options.idle_timeout,
         overall_deadline,
@@ -942,6 +963,9 @@ async fn sse_stream(request: &SseRequest) -> Result<ResponseStream, Error> {
                 max_retries: request.max_retries,
                 max_delay: request.max_retry_delay,
                 cancellation: &request.cancellation,
+                deadline: request.overall_deadline,
+                profile: retry::Profile::Codex,
+                request_timeout: request.connection_timeout,
             },
             || {
                 client
@@ -957,13 +981,13 @@ async fn sse_stream(request: &SseRequest) -> Result<ResponseStream, Error> {
                 }
             },
         ),
-        request.connection_timeout,
+        None,
         request.overall_deadline,
     )
     .await?;
     if !response.status().is_success() {
         let metadata = http::metadata(response.headers());
-        return Err(http::provider_error(
+        return Err(http::codex_provider_error(
             response,
             metadata,
             &request.cancellation,
@@ -1186,12 +1210,15 @@ async fn websocket_stream(
         request_id,
         headers: request.headers.clone(),
     };
-    let cached = cache_key
-        .as_deref()
-        .and_then(|key| cached_websocket(key, options.websocket_cache_ttl));
-    let reused = cached.is_some();
-    let connection = if let Some(cached) = cached {
-        cached
+    let lookup = cache_key.as_deref().map_or(
+        CachedWebSocketLookup {
+            connection: None,
+            cacheable: true,
+        },
+        |key| acquire_cached_websocket(key, options.websocket_cache_ttl),
+    );
+    let (connection, reused, active_cache_key) = if let Some(cached) = lookup.connection {
+        (cached, true, cache_key.clone())
     } else {
         let connection = connect_websocket(
             &handshake,
@@ -1200,16 +1227,22 @@ async fn websocket_stream(
             overall_deadline,
         )
         .await?;
-        if let Some(cache_key) = &cache_key {
+        let active_cache_key = if lookup.cacheable {
+            cache_key.clone()
+        } else {
+            None
+        };
+        if let Some(cache_key) = &active_cache_key {
             websockets()
                 .lock()
                 .expect("websocket cache lock")
                 .insert(cache_key.clone(), connection.clone());
         }
-        connection
+        (connection, false, active_cache_key)
     };
     let mut lease = WebSocketLease {
-        key: cache_key.clone(),
+        busy: active_cache_key.as_ref().map(|_| connection.busy.clone()),
+        key: active_cache_key.clone(),
     };
     let CachedWebSocket {
         socket,
@@ -1265,7 +1298,7 @@ async fn websocket_stream(
         }
         (socket, continuation, last_used) = replace_websocket(
             socket,
-            cache_key.as_deref(),
+            active_cache_key.as_deref(),
             &handshake,
             &options.cancellation,
             options.websocket_connect_timeout,
@@ -1284,8 +1317,8 @@ async fn websocket_stream(
     }
     let cancellation = options.cancellation.clone();
     let websocket_connect_timeout = options.websocket_connect_timeout;
-    let first_event_timeout = options.first_event_timeout;
-    let idle_timeout = options.idle_timeout;
+    let first_event_timeout = options.timeout.or(options.first_event_timeout);
+    let idle_timeout = options.timeout.or(options.idle_timeout);
     let events = async_stream::stream! {
         let mut continuation = continuation;
         let mut retried_socket = retried_socket;
@@ -1326,7 +1359,7 @@ async fn websocket_stream(
             {
                 match replace_websocket(
                     socket,
-                    cache_key.as_deref(),
+                    active_cache_key.as_deref(),
                     &handshake,
                     &cancellation,
                     websocket_connect_timeout,
@@ -1413,7 +1446,7 @@ async fn websocket_stream(
                     *continuation.lock().expect("websocket continuation lock") = None;
                     match replace_websocket(
                         socket,
-                        cache_key.as_deref(),
+                        active_cache_key.as_deref(),
                         &handshake,
                         &cancellation,
                         websocket_connect_timeout,
@@ -1462,7 +1495,7 @@ async fn websocket_stream(
                     *continuation.lock().expect("websocket continuation lock") = None;
                     match replace_websocket(
                         socket,
-                        cache_key.as_deref(),
+                        active_cache_key.as_deref(),
                         &handshake,
                         &cancellation,
                         websocket_connect_timeout,
@@ -1523,7 +1556,7 @@ async fn websocket_stream(
                     });
                     *last_used.lock().expect("websocket last-used lock") = Instant::now();
                 }
-                if terminal && cache_key.is_none() {
+                if terminal && active_cache_key.is_none() {
                     let _ = socket.close(None).await;
                 }
                 yield Ok(data);
@@ -1638,6 +1671,7 @@ async fn connect_websocket(
     };
     Ok(CachedWebSocket {
         socket: Arc::new(AsyncMutex::new(socket)),
+        busy: Arc::new(AtomicBool::new(true)),
         created_at: Instant::now(),
         session_id: handshake.session_id.clone(),
         metadata: http::metadata(response.headers()),
@@ -1915,23 +1949,45 @@ fn schedule_websocket_expiry(key: String, idle_ttl: Duration) {
     });
 }
 
-fn cached_websocket(key: &str, idle_ttl: Duration) -> Option<CachedWebSocket> {
+fn acquire_cached_websocket(key: &str, idle_ttl: Duration) -> CachedWebSocketLookup {
     let mut cache = websockets().lock().expect("websocket cache lock");
     let expired = cache
         .get(key)
         .is_some_and(|connection| websocket_expired(connection, idle_ttl));
     if expired {
-        cache.remove(key);
+        let connection = cache.remove(key).expect("expired websocket exists");
+        drop(cache);
+        close_websocket(connection);
+        return CachedWebSocketLookup {
+            connection: None,
+            cacheable: true,
+        };
     }
-    cache.get(key).cloned()
+    let Some(connection) = cache.get(key) else {
+        return CachedWebSocketLookup {
+            connection: None,
+            cacheable: true,
+        };
+    };
+    if connection.busy.swap(true, Ordering::AcqRel) {
+        CachedWebSocketLookup {
+            connection: None,
+            cacheable: false,
+        }
+    } else {
+        CachedWebSocketLookup {
+            connection: Some(connection.clone()),
+            cacheable: false,
+        }
+    }
 }
 
 fn websocket_expired(connection: &CachedWebSocket, idle_ttl: Duration) -> bool {
+    if connection.busy.load(Ordering::Acquire) {
+        return false;
+    }
     if connection.created_at.elapsed() >= WEBSOCKET_MAX_AGE {
         return true;
-    }
-    if connection.socket.try_lock().is_err() {
-        return false;
     }
     connection
         .last_used
