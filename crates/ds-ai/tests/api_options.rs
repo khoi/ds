@@ -1,10 +1,11 @@
 use crate::support::{Reply, serve};
 use base64::prelude::*;
 use ds_ai::{
-    AnthropicFallbackModel, AnthropicMessagesCompatibility, AnthropicOptions, ApiStreamOptions,
-    AssistantContent, CacheRetention, Context, InputContent, Message, ModelCompatibility,
-    ModelCost, ModelCostRates, OpenAiCodexResponsesOptions, OpenAiResponsesOptions, Provider,
-    ProviderId, StopReason, StreamOptions, Tool, ToolResultMessage, Transport, builtin_model,
+    AnthropicFallbackModel, AnthropicMessagesCompatibility, AnthropicOptions, Api,
+    ApiStreamOptions, AssistantContent, AssistantMessage, AssistantToolCall, CacheRetention,
+    Context, InputContent, Message, ModelCompatibility, ModelCost, ModelCostRates,
+    OpenAiCodexResponsesOptions, OpenAiResponsesOptions, Provider, ProviderId, StopReason,
+    StreamOptions, Tool, ToolResultMessage, Transport, Usage, builtin_model,
 };
 use serde_json::{Value, json};
 
@@ -436,6 +437,133 @@ async fn uses_anthropic_fallback_models_and_pricing() {
         request_json(&request)["fallbacks"],
         json!([{"model": "claude-fallback"}])
     );
+}
+
+#[tokio::test]
+async fn shapes_anthropic_oauth_requests_and_tool_names() {
+    let sse = [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-4-5\",\"usage\":{}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_2\",\"name\":\"Read\",\"input\":{}}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let mut model = builtin_model("anthropic", "claude-opus-4-5").unwrap();
+    model.base_url = server.base_url.clone();
+    let provider = ds_ai::anthropic::Provider::new([model.clone()]);
+    let assistant = AssistantMessage {
+        content: vec![AssistantContent::ToolCall(AssistantToolCall {
+            id: "call_1".into(),
+            name: "bash".into(),
+            arguments: json!({"command": "pwd"}),
+            thought_signature: None,
+            namespace: None,
+        })],
+        api: Api::AnthropicMessages,
+        provider: ProviderId::new("anthropic"),
+        model: model.id.clone(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        raw_stop_reason: Some("tool_use".into()),
+        end_turn: None,
+        timestamp: 1,
+    };
+    let mut tool_result = ToolResultMessage::new("call_1", "bash", [InputContent::text("done")]);
+    tool_result.added_tool_names = Some(vec!["websearch".into()]);
+    let context = Context::new([
+        Message::assistant(assistant),
+        Message::tool_result(tool_result),
+    ])
+    .with_system("System")
+    .with_tools([
+        Tool::new("read", "Read", json!({"type": "object"})),
+        Tool::new("bash", "Run", json!({"type": "object"})),
+        Tool::new("websearch", "Search", json!({"type": "object"})),
+    ]);
+    let result = provider
+        .stream(
+            &model,
+            &context,
+            &ApiStreamOptions::AnthropicMessages(AnthropicOptions {
+                stream: StreamOptions {
+                    api_key: Some("sk-ant-oat-test".into()),
+                    ..Default::default()
+                },
+                tool_choice: Some(ds_ai::anthropic::ToolChoice::Tool("read".into())),
+                ..Default::default()
+            }),
+        )
+        .result()
+        .await
+        .unwrap();
+
+    let AssistantContent::ToolCall(call) = &result.content[0] else {
+        panic!("missing tool call");
+    };
+    assert_eq!(call.name, "read");
+
+    let request = server.requests().await.pop().unwrap();
+    assert!(request.contains("authorization: Bearer sk-ant-oat-test\r\n"));
+    assert!(!request.contains("x-api-key:"));
+    assert!(request.contains("user-agent: claude-cli/2.1.75\r\n"));
+    assert!(request.contains("x-app: cli\r\n"));
+    assert!(request.contains("anthropic-beta: claude-code-20250219,oauth-2025-04-20\r\n"));
+    let payload = request_json(&request);
+    assert_eq!(
+        payload["system"][0]["text"],
+        "You are Claude Code, Anthropic's official CLI for Claude."
+    );
+    assert_eq!(payload["system"][1]["text"], "System");
+    assert_eq!(payload["tools"][0]["name"], "Read");
+    assert_eq!(payload["tools"][1]["name"], "Bash");
+    assert_eq!(payload["tools"][2]["name"], "WebSearch");
+    assert_eq!(payload["tools"][2]["defer_loading"], true);
+    assert_eq!(
+        payload["tool_choice"],
+        json!({"type": "tool", "name": "Read"})
+    );
+    assert_eq!(payload["messages"][0]["content"][0]["name"], "Bash");
+    assert_eq!(
+        payload["messages"][1]["content"][0]["content"][0],
+        json!({"type": "tool_reference", "tool_name": "WebSearch"})
+    );
+}
+
+#[tokio::test]
+async fn accepts_anthropic_header_owned_auth_without_oauth_shaping() {
+    let server = serve([Reply::sse(anthropic_done())]).await;
+    let mut model = builtin_model("anthropic", "claude-opus-4-5").unwrap();
+    model.base_url = server.base_url.clone();
+    let provider = ds_ai::anthropic::Provider::new([model.clone()]);
+    provider
+        .stream(
+            &model,
+            &Context::new([Message::user("Hello")]).with_system("System"),
+            &ApiStreamOptions::AnthropicMessages(AnthropicOptions {
+                stream: StreamOptions {
+                    headers: [("Authorization".into(), Some("Bearer gateway-token".into()))].into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .result()
+        .await
+        .unwrap();
+
+    let request = server.requests().await.pop().unwrap();
+    assert!(request.contains("authorization: Bearer gateway-token\r\n"));
+    assert!(!request.contains("x-api-key:"));
+    assert!(!request.contains("oauth-2025-04-20"));
+    let payload = request_json(&request);
+    assert_eq!(payload["system"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["system"][0]["text"], "System");
 }
 
 #[tokio::test]

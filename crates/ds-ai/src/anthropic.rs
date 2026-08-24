@@ -17,6 +17,25 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+const OAUTH_TOOL_NAMES: [&str; 17] = [
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "KillShell",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+];
 
 pub struct Provider {
     id: crate::ProviderId,
@@ -49,15 +68,20 @@ impl Provider {
             let tool_choice = options.tool_choice;
             let stream_options = options.stream;
             let request_hooks = stream_options.request_hooks(&requested_model);
-            let api_key = stream_options
-                .api_key
-                .ok_or_else(|| Error::InvalidRequest("Anthropic API key is required".into()))?;
+            let api_key = stream_options.api_key;
+            if api_key.as_deref().is_none_or(str::is_empty)
+                && !has_auth_header(&stream_options.headers)
+            {
+                return Err(Error::InvalidRequest(
+                    "Anthropic request authentication is required".into(),
+                ));
+            }
             let provider_model = Model::from_public(&requested_model);
             let max_tokens = stream_options
                 .max_tokens
                 .unwrap_or(requested_model.max_tokens)
                 .min(requested_model.max_tokens);
-            let mut provider_options = Options::new(api_key)
+            let mut provider_options = Options::with_auth(api_key)
                 .with_max_tokens(max_tokens)
                 .with_cancellation(stream_options.cancellation)
                 .with_max_retries(stream_options.max_retries.unwrap_or_default())
@@ -237,6 +261,30 @@ fn default_supports_tool_references(model: &crate::Model) -> bool {
     major > 4 || major == 4 && minor >= 5
 }
 
+fn has_auth_header(headers: &BTreeMap<String, Option<String>>) -> bool {
+    ["authorization", "x-api-key", "cf-aig-authorization"]
+        .into_iter()
+        .any(|expected| {
+            headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case(expected)
+                    && value
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty())
+            })
+        })
+}
+
+fn is_oauth_token(api_key: Option<&str>) -> bool {
+    api_key.is_some_and(|api_key| api_key.contains("sk-ant-oat"))
+}
+
+fn oauth_tool_name(name: &str) -> String {
+    OAUTH_TOOL_NAMES
+        .iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(name))
+        .map_or_else(|| name.to_owned(), |name| (*name).to_owned())
+}
+
 struct AnthropicApiKeyAuth;
 
 #[async_trait]
@@ -394,7 +442,7 @@ impl Model {
 }
 
 pub struct Options {
-    api_key: String,
+    api_key: Option<String>,
     max_tokens: u64,
     max_retries: usize,
     max_retry_delay: Option<Duration>,
@@ -455,8 +503,12 @@ pub enum ToolChoice {
 
 impl Options {
     pub fn new(api_key: impl Into<String>) -> Self {
+        Self::with_auth(Some(api_key.into()))
+    }
+
+    fn with_auth(api_key: Option<String>) -> Self {
         Self {
-            api_key: api_key.into(),
+            api_key,
             max_tokens: 4096,
             max_retries: 0,
             max_retry_delay: Some(DEFAULT_MAX_RETRY_DELAY),
@@ -754,26 +806,26 @@ pub async fn stream(
     let overall_deadline = options
         .overall_timeout
         .map(|timeout| Instant::now() + timeout);
+    let oauth = is_oauth_token(options.api_key.as_deref());
     let cache_control = cache_control(options.cache_retention, model.long_cache_retention);
     let (thinking, output_config) = thinking(&options.thinking);
-    let mut placement = crate::deferred_tools::split(context, model.tool_references, str::to_owned);
+    let mut placement = crate::deferred_tools::split(context, model.tool_references, |name| {
+        if oauth {
+            oauth_tool_name(name)
+        } else {
+            name.to_owned()
+        }
+    });
     if placement.immediate.is_empty() && !placement.deferred.is_empty() {
         placement.immediate = placement.deferred.drain(..).map(|(_, tool)| tool).collect();
     }
-    let tools =
-        request_tools(model, &placement, cache_control.as_ref()).map_err(Error::InvalidRequest)?;
+    let tools = request_tools(model, &placement, cache_control.as_ref(), oauth)
+        .map_err(Error::InvalidRequest)?;
     let legacy_tool_streaming = !model.eager_tool_input_streaming && !tools.is_empty();
     let request = Request {
         model: &model.id,
-        system: context
-            .system()
-            .map(|system| {
-                let mut block = serde_json::json!({"type": "text", "text": system});
-                add_cache_control(&mut block, cache_control.as_ref());
-                vec![block]
-            })
-            .unwrap_or_default(),
-        messages: messages(model, context, cache_control.as_ref(), &placement),
+        system: system(context, cache_control.as_ref(), oauth),
+        messages: messages(model, context, cache_control.as_ref(), &placement, oauth),
         tools,
         max_tokens: options.max_tokens,
         stream: true,
@@ -793,7 +845,10 @@ pub async fn stream(
             .metadata_user_id
             .as_ref()
             .map(|user_id| serde_json::json!({"user_id": user_id})),
-        tool_choice: options.tool_choice.as_ref().map(tool_choice),
+        tool_choice: options
+            .tool_choice
+            .as_ref()
+            .map(|choice| tool_choice(choice, oauth)),
         fallbacks: model
             .fallback_models
             .iter()
@@ -810,7 +865,11 @@ pub async fn stream(
         serde_json::to_vec(&request).map_err(|error| Error::InvalidRequest(error.to_string()))?;
     let client = reqwest::Client::new();
     let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
-    let mut beta_features = Vec::new();
+    let mut beta_features = if oauth {
+        vec!["claude-code-20250219", "oauth-2025-04-20"]
+    } else {
+        Vec::new()
+    };
     if legacy_tool_streaming {
         beta_features.push("fine-grained-tool-streaming-2025-05-14");
     }
@@ -822,10 +881,24 @@ pub async fn stream(
     }
     let beta_features = beta_features.join(",");
     let mut default_headers = BTreeMap::from([
-        ("x-api-key".into(), options.api_key.clone()),
         ("anthropic-version".into(), "2023-06-01".into()),
         ("content-type".into(), "application/json".into()),
+        ("accept".into(), "application/json".into()),
+        (
+            "anthropic-dangerous-direct-browser-access".into(),
+            "true".into(),
+        ),
     ]);
+    if oauth {
+        default_headers.insert(
+            "authorization".into(),
+            format!("Bearer {}", options.api_key.as_deref().unwrap_or_default()),
+        );
+        default_headers.insert("user-agent".into(), "claude-cli/2.1.75".into());
+        default_headers.insert("x-app".into(), "cli".into());
+    } else if let Some(api_key) = &options.api_key {
+        default_headers.insert("x-api-key".into(), api_key.clone());
+    }
     if !beta_features.is_empty() {
         default_headers.insert("anthropic-beta".into(), beta_features);
     }
@@ -875,6 +948,11 @@ pub async fn stream(
 
     let metadata = metadata(response.headers());
     let response_model = model.id.clone();
+    let response_tool_names = context
+        .tools()
+        .iter()
+        .map(|tool| (tool.name.to_ascii_lowercase(), tool.name.clone()))
+        .collect::<HashMap<_, _>>();
     let stream_cancellation = options.cancellation.clone();
     let first_event_timeout = options.first_event_timeout;
     let idle_timeout = options.idle_timeout;
@@ -992,9 +1070,15 @@ pub async fn stream(
                     StreamEvent::ContentBlockStart { index, content_block }
                         if content_block.r#type == "tool_use" =>
                     {
-                        let (Some(id), Some(name)) = (content_block.id, content_block.name) else {
+                        let (Some(id), Some(mut name)) = (content_block.id, content_block.name) else {
                             continue;
                         };
+                        if oauth {
+                            name = response_tool_names
+                                .get(&name.to_ascii_lowercase())
+                                .cloned()
+                                .unwrap_or(name);
+                        }
                         let content_index = result.content.len();
                         let arguments = content_block.input.unwrap_or_else(|| serde_json::json!({}));
                         let initial = (!arguments
@@ -1158,11 +1242,33 @@ fn metadata(headers: &reqwest::header::HeaderMap) -> ResponseMetadata {
     metadata
 }
 
+fn system(
+    context: &Context,
+    cache_control: Option<&CacheControl>,
+    oauth: bool,
+) -> Vec<serde_json::Value> {
+    let mut system = Vec::new();
+    if oauth {
+        system.push(serde_json::json!({
+            "type": "text",
+            "text": "You are Claude Code, Anthropic's official CLI for Claude."
+        }));
+    }
+    if let Some(text) = context.system() {
+        system.push(serde_json::json!({"type": "text", "text": text}));
+    }
+    for block in &mut system {
+        add_cache_control(block, cache_control);
+    }
+    system
+}
+
 fn messages(
     model: &Model,
     context: &Context,
     cache_control: Option<&CacheControl>,
     placement: &crate::deferred_tools::ToolPlacement,
+    oauth: bool,
 ) -> Vec<RequestMessage> {
     let mut messages = Vec::new();
     let mut pending_tool_calls = Vec::new();
@@ -1188,7 +1294,7 @@ fn messages(
                 ) {
                     continue;
                 }
-                let content = assistant_content(model, response);
+                let content = assistant_content(model, response, oauth);
                 pending_tool_calls.extend(response.content.iter().filter_map(|content| {
                     if let AssistantContent::ToolCall(call) = content {
                         Some(normalize_id(&call.id))
@@ -1204,7 +1310,7 @@ fn messages(
                 push_message(
                     &mut messages,
                     "user",
-                    tool_result(result, &id, placement, &mut loaded_tools),
+                    tool_result(result, &id, placement, &mut loaded_tools, oauth),
                 );
             }
         }
@@ -1264,6 +1370,7 @@ fn request_tools(
     model: &Model,
     placement: &crate::deferred_tools::ToolPlacement,
     cache_control: Option<&CacheControl>,
+    oauth: bool,
 ) -> Result<Vec<RequestTool>, String> {
     let immediate_count = placement.immediate.len();
     placement
@@ -1280,7 +1387,11 @@ fn request_tools(
                 |sampling| sampling.parameters,
             );
             Ok(RequestTool {
-                name: tool.name.clone(),
+                name: if oauth {
+                    oauth_tool_name(&tool.name)
+                } else {
+                    tool.name.clone()
+                },
                 description: tool.description.clone(),
                 eager_input_streaming: model.eager_tool_input_streaming.then_some(true),
                 strict: strict.then_some(true),
@@ -1299,7 +1410,11 @@ fn request_tools(
         .collect()
 }
 
-fn assistant_content(model: &Model, message: &crate::AssistantMessage) -> Vec<serde_json::Value> {
+fn assistant_content(
+    model: &Model,
+    message: &crate::AssistantMessage,
+    oauth: bool,
+) -> Vec<serde_json::Value> {
     let same_model = message.model == model.id;
     message
         .content
@@ -1312,7 +1427,7 @@ fn assistant_content(model: &Model, message: &crate::AssistantMessage) -> Vec<se
             AssistantContent::ToolCall(call) => Some(serde_json::json!({
                 "type": "tool_use",
                 "id": normalize_id(&call.id),
-                "name": call.name,
+                "name": if oauth { oauth_tool_name(&call.name) } else { call.name.clone() },
                 "input": call.arguments
             })),
             AssistantContent::Thinking(thinking) if thinking.redacted == Some(true) => thinking
@@ -1415,12 +1530,15 @@ fn thinking(thinking: &Option<Thinking>) -> (Option<serde_json::Value>, Option<s
     }
 }
 
-fn tool_choice(choice: &ToolChoice) -> serde_json::Value {
+fn tool_choice(choice: &ToolChoice, oauth: bool) -> serde_json::Value {
     match choice {
         ToolChoice::Auto => serde_json::json!({"type": "auto"}),
         ToolChoice::Any => serde_json::json!({"type": "any"}),
         ToolChoice::None => serde_json::json!({"type": "none"}),
-        ToolChoice::Tool(name) => serde_json::json!({"type": "tool", "name": name}),
+        ToolChoice::Tool(name) => serde_json::json!({
+            "type": "tool",
+            "name": if oauth { oauth_tool_name(name) } else { name.clone() }
+        }),
     }
 }
 
@@ -1429,16 +1547,25 @@ fn tool_result(
     id: &str,
     placement: &crate::deferred_tools::ToolPlacement,
     loaded_tools: &mut BTreeSet<String>,
+    oauth: bool,
 ) -> Vec<serde_json::Value> {
     let references = result
         .added_tool_names
         .iter()
         .flatten()
         .filter_map(|name| {
-            let tool = placement.deferred_tool(name)?;
-            loaded_tools
-                .insert(name.clone())
-                .then(|| serde_json::json!({"type": "tool_reference", "tool_name": tool.name}))
+            let name = if oauth {
+                oauth_tool_name(name)
+            } else {
+                name.clone()
+            };
+            let tool = placement.deferred_tool(&name)?;
+            loaded_tools.insert(name.clone()).then(|| {
+                serde_json::json!({
+                    "type": "tool_reference",
+                    "tool_name": if oauth { oauth_tool_name(&tool.name) } else { tool.name.clone() }
+                })
+            })
         })
         .collect::<Vec<_>>();
     let content = result.content.iter().map(input_content).collect::<Vec<_>>();
