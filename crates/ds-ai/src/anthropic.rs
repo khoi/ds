@@ -1,8 +1,8 @@
 use crate::{
     AssistantContent, AssistantToolCall, CacheRetention, Content, Context, Error, InputContent,
-    Message, RateLimits, Response, ResponseMetadata, ResponseStream, StopReason, TextContent,
-    ThinkingContent, ToolResultMessage, Usage, UserContent, constrained_sampling, http, json,
-    retry, schema, transport,
+    Message, RateLimits, Response, ResponseMetadata, StopReason, TextContent, ThinkingContent,
+    ToolResultMessage, Usage, UserContent, constrained_sampling, http, json, retry, schema,
+    transport,
     types::{AnthropicReasoning, normalize_id},
 };
 use async_stream::stream;
@@ -420,7 +420,7 @@ impl crate::ApiKeyAuth for AnthropicApiKeyAuth {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Model {
+struct Model {
     id: String,
     base_url: String,
     eager_tool_input_streaming: bool,
@@ -436,7 +436,7 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(id: impl Into<String>) -> Self {
+    fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             base_url: DEFAULT_BASE_URL.into(),
@@ -478,39 +478,20 @@ impl Model {
         result
     }
 
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+    fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
-        self
-    }
-
-    pub fn with_eager_tool_input_streaming(mut self, enabled: bool) -> Self {
-        self.eager_tool_input_streaming = enabled;
-        self
-    }
-
-    pub fn with_strict_tools(mut self) -> Self {
-        self.strict_tools = true;
-        self
-    }
-
-    pub fn with_empty_thinking_signatures(mut self) -> Self {
-        self.empty_thinking_signatures = true;
         self
     }
 }
 
-pub struct Options {
+struct Options {
     api_key: Option<String>,
     max_tokens: u64,
     max_retries: usize,
     max_retry_delay: Option<Duration>,
     cancellation: CancellationToken,
-    connection_timeout: Option<Duration>,
-    first_event_timeout: Option<Duration>,
-    idle_timeout: Option<Duration>,
     overall_timeout: Option<Duration>,
     temperature: Option<f64>,
-    stop_sequences: Vec<String>,
     thinking: Option<Thinking>,
     metadata_user_id: Option<String>,
     tool_choice: Option<ToolChoice>,
@@ -522,7 +503,7 @@ pub struct Options {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Thinking {
+enum Thinking {
     Disabled,
     Enabled {
         budget_tokens: u64,
@@ -560,10 +541,6 @@ pub enum ToolChoice {
 }
 
 impl Options {
-    pub fn new(api_key: impl Into<String>) -> Self {
-        Self::with_auth(Some(api_key.into()))
-    }
-
     fn with_auth(api_key: Option<String>) -> Self {
         Self {
             api_key,
@@ -571,12 +548,8 @@ impl Options {
             max_retries: 0,
             max_retry_delay: Some(DEFAULT_MAX_RETRY_DELAY),
             cancellation: CancellationToken::new(),
-            connection_timeout: None,
-            first_event_timeout: None,
-            idle_timeout: None,
             overall_timeout: None,
             temperature: None,
-            stop_sequences: Vec::new(),
             thinking: None,
             metadata_user_id: None,
             tool_choice: None,
@@ -588,85 +561,62 @@ impl Options {
         }
     }
 
-    pub fn with_max_tokens(mut self, max_tokens: u64) -> Self {
+    fn with_max_tokens(mut self, max_tokens: u64) -> Self {
         self.max_tokens = max_tokens;
         self
     }
 
-    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+    fn with_max_retries(mut self, max_retries: usize) -> Self {
         self.max_retries = max_retries;
         self
     }
 
-    pub fn with_max_retry_delay(mut self, max_retry_delay: Option<Duration>) -> Self {
+    fn with_max_retry_delay(mut self, max_retry_delay: Option<Duration>) -> Self {
         self.max_retry_delay = max_retry_delay;
         self
     }
 
-    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+    fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = cancellation;
         self
     }
 
-    pub fn with_connection_timeout(mut self, timeout: Duration) -> Self {
-        self.connection_timeout = Some(timeout);
-        self
-    }
-
-    pub fn with_first_event_timeout(mut self, timeout: Duration) -> Self {
-        self.first_event_timeout = Some(timeout);
-        self
-    }
-
-    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
-        self.idle_timeout = Some(timeout);
-        self
-    }
-
-    pub fn with_overall_timeout(mut self, timeout: Duration) -> Self {
+    fn with_overall_timeout(mut self, timeout: Duration) -> Self {
         self.overall_timeout = Some(timeout);
         self
     }
 
-    pub fn with_temperature(mut self, temperature: f64) -> Self {
+    fn with_temperature(mut self, temperature: f64) -> Self {
         self.temperature = Some(temperature);
         self
     }
 
-    pub fn with_stop_sequences(
-        mut self,
-        stop_sequences: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.stop_sequences = stop_sequences.into_iter().map(Into::into).collect();
-        self
-    }
-
-    pub fn with_thinking(mut self, thinking: Thinking) -> Self {
+    fn with_thinking(mut self, thinking: Thinking) -> Self {
         self.thinking = Some(thinking);
         self
     }
 
-    pub fn with_metadata_user_id(mut self, user_id: impl Into<String>) -> Self {
+    fn with_metadata_user_id(mut self, user_id: impl Into<String>) -> Self {
         self.metadata_user_id = Some(user_id.into());
         self
     }
 
-    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+    fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = Some(tool_choice);
         self
     }
 
-    pub fn with_cache_retention(mut self, retention: CacheRetention) -> Self {
+    fn with_cache_retention(mut self, retention: CacheRetention) -> Self {
         self.cache_retention = retention;
         self
     }
 
-    pub fn with_interleaved_thinking(mut self, enabled: bool) -> Self {
+    fn with_interleaved_thinking(mut self, enabled: bool) -> Self {
         self.interleaved_thinking = enabled;
         self
     }
 
-    pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
+    fn with_session_id(mut self, session_id: Option<String>) -> Self {
         self.session_id = session_id;
         self
     }
@@ -692,8 +642,6 @@ struct Request<'a> {
     tools: Vec<RequestTool>,
     max_tokens: u64,
     stream: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    stop_sequences: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -859,17 +807,6 @@ enum Slot {
     },
 }
 
-#[doc(hidden)]
-pub async fn raw_stream(
-    model: &Model,
-    context: &Context,
-    options: &Options,
-) -> Result<ResponseStream, Error> {
-    response_events(model, context, options)
-        .await
-        .map(crate::legacy::response_stream)
-}
-
 async fn response_events(
     model: &Model,
     context: &Context,
@@ -901,7 +838,6 @@ async fn response_events(
         tools,
         max_tokens: options.max_tokens,
         stream: true,
-        stop_sequences: options.stop_sequences.clone(),
         temperature: if model.temperature
             && !matches!(
                 options.thinking.as_ref(),
@@ -1013,7 +949,7 @@ async fn response_events(
                 }
             },
         ),
-        options.connection_timeout,
+        None,
         overall_deadline,
     )
     .await?;
@@ -1036,14 +972,12 @@ async fn response_events(
         .map(|tool| (tool.name.to_ascii_lowercase(), tool.name.clone()))
         .collect::<HashMap<_, _>>();
     let stream_cancellation = options.cancellation.clone();
-    let first_event_timeout = options.first_event_timeout;
-    let idle_timeout = options.idle_timeout;
     let output = stream! {
         let mut events = transport::EventStream::new(
             response,
             stream_cancellation,
-            first_event_timeout,
-            idle_timeout,
+            None,
+            None,
             overall_deadline,
         );
         let mut result = Response::anthropic(response_model.clone());

@@ -1,10 +1,13 @@
 use crate::support::{Reply, serve};
 use ds_ai::{
-    CacheRetention, Context, Event, InputContent, Message, StopReason, Tool, ToolCall,
-    ToolResultMessage, anthropic,
+    AnthropicMessagesCompatibility, AnthropicOptions, AssistantContent, AssistantMessage,
+    AssistantMessageEvent, AssistantToolCall, CacheRetention, Context, InputContent, Message,
+    ModelCompatibility, ResponseHook, StopReason, StreamOptions, TextContent, ThinkingContent,
+    Tool, ToolResultMessage, anthropic, builtin_model,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
 
 #[tokio::test]
 async fn streams_anthropic_text_until_message_stop() {
@@ -26,26 +29,23 @@ async fn streams_anthropic_text_until_message_stop() {
         .with_header("anthropic-ratelimit-tokens-remaining", "9000")
         .with_header("anthropic-ratelimit-tokens-reset", "2026-08-24T12:01:00Z")])
     .await;
-    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let model = model("claude-sonnet-4-5", &server.base_url);
     let context = Context::new([Message::user("Hello")]).with_system("Be brief");
-    let options = anthropic::Options::new("test-key").with_max_tokens(1024);
+    let options = options(|stream| stream.max_tokens = Some(1024));
 
-    let events = anthropic::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let events = events(&model, &context, &options).await;
 
-    assert_eq!(
-        events.first(),
-        Some(&Ok(Event::TextDelta {
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AssistantMessageEvent::TextDelta {
             content_index: 0,
-            delta: "Hello".into(),
-        }))
-    );
+            delta,
+            ..
+        } if delta == "Hello"
+    )));
     let response = done(&events);
-    assert_eq!(response.id.as_deref(), Some("msg_1"));
-    assert_eq!(response.content, [ds_ai::Content::Text("Hello".into())]);
+    assert_eq!(response.response_id.as_deref(), Some("msg_1"));
+    assert_eq!(response.content, [text("Hello")]);
     assert_eq!(response.stop_reason, StopReason::Stop);
     assert_eq!(response.raw_stop_reason.as_deref(), Some("end_turn"));
     assert_eq!(response.usage.input, 12);
@@ -53,23 +53,6 @@ async fn streams_anthropic_text_until_message_stop() {
     assert_eq!(response.usage.cache_read, 2);
     assert_eq!(response.usage.cache_write, 3);
     assert_eq!(response.usage.cache_write_1h, Some(0));
-    assert_eq!(
-        response.metadata.request_id.as_deref(),
-        Some("req_anthropic")
-    );
-    assert_eq!(response.metadata.rate_limits.limit_requests, Some(100));
-    assert_eq!(response.metadata.rate_limits.remaining_requests, Some(90));
-    assert_eq!(
-        response.metadata.rate_limits.reset_requests.as_deref(),
-        Some("2026-08-24T12:00:00Z")
-    );
-    assert_eq!(response.metadata.rate_limits.limit_tokens, Some(10000));
-    assert_eq!(response.metadata.rate_limits.remaining_tokens, Some(9000));
-    assert_eq!(
-        response.metadata.rate_limits.reset_tokens.as_deref(),
-        Some("2026-08-24T12:01:00Z")
-    );
-
     let request = server.requests().await.pop().unwrap();
     assert!(request.starts_with("POST /v1/messages HTTP/1.1\r\n"));
     assert!(request.contains("x-api-key: test-key\r\n"));
@@ -110,28 +93,46 @@ async fn preserves_anthropic_http_error_rate_limits() {
     .with_header("anthropic-ratelimit-tokens-limit", "10000")
     .with_header("anthropic-ratelimit-tokens-remaining", "200")])
     .await;
-    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
-
-    match anthropic::raw_stream(
-        &model,
-        &Context::new([Message::user("Hello")]),
-        &anthropic::Options::new("test-key"),
-    )
-    .await
-    {
-        Err(ds_ai::Error::Provider {
-            request_id,
-            rate_limits,
-            ..
-        }) => {
-            assert_eq!(request_id.as_deref(), Some("req_anthropic_failure"));
-            assert_eq!(rate_limits.limit_requests, Some(100));
-            assert_eq!(rate_limits.remaining_requests, Some(0));
-            assert_eq!(rate_limits.limit_tokens, Some(10000));
-            assert_eq!(rate_limits.remaining_tokens, Some(200));
+    let model = model("claude-sonnet-4-5", &server.base_url);
+    let responses = Arc::new(Mutex::new(Vec::new()));
+    let captured = responses.clone();
+    let mut options = options(|_| {});
+    options.stream.on_response = Some(ResponseHook::new(move |response, _| {
+        let captured = captured.clone();
+        async move {
+            captured.lock().unwrap().push(response);
+            Ok(())
         }
-        _ => panic!("unexpected provider result"),
-    }
+    }));
+    let context = Context::new([Message::user("Hello")]);
+
+    let events = events(&model, &context, &options).await;
+    let error = failed(&events);
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("provider returned HTTP 429: Too many requests")
+    );
+    let response = responses.lock().unwrap()[0].clone();
+    assert_eq!(response.status, 429);
+    assert_eq!(
+        response.headers.get("request-id").map(String::as_str),
+        Some("req_anthropic_failure")
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("anthropic-ratelimit-requests-remaining")
+            .map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("anthropic-ratelimit-tokens-remaining")
+            .map(String::as_str),
+        Some("200")
+    );
     server.requests().await;
 }
 
@@ -154,61 +155,64 @@ async fn streams_and_replays_anthropic_thinking_and_tool_calls() {
     ]
     .concat();
     let first_server = serve([Reply::sse(first_sse)]).await;
-    let first_model =
-        anthropic::Model::new("claude-sonnet-4-5").with_base_url(&first_server.base_url);
+    let first_model = model("claude-sonnet-4-5", &first_server.base_url);
     let first_context = Context::new([Message::user("Edit")]);
-    let options = anthropic::Options::new("test-key");
+    let options = options(|_| {});
 
-    let first_events = anthropic::raw_stream(&first_model, &first_context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let first_events = events(&first_model, &first_context, &options).await;
 
-    assert_eq!(
-        first_events.first(),
-        Some(&Ok(Event::ReasoningDelta {
+    assert!(first_events.iter().any(|event| matches!(
+        event,
+        AssistantMessageEvent::ThinkingStart {
             content_index: 0,
-            delta: "I".into(),
-        }))
-    );
-    assert_eq!(
-        first_events.get(1),
-        Some(&Ok(Event::ReasoningDelta {
+            partial,
+        } if matches!(
+            partial.content.first(),
+            Some(AssistantContent::Thinking(ThinkingContent { thinking, .. })) if thinking == "I"
+        )
+    )));
+    assert!(first_events.iter().any(|event| matches!(
+        event,
+        AssistantMessageEvent::ThinkingDelta {
             content_index: 0,
-            delta: " think".into(),
-        }))
-    );
-    assert_eq!(
-        first_events.get(2),
-        Some(&Ok(Event::ReasoningDelta {
-            content_index: 1,
-            delta: "[Reasoning redacted]".into(),
-        }))
-    );
-    assert_eq!(
-        first_events.get(3),
-        Some(&Ok(Event::ToolCallDelta {
+            delta,
+            ..
+        } if delta == " think"
+    )));
+    assert!(first_events.iter().any(|event| matches!(
+        event,
+        AssistantMessageEvent::ToolCallDelta {
             content_index: 2,
-            delta: "{\"path\":\"README.md\"".into(),
-        }))
-    );
+            delta,
+            ..
+        } if delta == "{\"path\":\"README.md\""
+    )));
     let response = done(&first_events);
     assert_eq!(response.stop_reason, StopReason::ToolUse);
     assert_eq!(response.usage.reasoning, Some(3));
     assert_eq!(
         response.content,
         [
-            ds_ai::Content::Reasoning("I think".into()),
-            ds_ai::Content::Reasoning("[Reasoning redacted]".into()),
-            ds_ai::Content::ToolCall(ToolCall {
+            AssistantContent::Thinking(ThinkingContent {
+                thinking: "I think".into(),
+                thinking_signature: Some("sig_1".into()),
+                redacted: None,
+            }),
+            AssistantContent::Thinking(ThinkingContent {
+                thinking: "[Reasoning redacted]".into(),
+                thinking_signature: Some("encrypted".into()),
+                redacted: Some(true),
+            }),
+            AssistantContent::ToolCall(AssistantToolCall {
                 id: "toolu_1".into(),
                 name: "edit".into(),
                 arguments: json!({"path": "README.md"}),
+                thought_signature: None,
+                namespace: None,
             }),
         ]
     );
-    let restored: ds_ai::Response =
+    let restored: AssistantMessage =
         serde_json::from_value(serde_json::to_value(response).unwrap()).unwrap();
     first_server.requests().await;
 
@@ -218,8 +222,7 @@ async fn streams_and_replays_anthropic_thinking_and_tool_calls() {
     ]
     .concat();
     let second_server = serve([Reply::sse(second_sse)]).await;
-    let second_model =
-        anthropic::Model::new("claude-sonnet-4-5").with_base_url(&second_server.base_url);
+    let second_model = model("claude-sonnet-4-5", &second_server.base_url);
     let second_context = Context::new([
         Message::assistant(restored),
         Message::tool_result(ToolResultMessage::new(
@@ -229,11 +232,8 @@ async fn streams_and_replays_anthropic_thinking_and_tool_calls() {
         )),
     ]);
 
-    anthropic::raw_stream(&second_model, &second_context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let second_events = events(&second_model, &second_context, &options).await;
+    done(&second_events);
 
     let request = second_server.requests().await.pop().unwrap();
     let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -278,38 +278,25 @@ async fn preserves_anthropic_start_content_and_refusal_details() {
     ]
     .concat();
     let server = serve([Reply::sse(sse)]).await;
-    let model = anthropic::Model::new("claude-fable-5").with_base_url(&server.base_url);
-    let events = anthropic::raw_stream(
-        &model,
-        &Context::new([Message::user("Blocked request")]),
-        &anthropic::Options::new("test-key"),
-    )
-    .await
-    .unwrap()
-    .collect::<Vec<_>>()
-    .await;
+    let model = model("claude-fable-5", &server.base_url);
+    let context = Context::new([Message::user("Blocked request")]);
+    let events = events(&model, &context, &options(|_| {})).await;
 
-    assert_eq!(
-        events.first(),
-        Some(&Ok(Event::TextDelta {
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AssistantMessageEvent::TextStart {
             content_index: 0,
-            delta: "Blocked".into(),
-        }))
-    );
-    match events.last() {
-        Some(Err(ds_ai::Error::Response {
-            code,
-            message,
             partial,
-        })) => {
-            assert_eq!(code.as_deref(), Some("refusal"));
-            assert_eq!(message, "Request denied");
-            assert_eq!(partial.stop_reason, StopReason::Error);
-            assert_eq!(partial.raw_stop_reason.as_deref(), Some("refusal"));
-            assert_eq!(partial.content, [ds_ai::Content::Text("Blocked".into())]);
-        }
-        event => panic!("unexpected terminal event: {event:?}"),
-    }
+        } if partial.content == [text("Blocked")]
+    )));
+    let error = failed(&events);
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(error.raw_stop_reason.as_deref(), Some("refusal"));
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("provider response failed: Request denied")
+    );
+    assert_eq!(error.content, [text("Blocked")]);
 }
 
 #[tokio::test]
@@ -325,25 +312,17 @@ async fn rejects_sensitive_and_unknown_anthropic_stop_reasons() {
         ]
         .concat();
         let server = serve([Reply::sse(sse)]).await;
-        let model = anthropic::Model::new("claude-haiku-4-5").with_base_url(&server.base_url);
-        let events = anthropic::raw_stream(
-            &model,
-            &Context::new([Message::user("Blocked request")]),
-            &anthropic::Options::new("test-key"),
-        )
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+        let model = model("claude-haiku-4-5", &server.base_url);
+        let context = Context::new([Message::user("Blocked request")]);
+        let events = events(&model, &context, &options(|_| {})).await;
+        let error = failed(&events);
 
-        assert!(matches!(
-            events.last(),
-            Some(Err(ds_ai::Error::Response { code, message, partial }))
-                if code.as_deref() == Some(reason)
-                    && message == expected
-                    && partial.stop_reason == StopReason::Error
-                    && partial.raw_stop_reason.as_deref() == Some(reason)
-        ));
+        assert_eq!(error.stop_reason, StopReason::Error);
+        assert_eq!(error.raw_stop_reason.as_deref(), Some(reason));
+        assert_eq!(
+            error.error_message.as_deref(),
+            Some(format!("provider response failed: {expected}").as_str())
+        );
     }
 }
 
@@ -363,17 +342,13 @@ async fn retries_anthropic_before_streaming_starts() {
         Reply::sse(completed),
     ])
     .await;
-    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let model = model("claude-sonnet-4-5", &server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = anthropic::Options::new("test-key").with_max_retries(1);
+    let options = options(|stream| stream.max_retries = Some(1));
 
-    let events = anthropic::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let events = events(&model, &context, &options).await;
 
-    assert!(matches!(events.as_slice(), [Ok(Event::Done(_))]));
+    done(&events);
     assert_eq!(server.requests().await.len(), 2);
 }
 
@@ -386,26 +361,24 @@ async fn cancels_an_active_anthropic_stream_with_partial_content() {
     ]
     .concat();
     let server = serve([Reply::open_sse(sse)]).await;
-    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let model = model("claude-sonnet-4-5", &server.base_url);
     let context = Context::new([Message::user("Hello")]);
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let options = anthropic::Options::new("test-key").with_cancellation(cancellation.clone());
-    let mut response = anthropic::raw_stream(&model, &context, &options)
-        .await
-        .unwrap();
+    let options = options(|stream| stream.cancellation = cancellation.clone());
+    let mut response = anthropic::stream(&model, &context, &options);
 
-    assert!(matches!(
+    while !matches!(
         response.next().await,
-        Some(Ok(Event::TextDelta { .. }))
-    ));
+        Some(AssistantMessageEvent::TextDelta { .. })
+    ) {}
     cancellation.cancel();
 
     match response.next().await {
-        Some(Err(ds_ai::Error::Cancelled {
-            partial: Some(partial),
-        })) => {
-            assert_eq!(partial.stop_reason, StopReason::Aborted);
-            assert_eq!(partial.content, [ds_ai::Content::Text("Visible".into())]);
+        Some(AssistantMessageEvent::Error { reason, error }) => {
+            assert_eq!(reason, StopReason::Aborted);
+            assert_eq!(error.stop_reason, StopReason::Aborted);
+            assert_eq!(error.error_message.as_deref(), Some("request cancelled"));
+            assert_eq!(error.content, [text("Visible")]);
         }
         event => panic!("unexpected cancellation event: {event:?}"),
     }
@@ -414,24 +387,25 @@ async fn cancels_an_active_anthropic_stream_with_partial_content() {
 #[tokio::test(start_paused = true)]
 async fn times_out_an_anthropic_stream_before_its_first_event() {
     let server = serve([Reply::open_sse(": keepalive\n\n")]).await;
-    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let model = model("claude-sonnet-4-5", &server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = anthropic::Options::new("test-key")
-        .with_first_event_timeout(std::time::Duration::from_secs(5));
-    let mut response = anthropic::raw_stream(&model, &context, &options)
-        .await
-        .unwrap();
+    let options = options(|stream| {
+        stream.timeout = Some(std::time::Duration::from_secs(5));
+    });
+    let mut response = anthropic::stream(&model, &context, &options);
     let next = tokio::spawn(async move { response.next().await });
 
+    tokio::task::yield_now().await;
     tokio::time::advance(std::time::Duration::from_secs(5)).await;
 
     match next.await.unwrap() {
-        Some(Err(ds_ai::Error::Timeout {
-            phase,
-            partial: Some(partial),
-        })) => {
-            assert_eq!(phase, ds_ai::TimeoutPhase::FirstEvent);
-            assert_eq!(partial.stop_reason, StopReason::Error);
+        Some(AssistantMessageEvent::Error { reason, error }) => {
+            assert_eq!(reason, StopReason::Error);
+            assert_eq!(error.stop_reason, StopReason::Error);
+            assert_eq!(
+                error.error_message.as_deref(),
+                Some("provider timed out during Overall")
+            );
         }
         event => panic!("unexpected timeout event: {event:?}"),
     }
@@ -445,15 +419,11 @@ async fn maps_anthropic_pause_turn_to_stop() {
     ]
     .concat();
     let server = serve([Reply::sse(sse)]).await;
-    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let model = model("claude-sonnet-4-5", &server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = anthropic::Options::new("test-key");
+    let options = options(|_| {});
 
-    let events = anthropic::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let events = events(&model, &context, &options).await;
 
     let response = done(&events);
     assert_eq!(response.stop_reason, StopReason::Stop);
@@ -470,24 +440,20 @@ async fn rejects_anthropic_stream_closure_before_message_stop() {
     ]
     .concat();
     let server = serve([Reply::sse(sse)]).await;
-    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let model = model("claude-sonnet-4-5", &server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = anthropic::Options::new("test-key");
+    let options = options(|_| {});
 
-    let events = anthropic::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let events = events(&model, &context, &options).await;
 
-    match events.last() {
-        Some(Err(ds_ai::Error::IncompleteStream { partial })) => {
-            assert_eq!(partial.id.as_deref(), Some("msg_partial"));
-            assert_eq!(partial.content, [ds_ai::Content::Text("Partial".into())]);
-            assert_eq!(partial.raw_stop_reason.as_deref(), Some("end_turn"));
-        }
-        event => panic!("unexpected terminal event: {event:?}"),
-    }
+    let error = failed(&events);
+    assert_eq!(error.response_id.as_deref(), Some("msg_partial"));
+    assert_eq!(error.content, [text("Partial")]);
+    assert_eq!(error.raw_stop_reason.as_deref(), Some("end_turn"));
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("provider stream ended before a terminal event")
+    );
 }
 
 #[tokio::test]
@@ -499,33 +465,23 @@ async fn rejects_an_anthropic_error_event_with_partial_content() {
     ]
     .concat();
     let server = serve([Reply::sse(sse)]).await;
-    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let model = model("claude-sonnet-4-5", &server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options = anthropic::Options::new("test-key");
+    let options = options(|_| {});
 
-    let events = anthropic::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let events = events(&model, &context, &options).await;
 
-    match events.last() {
-        Some(Err(ds_ai::Error::Response {
-            code,
-            message,
-            partial,
-        })) => {
-            assert_eq!(code.as_deref(), Some("overloaded_error"));
-            assert_eq!(message, "busy");
-            assert_eq!(partial.stop_reason, StopReason::Error);
-            assert_eq!(
-                partial.raw_stop_reason.as_deref(),
-                Some("error.overloaded_error")
-            );
-            assert_eq!(partial.content, [ds_ai::Content::Text("Visible".into())]);
-        }
-        event => panic!("unexpected error event: {event:?}"),
-    }
+    let error = failed(&events);
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(
+        error.raw_stop_reason.as_deref(),
+        Some("error.overloaded_error")
+    );
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("provider response failed: busy")
+    );
+    assert_eq!(error.content, [text("Visible")]);
 }
 
 #[tokio::test]
@@ -536,7 +492,7 @@ async fn encodes_anthropic_generation_thinking_and_cache_options() {
     ]
     .concat();
     let server = serve([Reply::sse(completed)]).await;
-    let model = anthropic::Model::new("claude-opus-4-8").with_base_url(&server.base_url);
+    let model = model("claude-opus-4-8", &server.base_url);
     let context = Context::new([Message::user_content([
         InputContent::text("Inspect"),
         InputContent::image("image/png", "iVBORw0KGgo="),
@@ -547,22 +503,19 @@ async fn encodes_anthropic_generation_thinking_and_cache_options() {
         "Inspect the input",
         json!({"type": "object", "properties": {}}),
     )]);
-    let options = anthropic::Options::new("test-key")
-        .with_temperature(0.2)
-        .with_stop_sequences(["END"])
-        .with_thinking(anthropic::Thinking::Adaptive {
-            effort: Some(anthropic::Effort::High),
-            display: anthropic::ThinkingDisplay::Summarized,
-        })
-        .with_metadata_user_id("user_1")
-        .with_tool_choice(anthropic::ToolChoice::Tool("inspect".into()))
-        .with_cache_retention(CacheRetention::Long);
+    let mut options = options(|stream| {
+        stream.temperature = Some(0.2);
+        stream.max_tokens = Some(4096);
+        stream.cache_retention = CacheRetention::Long;
+        stream.metadata.insert("user_id".into(), json!("user_1"));
+    });
+    options.thinking_enabled = Some(true);
+    options.effort = Some(anthropic::Effort::High);
+    options.thinking_display = Some(anthropic::ThinkingDisplay::Summarized);
+    options.tool_choice = Some(anthropic::ToolChoice::Tool("inspect".into()));
 
-    anthropic::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let response = events(&model, &context, &options).await;
+    done(&response);
 
     let request = server.requests().await.pop().unwrap();
     let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -595,7 +548,6 @@ async fn encodes_anthropic_generation_thinking_and_cache_options() {
             }],
             "max_tokens": 4096,
             "stream": true,
-            "stop_sequences": ["END"],
             "thinking": {"type": "adaptive", "display": "summarized"},
             "output_config": {"effort": "high"},
             "metadata": {"user_id": "user_1"},
@@ -613,20 +565,17 @@ async fn keeps_anthropic_temperature_with_disabled_thinking_and_cache() {
     ]
     .concat();
     let server = serve([Reply::sse(completed)]).await;
-    let model = anthropic::Model::new("claude-sonnet-4-5")
-        .with_base_url(&server.base_url)
-        .with_eager_tool_input_streaming(false);
+    let mut model = model("claude-sonnet-4-5", &server.base_url);
+    anthropic_compat(&mut model).supports_eager_tool_input_streaming = Some(false);
     let context = Context::new([Message::user("Hello")]).with_system("Be brief");
-    let options = anthropic::Options::new("test-key")
-        .with_temperature(0.0)
-        .with_thinking(anthropic::Thinking::Disabled)
-        .with_cache_retention(CacheRetention::None);
+    let mut options = options(|stream| {
+        stream.temperature = Some(0.0);
+        stream.cache_retention = CacheRetention::None;
+    });
+    options.thinking_enabled = Some(false);
 
-    anthropic::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let response = events(&model, &context, &options).await;
+    done(&response);
 
     let request = server.requests().await.pop().unwrap();
     let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -645,10 +594,10 @@ async fn encodes_legacy_tool_streaming_and_strict_schemas() {
     ]
     .concat();
     let server = serve([Reply::sse(completed)]).await;
-    let model = anthropic::Model::new("claude-opus-4-8")
-        .with_base_url(&server.base_url)
-        .with_eager_tool_input_streaming(false)
-        .with_strict_tools();
+    let mut model = model("claude-opus-4-8", &server.base_url);
+    let compat = anthropic_compat(&mut model);
+    compat.supports_eager_tool_input_streaming = Some(false);
+    compat.supports_strict_tools = Some(true);
     let context = Context::new([Message::user("Look up")]).with_tools([Tool::new(
         "lookup",
         "Look up a value",
@@ -664,16 +613,11 @@ async fn encodes_legacy_tool_streaming_and_strict_schemas() {
     )
     .with_strict()]);
 
-    anthropic::raw_stream(&model, &context, &anthropic::Options::new("test-key"))
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let response = events(&model, &context, &options(|_| {})).await;
+    done(&response);
 
     let request = server.requests().await.pop().unwrap();
-    assert!(request.contains(
-        "anthropic-beta: fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14\r\n"
-    ));
+    assert!(request.contains("anthropic-beta: fine-grained-tool-streaming-2025-05-14\r\n"));
     let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert_eq!(
         body["tools"],
@@ -709,18 +653,10 @@ async fn replays_empty_signature_thinking_as_text_unless_enabled() {
     ]
     .concat();
     let first_server = serve([Reply::sse(thinking)]).await;
-    let first_model =
-        anthropic::Model::new("claude-sonnet-4-5").with_base_url(&first_server.base_url);
-    let events = anthropic::raw_stream(
-        &first_model,
-        &Context::new([Message::user("Think")]),
-        &anthropic::Options::new("test-key"),
-    )
-    .await
-    .unwrap()
-    .collect::<Vec<_>>()
-    .await;
-    let response = done(&events).clone();
+    let first_model = model("claude-sonnet-4-5", &first_server.base_url);
+    let context = Context::new([Message::user("Think")]);
+    let first_events = events(&first_model, &context, &options(|_| {})).await;
+    let response = done(&first_events).clone();
 
     let completed = [
         "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n",
@@ -728,17 +664,14 @@ async fn replays_empty_signature_thinking_as_text_unless_enabled() {
     ]
     .concat();
     let default_server = serve([Reply::sse(completed.clone())]).await;
-    let default_model =
-        anthropic::Model::new("claude-sonnet-4-5").with_base_url(&default_server.base_url);
-    anthropic::raw_stream(
+    let default_model = model("claude-sonnet-4-5", &default_server.base_url);
+    let default_events = events(
         &default_model,
         &Context::new([Message::assistant(response.clone())]),
-        &anthropic::Options::new("test-key"),
+        &options(|_| {}),
     )
-    .await
-    .unwrap()
-    .collect::<Vec<_>>()
     .await;
+    done(&default_events);
     let default_request = default_server.requests().await.pop().unwrap();
     let default_body: Value =
         serde_json::from_str(default_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -751,18 +684,15 @@ async fn replays_empty_signature_thinking_as_text_unless_enabled() {
     );
 
     let enabled_server = serve([Reply::sse(completed)]).await;
-    let enabled_model = anthropic::Model::new("claude-sonnet-4-5")
-        .with_base_url(&enabled_server.base_url)
-        .with_empty_thinking_signatures();
-    anthropic::raw_stream(
+    let mut enabled_model = model("claude-sonnet-4-5", &enabled_server.base_url);
+    anthropic_compat(&mut enabled_model).allow_empty_signature = Some(true);
+    let enabled_events = events(
         &enabled_model,
         &Context::new([Message::assistant(response)]),
-        &anthropic::Options::new("test-key"),
+        &options(|_| {}),
     )
-    .await
-    .unwrap()
-    .collect::<Vec<_>>()
     .await;
+    done(&enabled_events);
     let enabled_request = enabled_server.requests().await.pop().unwrap();
     let enabled_body: Value =
         serde_json::from_str(enabled_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -791,30 +721,78 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta"
     ]
     .concat();
     let server = serve([Reply::sse(sse)]).await;
-    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let model = model("claude-sonnet-4-5", &server.base_url);
     let context = Context::new([Message::user("Edit")]);
-    let options = anthropic::Options::new("test-key");
+    let options = options(|_| {});
 
-    let events = anthropic::raw_stream(&model, &context, &options)
-        .await
-        .unwrap()
-        .collect::<Vec<_>>()
-        .await;
+    let events = events(&model, &context, &options).await;
 
     let response = done(&events);
     assert_eq!(
         response.content,
-        [ds_ai::Content::ToolCall(ToolCall {
+        [AssistantContent::ToolCall(AssistantToolCall {
             id: "toolu_repair".into(),
             name: "edit".into(),
             arguments: json!({"path": "A\\H", "text": "col1\tcol2", "unicode": "\\u12xz"}),
+            thought_signature: None,
+            namespace: None,
         })]
     );
 }
 
-fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {
+fn model(id: &str, base_url: &str) -> ds_ai::Model {
+    let mut model = builtin_model("anthropic", id).unwrap();
+    model.base_url = base_url.into();
+    model
+}
+
+fn anthropic_compat(model: &mut ds_ai::Model) -> &mut AnthropicMessagesCompatibility {
+    if !matches!(model.compat, Some(ModelCompatibility::Anthropic(_))) {
+        model.compat = Some(ModelCompatibility::Anthropic(Default::default()));
+    }
+    let Some(ModelCompatibility::Anthropic(compat)) = &mut model.compat else {
+        unreachable!()
+    };
+    compat
+}
+
+fn options(configure: impl FnOnce(&mut StreamOptions)) -> AnthropicOptions {
+    let mut stream = StreamOptions {
+        api_key: Some("test-key".into()),
+        ..Default::default()
+    };
+    configure(&mut stream);
+    AnthropicOptions {
+        stream,
+        ..Default::default()
+    }
+}
+
+async fn events(
+    model: &ds_ai::Model,
+    context: &Context,
+    options: &AnthropicOptions,
+) -> Vec<AssistantMessageEvent> {
+    anthropic::stream(model, context, options).collect().await
+}
+
+fn text(value: &str) -> AssistantContent {
+    AssistantContent::Text(TextContent {
+        text: value.into(),
+        text_signature: None,
+    })
+}
+
+fn done(events: &[AssistantMessageEvent]) -> &AssistantMessage {
     match events.last() {
-        Some(Ok(Event::Done(response))) => response,
+        Some(AssistantMessageEvent::Done { message, .. }) => message,
         _ => panic!("stream did not complete"),
+    }
+}
+
+fn failed(events: &[AssistantMessageEvent]) -> &AssistantMessage {
+    match events.last() {
+        Some(AssistantMessageEvent::Error { error, .. }) => error,
+        event => panic!("stream did not fail: {event:?}"),
     }
 }
