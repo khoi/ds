@@ -12,6 +12,7 @@ path = "tests/providers.rs"
 
 [dependencies]
 async-stream.workspace = true
+async-trait.workspace = true
 base64.workspace = true
 bytes.workspace = true
 futures-core.workspace = true
@@ -25,6 +26,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tokio-tungstenite.workspace = true
+url.workspace = true
+sha2.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]

@@ -23,6 +23,8 @@ use tokio_util::sync::CancellationToken;
 
 pub use crate::openai::{ReasoningEffort, ReasoningSummary, ServiceTier, ToolChoice};
 
+pub mod auth;
+
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
