@@ -1051,18 +1051,16 @@ async fn cancels_an_active_openai_stream_with_partial_content() {
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn times_out_an_openai_request_before_response_headers() {
     let server = serve([Reply::pending()]).await;
     let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
-    let options =
-        openai::Options::new("test-key").with_connection_timeout(std::time::Duration::from_secs(5));
+    let options = openai::Options::new("test-key")
+        .with_connection_timeout(std::time::Duration::from_millis(50));
     let request = tokio::spawn(async move { openai::stream(&model, &context, &options).await });
 
     server.wait_for_requests(1).await;
-    tokio::time::advance(std::time::Duration::from_secs(5)).await;
-
     match request.await.unwrap() {
         Err(ds_ai::Error::Timeout { phase, partial }) => {
             assert_eq!(phase, ds_ai::TimeoutPhase::Connection);
@@ -1173,6 +1171,43 @@ async fn enforces_an_overall_openai_stream_deadline() {
         }
         event => panic!("unexpected timeout event: {event:?}"),
     }
+}
+
+#[tokio::test]
+async fn encodes_openai_prompt_cache_retention_and_session_keys() {
+    let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cache\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
+    let server = serve([Reply::sse(sse), Reply::sse(sse)]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let session_id = "🦀".repeat(70);
+    let long = openai::Options::new("test-key")
+        .with_session_id(&session_id)
+        .with_cache_retention(ds_ai::CacheRetention::Long);
+
+    openai::stream(&model, &context, &long)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    let disabled = openai::Options::new("test-key")
+        .with_session_id(&session_id)
+        .with_cache_retention(ds_ai::CacheRetention::None);
+    openai::stream(&model, &context, &disabled)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    let requests = server.requests().await;
+    let long_body: Value =
+        serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(long_body["prompt_cache_key"], "🦀".repeat(64));
+    assert_eq!(long_body["prompt_cache_retention"], "24h");
+    let disabled_body: Value =
+        serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert!(disabled_body.get("prompt_cache_key").is_none());
+    assert!(disabled_body.get("prompt_cache_retention").is_none());
 }
 
 fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {

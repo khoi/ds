@@ -283,4 +283,12 @@ pub enum TimeoutPhase {
     Overall,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CacheRetention {
+    None,
+    #[default]
+    Short,
+    Long,
+}
+
 pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send>>;

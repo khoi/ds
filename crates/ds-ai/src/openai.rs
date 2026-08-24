@@ -1,6 +1,7 @@
 use crate::{
-    Content, Context, Error, Event, InputContent, Message, Response, ResponseStream, StopReason,
-    TimeoutPhase, ToolCall, ToolResult, Usage, retry, sse, types::OpenAiReplay,
+    CacheRetention, Content, Context, Error, Event, InputContent, Message, Response,
+    ResponseStream, StopReason, TimeoutPhase, ToolCall, ToolResult, Usage, retry, sse,
+    types::OpenAiReplay,
 };
 use async_stream::stream;
 use futures_util::StreamExt;
@@ -45,6 +46,8 @@ pub struct Options {
     first_event_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     overall_timeout: Option<Duration>,
+    session_id: Option<String>,
+    cache_retention: CacheRetention,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -95,6 +98,8 @@ impl Options {
             first_event_timeout: None,
             idle_timeout: None,
             overall_timeout: None,
+            session_id: None,
+            cache_retention: CacheRetention::Short,
         }
     }
 
@@ -152,6 +157,16 @@ impl Options {
         self.overall_timeout = Some(timeout);
         self
     }
+
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn with_cache_retention(mut self, retention: CacheRetention) -> Self {
+        self.cache_retention = retention;
+        self
+    }
 }
 
 #[derive(Serialize)]
@@ -172,6 +187,10 @@ struct Request<'a> {
     include: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_retention: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -555,6 +574,16 @@ pub async fn stream(
             .map(|_| vec!["reasoning.encrypted_content"])
             .unwrap_or_default(),
         tool_choice: options.tool_choice,
+        prompt_cache_key: match options.cache_retention {
+            CacheRetention::None => None,
+            CacheRetention::Short | CacheRetention::Long => {
+                options.session_id.as_deref().map(clamp_cache_key)
+            }
+        },
+        prompt_cache_retention: match options.cache_retention {
+            CacheRetention::Long => Some("24h"),
+            CacheRetention::None | CacheRetention::Short => None,
+        },
     };
     let client = reqwest::Client::new();
     let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
@@ -906,6 +935,10 @@ pub async fn stream(
 
 fn parse_arguments(arguments: &str) -> serde_json::Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn clamp_cache_key(key: &str) -> String {
+    key.chars().take(64).collect()
 }
 
 async fn wait_for(timeout: Option<Duration>) {
