@@ -243,9 +243,9 @@ impl Response {
         }
     }
 
-    pub(crate) fn anthropic_reasoning(&self, model: &str) -> Option<&[AnthropicReasoning]> {
+    pub(crate) fn anthropic_state(&self) -> Option<(&str, &[AnthropicReasoning])> {
         match &self.provider {
-            ProviderState::Anthropic(state) if state.model == model => Some(&state.reasoning),
+            ProviderState::Anthropic(state) => Some((&state.model, &state.reasoning)),
             _ => None,
         }
     }

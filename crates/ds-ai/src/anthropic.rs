@@ -5,7 +5,10 @@ use crate::{
 };
 use async_stream::stream;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -702,24 +705,45 @@ fn messages(
     context: &Context,
     cache_control: Option<&CacheControl>,
 ) -> Vec<RequestMessage> {
-    let mut messages = context
-        .messages()
-        .iter()
-        .map(|message| match message {
-            Message::User(content) => RequestMessage {
-                role: "user",
-                content: content.iter().map(input_content).collect(),
-            },
-            Message::Assistant(response) => RequestMessage {
-                role: "assistant",
-                content: assistant_content(model, response),
-            },
-            Message::ToolResult(result) => RequestMessage {
-                role: "user",
-                content: vec![tool_result(result)],
-            },
-        })
-        .collect::<Vec<_>>();
+    let mut messages = Vec::new();
+    let mut pending_tool_calls = Vec::new();
+    let mut tool_results = HashSet::new();
+    for message in context.messages() {
+        match message {
+            Message::User(content) => {
+                finish_tool_calls(&mut messages, &mut pending_tool_calls, &mut tool_results);
+                push_message(
+                    &mut messages,
+                    "user",
+                    content.iter().map(input_content).collect(),
+                );
+            }
+            Message::Assistant(response) => {
+                finish_tool_calls(&mut messages, &mut pending_tool_calls, &mut tool_results);
+                if matches!(
+                    response.stop_reason,
+                    StopReason::Error | StopReason::Aborted
+                ) {
+                    continue;
+                }
+                let content = assistant_content(model, response);
+                pending_tool_calls.extend(response.content.iter().filter_map(|content| {
+                    if let Content::ToolCall(call) = content {
+                        Some(normalize_tool_id(&call.id))
+                    } else {
+                        None
+                    }
+                }));
+                push_message(&mut messages, "assistant", content);
+            }
+            Message::ToolResult(result) => {
+                let id = normalize_tool_id(&result.id);
+                tool_results.insert(id.clone());
+                push_message(&mut messages, "user", vec![tool_result(result, &id)]);
+            }
+        }
+    }
+    finish_tool_calls(&mut messages, &mut pending_tool_calls, &mut tool_results);
     if let Some(message) = messages
         .iter_mut()
         .rev()
@@ -729,6 +753,45 @@ fn messages(
         add_cache_control(content, cache_control);
     }
     messages
+}
+
+fn push_message(
+    messages: &mut Vec<RequestMessage>,
+    role: &'static str,
+    content: Vec<serde_json::Value>,
+) {
+    if content.is_empty() {
+        return;
+    }
+    if let Some(message) = messages.last_mut()
+        && message.role == role
+    {
+        message.content.extend(content);
+    } else {
+        messages.push(RequestMessage { role, content });
+    }
+}
+
+fn finish_tool_calls(
+    messages: &mut Vec<RequestMessage>,
+    pending: &mut Vec<String>,
+    results: &mut HashSet<String>,
+) {
+    for id in pending.drain(..) {
+        if !results.contains(&id) {
+            push_message(
+                messages,
+                "user",
+                vec![serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": id,
+                    "content": [{"type": "text", "text": "No result provided"}],
+                    "is_error": true
+                })],
+            );
+        }
+    }
+    results.clear();
 }
 
 fn request_tools(
@@ -767,7 +830,7 @@ fn request_tools(
 }
 
 fn assistant_content(model: &Model, response: &Response) -> Vec<serde_json::Value> {
-    let reasoning = response.anthropic_reasoning(&model.id);
+    let source = response.anthropic_state();
     response
         .content
         .iter()
@@ -776,16 +839,27 @@ fn assistant_content(model: &Model, response: &Response) -> Vec<serde_json::Valu
             Content::Text(text) => Some(serde_json::json!({"type": "text", "text": text})),
             Content::ToolCall(call) => Some(serde_json::json!({
                 "type": "tool_use",
-                "id": call.id,
+                "id": normalize_tool_id(&call.id),
                 "name": call.name,
                 "input": call.arguments
             })),
-            Content::Reasoning(text) => reasoning.and_then(|reasoning| {
-                reasoning.iter().find_map(|reasoning| match reasoning {
-                    AnthropicReasoning::Thinking {
-                        content_index: index,
-                        signature,
-                    } if *index == content_index => {
+            Content::Reasoning(text) => {
+                let source_reasoning = source.and_then(|(_, reasoning)| {
+                    reasoning.iter().find(|reasoning| match reasoning {
+                        AnthropicReasoning::Thinking {
+                            content_index: index,
+                            ..
+                        }
+                        | AnthropicReasoning::Redacted {
+                            content_index: index,
+                            ..
+                        } => *index == content_index,
+                    })
+                });
+                match source_reasoning {
+                    Some(AnthropicReasoning::Thinking { signature, .. })
+                        if source.is_some_and(|(source_model, _)| source_model == model.id) =>
+                    {
                         if !signature.trim().is_empty() || model.empty_thinking_signatures {
                             Some(serde_json::json!({
                                 "type": "thinking",
@@ -798,18 +872,36 @@ fn assistant_content(model: &Model, response: &Response) -> Vec<serde_json::Valu
                             Some(serde_json::json!({"type": "text", "text": text}))
                         }
                     }
-                    AnthropicReasoning::Redacted {
-                        content_index: index,
-                        data,
-                    } if *index == content_index => Some(serde_json::json!({
-                        "type": "redacted_thinking",
-                        "data": data
-                    })),
-                    _ => None,
-                })
-            }),
+                    Some(AnthropicReasoning::Redacted { data, .. })
+                        if source.is_some_and(|(source_model, _)| source_model == model.id) =>
+                    {
+                        Some(serde_json::json!({
+                            "type": "redacted_thinking",
+                            "data": data
+                        }))
+                    }
+                    Some(AnthropicReasoning::Redacted { .. }) => None,
+                    _ if text.trim().is_empty() => None,
+                    _ => Some(serde_json::json!({"type": "text", "text": text})),
+                }
+            }
         })
         .collect()
+}
+
+fn normalize_tool_id(id: &str) -> String {
+    let id = id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect::<String>();
+    if id.is_empty() { "_".into() } else { id }
 }
 
 fn parse_arguments(arguments: &str) -> serde_json::Value {
@@ -881,10 +973,10 @@ fn tool_choice(choice: &ToolChoice) -> serde_json::Value {
     }
 }
 
-fn tool_result(result: &ToolResult) -> serde_json::Value {
+fn tool_result(result: &ToolResult, id: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "tool_result",
-        "tool_use_id": result.id,
+        "tool_use_id": id,
         "content": result.content.iter().map(input_content).collect::<Vec<_>>(),
         "is_error": result.is_error
     })
