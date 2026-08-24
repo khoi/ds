@@ -1,8 +1,14 @@
 use crate::support::{Reply, serve};
+use async_trait::async_trait;
 use base64::prelude::*;
-use ds_ai::codex::auth::{Client, CredentialManager, Credentials};
+use ds_ai::codex::auth::{Client, CredentialManager, Credentials, Interaction, Notification};
 use serde_json::json;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use sha2::{Digest, Sha256};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -110,6 +116,138 @@ async fn cancels_an_active_codex_refresh() {
     server.requests().await;
 }
 
+#[tokio::test]
+async fn logs_in_with_a_manual_codex_redirect() {
+    let server = serve([Reply::json(
+        200,
+        json!({
+            "access_token": token("acc_manual"),
+            "refresh_token": "refresh_manual",
+            "expires_in": 3600
+        }),
+    )])
+    .await;
+    let interaction = ManualInteraction::default();
+    let client = Client::new()
+        .with_base_url(&server.base_url)
+        .with_callback_address(local_address());
+
+    let credentials = client
+        .login_browser(&interaction, &CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(credentials.account_id().unwrap(), "acc_manual");
+    let authorization_url = interaction.authorization_url();
+    let authorization_url = url::Url::parse(&authorization_url).unwrap();
+    assert_eq!(authorization_url.path(), "/oauth/authorize");
+    assert_eq!(query(&authorization_url, "response_type"), "code");
+    assert_eq!(query(&authorization_url, "code_challenge_method"), "S256");
+    assert_eq!(query(&authorization_url, "originator"), "ds");
+    let request = server.requests().await.pop().unwrap();
+    let body = request.split("\r\n\r\n").nth(1).unwrap();
+    let form = url::form_urlencoded::parse(body.as_bytes()).collect::<Vec<_>>();
+    assert_eq!(form_value(&form, "grant_type"), "authorization_code");
+    assert_eq!(form_value(&form, "code"), "manual_code");
+    assert_eq!(
+        query(&authorization_url, "redirect_uri"),
+        form_value(&form, "redirect_uri")
+    );
+    let verifier = form_value(&form, "code_verifier");
+    assert_eq!(
+        query(&authorization_url, "code_challenge"),
+        BASE64_URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+    );
+}
+
+#[tokio::test]
+async fn logs_in_through_the_codex_browser_callback() {
+    let server = serve([Reply::json(
+        200,
+        json!({
+            "access_token": token("acc_callback"),
+            "refresh_token": "refresh_callback",
+            "expires_in": 3600
+        }),
+    )])
+    .await;
+    let interaction = CallbackInteraction;
+    let client = Client::new()
+        .with_base_url(&server.base_url)
+        .with_callback_address(local_address());
+
+    let credentials = client
+        .login_browser(&interaction, &CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(credentials.account_id().unwrap(), "acc_callback");
+    let request = server.requests().await.pop().unwrap();
+    let body = request.split("\r\n\r\n").nth(1).unwrap();
+    assert!(body.contains("code=callback_code"));
+}
+
+#[derive(Default)]
+struct ManualInteraction {
+    authorization_url: Arc<Mutex<Option<String>>>,
+}
+
+impl ManualInteraction {
+    fn authorization_url(&self) -> String {
+        self.authorization_url.lock().unwrap().clone().unwrap()
+    }
+}
+
+#[async_trait]
+impl Interaction for ManualInteraction {
+    fn notify(&self, notification: Notification) {
+        let Notification::AuthorizationUrl { url } = notification;
+        *self.authorization_url.lock().unwrap() = Some(url);
+    }
+
+    async fn manual_authorization(
+        &self,
+        _cancellation: CancellationToken,
+    ) -> Result<String, ds_ai::codex::auth::Error> {
+        let authorization_url = url::Url::parse(&self.authorization_url()).unwrap();
+        Ok(format!(
+            "{}?code=manual_code&state={}",
+            query(&authorization_url, "redirect_uri"),
+            query(&authorization_url, "state")
+        ))
+    }
+}
+
+struct CallbackInteraction;
+
+#[async_trait]
+impl Interaction for CallbackInteraction {
+    fn notify(&self, notification: Notification) {
+        let Notification::AuthorizationUrl { url } = notification;
+        let authorization_url = url::Url::parse(&url).unwrap();
+        let callback = format!(
+            "{}?code=callback_code&state={}",
+            query(&authorization_url, "redirect_uri"),
+            query(&authorization_url, "state")
+        );
+        tokio::spawn(async move {
+            reqwest::get(callback)
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+        });
+    }
+
+    async fn manual_authorization(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<String, ds_ai::codex::auth::Error> {
+        cancellation.cancelled().await;
+        Err(ds_ai::codex::auth::Error::Cancelled)
+    }
+}
+
 fn token(account_id: &str) -> String {
     let payload = BASE64_URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&json!({
@@ -127,4 +265,25 @@ fn now_millis() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+fn local_address() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+}
+
+fn query(url: &url::Url, key: &str) -> String {
+    url.query_pairs()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.into_owned())
+        .unwrap()
+}
+
+fn form_value(
+    form: &[(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)],
+    key: &str,
+) -> String {
+    form.iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.to_string())
+        .unwrap()
 }
