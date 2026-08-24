@@ -163,8 +163,8 @@ impl crate::Provider for Provider {
     }
 }
 
-pub fn provider(models: impl IntoIterator<Item = crate::Model>) -> Arc<dyn crate::Provider> {
-    Arc::new(Provider::new(models))
+pub fn provider() -> Arc<dyn crate::Provider> {
+    Arc::new(Provider::new(crate::anthropic_models().iter().cloned()))
 }
 
 fn anthropic_thinking(level: crate::ThinkingLevel) -> Thinking {

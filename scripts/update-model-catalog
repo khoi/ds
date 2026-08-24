@@ -1,0 +1,34 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(dirname "$script_dir")
+pi_checkout=${1:?pass the pinned source checkout}
+catalog_dir="$repo_root/crates/ds-ai/src/catalog"
+manifest="$catalog_dir/manifest.json"
+expected_commit=$(jq -r .sourceCommit "$manifest")
+actual_commit=$(git -C "$pi_checkout" rev-parse HEAD)
+test "$actual_commit" = "$expected_commit"
+npm ci --ignore-scripts --prefix "$pi_checkout"
+npm --prefix "$pi_checkout/packages/ai" run hydrate-model-data
+source_dir="$pi_checkout/packages/ai/src/providers/data"
+catalog_temp=$(mktemp -d)
+trap 'rm -rf "$catalog_temp"' EXIT
+for file in anthropic.json openai-codex.json openai.json; do
+  install -m 0644 "$source_dir/$file" "$catalog_temp/$file"
+done
+generated_at=$(jq -r .generatedAt "$source_dir/.manifest.json")
+anthropic_hash=$(shasum -a 256 "$catalog_temp/anthropic.json" | cut -d ' ' -f 1)
+codex_hash=$(shasum -a 256 "$catalog_temp/openai-codex.json" | cut -d ' ' -f 1)
+openai_hash=$(shasum -a 256 "$catalog_temp/openai.json" | cut -d ' ' -f 1)
+jq -n \
+  --arg sourceCommit "$expected_commit" \
+  --arg generatedAt "$generated_at" \
+  --arg anthropic "$anthropic_hash" \
+  --arg codex "$codex_hash" \
+  --arg openai "$openai_hash" \
+  '{schemaVersion: 1, sourceCommit: $sourceCommit, generatedAt: $generatedAt, files: {"anthropic.json": $anthropic, "openai-codex.json": $codex, "openai.json": $openai}}' \
+  > "$catalog_temp/manifest.json"
+for file in anthropic.json manifest.json openai-codex.json openai.json; do
+  install -m 0644 "$catalog_temp/$file" "$catalog_dir/$file"
+done

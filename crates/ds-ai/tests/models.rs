@@ -125,7 +125,7 @@ async fn returns_terminal_stream_errors_for_unknown_provider_apis() {
     let mut model = model("openai", "gpt-test");
     model.api = Api::AnthropicMessages;
     let mut models = collection();
-    models.set_provider(ds_ai::openai::provider([model.clone()]));
+    models.set_provider(Arc::new(ds_ai::openai::Provider::new([model.clone()])));
     let result = models
         .complete(
             &model,
@@ -159,7 +159,7 @@ async fn openai_provider_returns_a_stream_before_setup_and_emits_pi_events() {
     let mut model = model("openai", "gpt-test");
     model.base_url = server.base_url;
     let mut models = collection();
-    models.set_provider(ds_ai::openai::provider([model.clone()]));
+    models.set_provider(Arc::new(ds_ai::openai::Provider::new([model.clone()])));
     let options = StreamOptions {
         api_key: Some("test-key".into()),
         ..Default::default()
@@ -407,7 +407,7 @@ async fn prepares_simple_options_from_the_model_and_context() {
         .sampling_params
         .insert("seed".into(), serde_json::json!(42));
     let mut models = collection();
-    models.set_provider(ds_ai::openai::provider([model.clone()]));
+    models.set_provider(Arc::new(ds_ai::openai::Provider::new([model.clone()])));
     models
         .complete_simple(
             &model,

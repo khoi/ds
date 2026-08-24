@@ -2,6 +2,8 @@
 mod anthropic_stream;
 #[path = "auth.rs"]
 mod auth;
+#[path = "catalog.rs"]
+mod catalog;
 #[path = "codex_auth.rs"]
 mod codex_auth;
 #[path = "codex_stream.rs"]

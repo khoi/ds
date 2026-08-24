@@ -1,4 +1,5 @@
 mod auth;
+mod catalog;
 mod estimate;
 mod event_stream;
 mod frame;
@@ -26,6 +27,11 @@ pub use auth::{
     AuthPrompt, AuthResolutionOverrides, AuthResult, AuthSelectOption, Credential, CredentialInfo,
     CredentialMutation, CredentialStore, CredentialType, EnvApiKeyAuth, InMemoryCredentialStore,
     ModelAuth, OAuthAuth, ProviderAuth, SystemAuthContext,
+};
+pub use catalog::{
+    CatalogError, CatalogInfo, anthropic_models, builtin_catalog_info, builtin_model,
+    builtin_models, builtin_provider_models, builtin_providers, codex_models, openai_models,
+    validate_builtin_catalog, validate_model_catalog,
 };
 
 pub use estimate::{

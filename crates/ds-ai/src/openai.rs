@@ -149,8 +149,8 @@ impl crate::Provider for Provider {
     }
 }
 
-pub fn provider(models: impl IntoIterator<Item = crate::Model>) -> Arc<dyn crate::Provider> {
-    Arc::new(Provider::new(models))
+pub fn provider() -> Arc<dyn crate::Provider> {
+    Arc::new(Provider::new(crate::openai_models().iter().cloned()))
 }
 
 fn reasoning_effort(level: crate::ThinkingLevel) -> Option<ReasoningEffort> {

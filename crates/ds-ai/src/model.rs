@@ -221,7 +221,7 @@ pub enum ModelCompatibility {
     Anthropic(AnthropicMessagesCompatibility),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Model {
     pub id: String,
@@ -242,6 +242,62 @@ pub struct Model {
     pub headers: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compat: Option<ModelCompatibility>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelWire {
+    id: String,
+    name: String,
+    api: Api,
+    provider: ProviderId,
+    base_url: String,
+    reasoning: bool,
+    #[serde(default)]
+    thinking_level_map: BTreeMap<ThinkingLevel, Option<String>>,
+    input: Vec<ModelInput>,
+    cost: ModelCost,
+    context_window: u64,
+    max_tokens: u64,
+    #[serde(default)]
+    sampling_params: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    compat: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for Model {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ModelWire::deserialize(deserializer)?;
+        let compat = match (&wire.api, wire.compat) {
+            (_, None) => None,
+            (Api::AnthropicMessages, Some(value)) => Some(ModelCompatibility::Anthropic(
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?,
+            )),
+            (_, Some(value)) => Some(ModelCompatibility::OpenAi(
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?,
+            )),
+        };
+        Ok(Self {
+            id: wire.id,
+            name: wire.name,
+            api: wire.api,
+            provider: wire.provider,
+            base_url: wire.base_url,
+            reasoning: wire.reasoning,
+            thinking_level_map: wire.thinking_level_map,
+            input: wire.input,
+            cost: wire.cost,
+            context_window: wire.context_window,
+            max_tokens: wire.max_tokens,
+            sampling_params: wire.sampling_params,
+            headers: wire.headers,
+            compat,
+        })
+    }
 }
 
 impl Model {
