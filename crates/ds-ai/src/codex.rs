@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const WEBSOCKET_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
 const WEBSOCKET_MAX_AGE: Duration = Duration::from_secs(55 * 60);
 
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -34,6 +35,7 @@ struct CachedWebSocket {
     created_at: Instant,
     metadata: ResponseMetadata,
     continuation: Arc<StdMutex<Option<Continuation>>>,
+    last_used: Arc<StdMutex<Instant>>,
 }
 
 struct Continuation {
@@ -77,6 +79,7 @@ pub struct Options {
     cache_retention: CacheRetention,
     transport: Transport,
     websocket_connect_timeout: Duration,
+    websocket_cache_ttl: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -102,6 +105,7 @@ impl Options {
             cache_retention: CacheRetention::Short,
             transport: Transport::Auto,
             websocket_connect_timeout: DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
+            websocket_cache_ttl: WEBSOCKET_IDLE_TTL,
         }
     }
 
@@ -157,6 +161,11 @@ impl Options {
 
     pub fn with_websocket_connect_timeout(mut self, timeout: Duration) -> Self {
         self.websocket_connect_timeout = timeout;
+        self
+    }
+
+    pub fn with_websocket_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.websocket_cache_ttl = ttl;
         self
     }
 }
@@ -339,7 +348,9 @@ async fn websocket_stream(
         account_id: request.account_id.to_owned(),
         request_id,
     };
-    let cached = cache_key.as_deref().and_then(cached_websocket);
+    let cached = cache_key
+        .as_deref()
+        .and_then(|key| cached_websocket(key, options.websocket_cache_ttl));
     let reused = cached.is_some();
     let connection = if let Some(cached) = cached {
         cached
@@ -363,6 +374,7 @@ async fn websocket_stream(
         socket,
         metadata,
         mut continuation,
+        mut last_used,
         ..
     } = connection;
     let mut socket = tokio::select! {
@@ -398,7 +410,7 @@ async fn websocket_stream(
         if !reused {
             return Err(WebSocketConnectError::Transport);
         }
-        (socket, continuation) = replace_websocket(
+        (socket, continuation, last_used) = replace_websocket(
             socket,
             cache_key.as_deref(),
             &handshake,
@@ -464,9 +476,10 @@ async fn websocket_stream(
                 )
                 .await
                 {
-                    Ok((fresh_socket, fresh_continuation)) => {
+                    Ok((fresh_socket, fresh_continuation, fresh_last_used)) => {
                         socket = fresh_socket;
                         continuation = fresh_continuation;
+                        last_used = fresh_last_used;
                     }
                     Err(WebSocketConnectError::Cancelled) => {
                         yield Err(transport::ReadError::Cancelled);
@@ -544,9 +557,10 @@ async fn websocket_stream(
                     )
                     .await
                     {
-                        Ok((fresh_socket, fresh_continuation)) => {
+                        Ok((fresh_socket, fresh_continuation, fresh_last_used)) => {
                             socket = fresh_socket;
                             continuation = fresh_continuation;
+                            last_used = fresh_last_used;
                         }
                         Err(WebSocketConnectError::Cancelled) => {
                             yield Err(transport::ReadError::Cancelled);
@@ -615,6 +629,7 @@ async fn websocket_stream(
                         response_id,
                         response_items: std::mem::take(&mut response_items),
                     });
+                    *last_used.lock().expect("websocket last-used lock") = Instant::now();
                 }
                 yield Ok(data);
                 if terminal {
@@ -683,6 +698,7 @@ async fn connect_websocket(
         created_at: Instant::now(),
         metadata: http::metadata(response.headers()),
         continuation: Arc::new(StdMutex::new(None)),
+        last_used: Arc::new(StdMutex::new(Instant::now())),
     })
 }
 
@@ -698,6 +714,7 @@ async fn replace_websocket(
     (
         OwnedMutexGuard<WebSocket>,
         Arc<StdMutex<Option<Continuation>>>,
+        Arc<StdMutex<Instant>>,
     ),
     WebSocketConnectError,
 > {
@@ -712,6 +729,7 @@ async fn replace_websocket(
     let connection =
         connect_websocket(handshake, cancellation, connect_timeout, overall_deadline).await?;
     let continuation = connection.continuation.clone();
+    let last_used = connection.last_used.clone();
     let fresh_socket = connection.socket.clone();
     let mut socket = tokio::select! {
         biased;
@@ -737,7 +755,7 @@ async fn replace_websocket(
             .expect("websocket cache lock")
             .insert(cache_key.to_owned(), connection);
     }
-    Ok((socket, continuation))
+    Ok((socket, continuation, last_used))
 }
 
 fn codex_error_code(data: &str) -> Option<String> {
@@ -778,11 +796,18 @@ fn websockets() -> &'static StdMutex<HashMap<String, CachedWebSocket>> {
     WEBSOCKETS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-fn cached_websocket(key: &str) -> Option<CachedWebSocket> {
+fn cached_websocket(key: &str, idle_ttl: Duration) -> Option<CachedWebSocket> {
     let mut cache = websockets().lock().expect("websocket cache lock");
-    let expired = cache
-        .get(key)
-        .is_some_and(|connection| connection.created_at.elapsed() >= WEBSOCKET_MAX_AGE);
+    let expired = cache.get(key).is_some_and(|connection| {
+        connection.created_at.elapsed() >= WEBSOCKET_MAX_AGE
+            || connection.socket.try_lock().is_ok()
+                && connection
+                    .last_used
+                    .lock()
+                    .expect("websocket last-used lock")
+                    .elapsed()
+                    >= idle_ttl
+    });
     if expired {
         cache.remove(key);
     }

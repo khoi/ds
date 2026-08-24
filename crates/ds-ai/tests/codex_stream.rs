@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_tungstenite::{
@@ -375,6 +376,40 @@ async fn replaces_a_stale_cached_codex_websocket() {
 }
 
 #[tokio::test]
+async fn expires_an_idle_cached_codex_websocket() {
+    let (base_url, capture) = serve_kept_websocket_connections([
+        text_events("resp_idle_seed", "msg_idle_seed", "First"),
+        text_events("resp_idle_fresh", "msg_idle_fresh", "Second"),
+    ])
+    .await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let options = codex::Options::new(token("acc_idle"))
+        .with_session_id("session_idle")
+        .with_websocket_cache_ttl(Duration::from_millis(10))
+        .with_transport(codex::Transport::WebSocket);
+    let context = Context::new([Message::user("Connect")]);
+    let first = codex::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    assert_eq!(done(&first).content, [ds_ai::Content::Text("First".into())]);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let second = codex::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert_eq!(
+        done(&second).content,
+        [ds_ai::Content::Text("Second".into())]
+    );
+    assert_eq!(capture.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn falls_back_to_sse_when_codex_websocket_connect_fails() {
     let sse = [
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_fallback\",\"type\":\"message\",\"content\":[]}}\n\n",
@@ -583,6 +618,37 @@ async fn serve_websocket_connections(
                     .unwrap();
             }
             socket.close(None).await.unwrap();
+        }
+        sender.send(bodies).ok();
+    });
+    (format!("http://{address}"), receiver)
+}
+
+async fn serve_kept_websocket_connections(
+    event_batches: impl IntoIterator<Item = Vec<Value>>,
+) -> (String, oneshot::Receiver<Vec<Value>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let event_batches = event_batches.into_iter().collect::<Vec<_>>();
+    let (sender, receiver) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut bodies = Vec::new();
+        let mut sockets = Vec::new();
+        for events in event_batches {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let body = match socket.next().await {
+                Some(Ok(WebSocketMessage::Text(body))) => serde_json::from_str(&body).unwrap(),
+                message => panic!("unexpected websocket request: {message:?}"),
+            };
+            bodies.push(body);
+            for event in events {
+                socket
+                    .send(WebSocketMessage::Text(event.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            sockets.push(socket);
         }
         sender.send(bodies).ok();
     });
