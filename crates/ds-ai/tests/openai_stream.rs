@@ -1158,7 +1158,7 @@ async fn encodes_openai_multimodal_context_and_generation_options() {
             "input": [
                 {
                     "role": "developer",
-                    "content": [{"type": "input_text", "text": "Be brief"}]
+                    "content": "Be brief"
                 },
                 {
                     "role": "user",

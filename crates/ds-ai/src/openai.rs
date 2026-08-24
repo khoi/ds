@@ -46,7 +46,7 @@ impl Provider {
         options: &crate::OpenAiResponsesOptions,
     ) -> crate::AssistantMessageEventStream {
         let requested_model = model.clone();
-        let context = context.clone();
+        let context = context.for_model(&requested_model);
         let options = options.clone();
         crate::legacy::adapt(requested_model.clone(), async move {
             let stream_options = options.stream;
@@ -806,7 +806,7 @@ pub async fn stream(
         tools,
         stream: true,
         store: false,
-        max_output_tokens: options.max_output_tokens,
+        max_output_tokens: options.max_output_tokens.map(|tokens| tokens.max(16)),
         temperature: options.temperature,
         reasoning: options
             .reasoning
@@ -1069,7 +1069,7 @@ pub(crate) fn response_input(
     {
         input.push(serde_json::json!({
             "role": role,
-            "content": [{"type": "input_text", "text": system}]
+            "content": system
         }));
     }
     for (message_index, message) in context.messages().iter().enumerate() {

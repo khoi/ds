@@ -3,7 +3,7 @@ use base64::prelude::*;
 use ds_ai::{
     AnthropicFallbackModel, AnthropicMessagesCompatibility, AnthropicOptions, Api,
     ApiStreamOptions, AssistantContent, AssistantMessage, AssistantToolCall, CacheRetention,
-    Context, InputContent, Message, ModelCompatibility, ModelCost, ModelCostRates,
+    Context, InputContent, Message, ModelCompatibility, ModelCost, ModelCostRates, ModelInput,
     OpenAiCodexResponsesOptions, OpenAiResponsesOptions, Provider, ProviderId, SimpleStreamOptions,
     StopReason, StreamOptions, ThinkingBudgets, Tool, ToolResultMessage, Transport, Usage,
     builtin_model,
@@ -20,7 +20,7 @@ async fn routes_openai_specific_options() {
         stream: StreamOptions {
             api_key: Some("test-key".into()),
             temperature: Some(0.25),
-            max_tokens: Some(4096),
+            max_tokens: Some(1),
             ..Default::default()
         },
         reasoning_effort: Some(ds_ai::openai::ReasoningEffort::High),
@@ -37,7 +37,7 @@ async fn routes_openai_specific_options() {
 
     let request = server.requests().await.pop().unwrap();
     let payload = request_json(&request);
-    assert_eq!(payload["max_output_tokens"], 4096);
+    assert_eq!(payload["max_output_tokens"], 16);
     assert_eq!(payload["temperature"], 0.25);
     assert_eq!(
         payload["reasoning"],
@@ -45,6 +45,67 @@ async fn routes_openai_specific_options() {
     );
     assert_eq!(payload["service_tier"], "flex");
     assert_eq!(payload["tool_choice"], "required");
+}
+
+#[tokio::test]
+async fn downgrades_images_for_text_only_models() {
+    let server = serve([Reply::sse(openai_done())]).await;
+    let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    model.base_url = server.base_url.clone();
+    model.input = vec![ModelInput::Text];
+    let provider = ds_ai::openai::Provider::new([model.clone()]);
+    let context = Context::new([
+        Message::user_content([
+            InputContent::text("Inspect"),
+            InputContent::image("image/png", "image-data"),
+        ]),
+        Message::tool_result(ToolResultMessage::new(
+            "call_inspect",
+            "inspect",
+            [
+                InputContent::text("Result"),
+                InputContent::image("image/png", "tool-image-data"),
+            ],
+        )),
+    ]);
+
+    provider
+        .stream(
+            &model,
+            &context,
+            &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .result()
+        .await
+        .unwrap();
+
+    let payload = request_json(&server.requests().await.pop().unwrap());
+    assert_eq!(
+        payload["input"],
+        json!([
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Inspect"},
+                    {
+                        "type": "input_text",
+                        "text": "(image omitted: model does not support images)"
+                    }
+                ]
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_inspect",
+                "output": "Result\n(tool image omitted: model does not support images)"
+            }
+        ])
+    );
 }
 
 #[tokio::test]

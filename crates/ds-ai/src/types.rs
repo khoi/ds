@@ -1,6 +1,6 @@
 use crate::{
-    Api, AssistantContent, AssistantMessage, AssistantToolCall, ImageContent, ProviderId,
-    TextContent, ThinkingContent,
+    Api, AssistantContent, AssistantMessage, AssistantToolCall, ImageContent, ModelInput,
+    ProviderId, TextContent, ThinkingContent,
 };
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
@@ -178,6 +178,34 @@ impl Context {
 
     pub(crate) fn system(&self) -> Option<&str> {
         self.system_prompt.as_deref()
+    }
+
+    pub(crate) fn for_model(&self, model: &crate::Model) -> Self {
+        let mut context = self.clone();
+        if model.input.contains(&ModelInput::Image) {
+            return context;
+        }
+        for message in &mut context.messages {
+            let (content, placeholder) = match message {
+                Message::User(message) => {
+                    let UserContent::Blocks(content) = &mut message.content else {
+                        continue;
+                    };
+                    (content, "(image omitted: model does not support images)")
+                }
+                Message::ToolResult(message) => (
+                    &mut message.content,
+                    "(tool image omitted: model does not support images)",
+                ),
+                Message::Assistant(_) => continue,
+            };
+            for item in content {
+                if matches!(item, InputContent::Image(_)) {
+                    *item = InputContent::text(placeholder);
+                }
+            }
+        }
+        context
     }
 
     pub(crate) fn tools(&self) -> &[Tool] {
