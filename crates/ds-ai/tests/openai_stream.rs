@@ -1,6 +1,8 @@
 mod support;
 
-use ds_ai::{Context, Event, InputContent, Message, Tool, ToolCall, ToolResult, openai};
+use ds_ai::{
+    Context, Event, InputContent, Message, StopReason, Tool, ToolCall, ToolResult, openai,
+};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use support::{Reply, serve};
@@ -771,6 +773,153 @@ async fn sends_openai_tool_result_text_images_and_empty_output() {
             }
         ])
     );
+}
+
+#[tokio::test]
+async fn finalizes_an_incomplete_openai_response_as_a_length_stop() {
+    let sse = [
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_incomplete\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_incomplete\",\"type\":\"message\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Partial\"}\n\n",
+        "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":30,\"input_tokens_details\":{\"cached_tokens\":5},\"output_tokens\":12,\"output_tokens_details\":{},\"total_tokens\":42}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Write")]);
+    let options = openai::Options::new("test-key");
+
+    let events = openai::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    let response = done(&events);
+    assert_eq!(response.stop_reason, StopReason::Length);
+    assert_eq!(
+        response.raw_stop_reason.as_deref(),
+        Some("incomplete.max_output_tokens")
+    );
+    assert_eq!(response.content, [ds_ai::Content::Text("Partial".into())]);
+    assert_eq!(response.usage.input, 25);
+    assert_eq!(response.usage.cache_read, 5);
+    assert_eq!(response.usage.output, 12);
+}
+
+#[tokio::test]
+async fn rejects_a_content_filtered_openai_response_with_partial_content() {
+    let sse = [
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_filtered\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_filtered\",\"type\":\"message\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Visible\"}\n\n",
+        "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_filtered\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"},\"usage\":{\"input_tokens\":2,\"input_tokens_details\":{},\"output_tokens\":1,\"output_tokens_details\":{}}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Write")]);
+    let options = openai::Options::new("test-key");
+
+    let events = openai::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    match events.last() {
+        Some(Err(ds_ai::Error::Response {
+            code,
+            message,
+            partial,
+        })) => {
+            assert_eq!(code, &None);
+            assert_eq!(message, "Response incomplete: content_filter");
+            assert_eq!(partial.stop_reason, StopReason::Error);
+            assert_eq!(
+                partial.raw_stop_reason.as_deref(),
+                Some("incomplete.content_filter")
+            );
+            assert_eq!(partial.content, [ds_ai::Content::Text("Visible".into())]);
+        }
+        event => panic!("unexpected terminal event: {event:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rejects_a_failed_openai_response_with_code_and_partial_content() {
+    let sse = [
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_failed\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_failed\",\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"Partial thought\"}\n\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Think")]);
+    let options = openai::Options::new("test-key");
+
+    let events = openai::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    match events.last() {
+        Some(Err(ds_ai::Error::Response {
+            code,
+            message,
+            partial,
+        })) => {
+            assert_eq!(code.as_deref(), Some("server_error"));
+            assert_eq!(message, "boom");
+            assert_eq!(partial.id.as_deref(), Some("resp_failed"));
+            assert_eq!(partial.stop_reason, StopReason::Error);
+            assert_eq!(partial.raw_stop_reason.as_deref(), Some("failed"));
+            assert_eq!(
+                partial.content,
+                [ds_ai::Content::Reasoning("Partial thought".into())]
+            );
+        }
+        event => panic!("unexpected terminal event: {event:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rejects_an_openai_error_event_with_code_and_partial_content() {
+    let sse = [
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_error\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_error\",\"type\":\"message\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Visible\"}\n\n",
+        "data: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\",\"param\":null}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let model = openai::Model::new("gpt-5.6").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Write")]);
+    let options = openai::Options::new("test-key");
+
+    let events = openai::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    match events.last() {
+        Some(Err(ds_ai::Error::Response {
+            code,
+            message,
+            partial,
+        })) => {
+            assert_eq!(code.as_deref(), Some("rate_limit_exceeded"));
+            assert_eq!(message, "slow down");
+            assert_eq!(partial.stop_reason, StopReason::Error);
+            assert_eq!(partial.raw_stop_reason.as_deref(), Some("error"));
+            assert_eq!(partial.content, [ds_ai::Content::Text("Visible".into())]);
+        }
+        event => panic!("unexpected terminal event: {event:?}"),
+    }
 }
 
 fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {

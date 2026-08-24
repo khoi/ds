@@ -1,6 +1,6 @@
 use crate::{
-    Content, Context, Error, Event, InputContent, Message, Response, ResponseStream, ToolCall,
-    ToolResult, Usage, retry, sse, types::OpenAiReplay,
+    Content, Context, Error, Event, InputContent, Message, Response, ResponseStream, StopReason,
+    ToolCall, ToolResult, Usage, retry, sse, types::OpenAiReplay,
 };
 use async_stream::stream;
 use futures_util::StreamExt;
@@ -184,6 +184,15 @@ enum StreamEvent {
     },
     #[serde(rename = "response.completed")]
     Completed { response: CompletedResponse },
+    #[serde(rename = "response.incomplete")]
+    Incomplete { response: IncompleteResponse },
+    #[serde(rename = "response.failed")]
+    Failed { response: FailedResponse },
+    #[serde(rename = "error")]
+    Error {
+        code: Option<String>,
+        message: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -234,6 +243,31 @@ enum Slot {
 struct CompletedResponse {
     id: String,
     usage: CompletedUsage,
+}
+
+#[derive(Deserialize)]
+struct IncompleteResponse {
+    id: String,
+    incomplete_details: IncompleteDetails,
+    usage: CompletedUsage,
+}
+
+#[derive(Deserialize)]
+struct IncompleteDetails {
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct FailedResponse {
+    id: Option<String>,
+    error: Option<FailedDetail>,
+    incomplete_details: Option<IncompleteDetails>,
+}
+
+#[derive(Deserialize)]
+struct FailedDetail {
+    code: Option<String>,
+    message: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -592,18 +626,74 @@ pub async fn stream(
                     }
                     StreamEvent::Completed { response } => {
                         result.id = Some(response.id);
-                        result.usage = Usage {
-                            input: response
-                                .usage
-                                .input_tokens
-                                .saturating_sub(response.usage.input_tokens_details.cached_tokens)
-                                .saturating_sub(response.usage.input_tokens_details.cache_write_tokens),
-                            output: response.usage.output_tokens,
-                            cache_read: response.usage.input_tokens_details.cached_tokens,
-                            cache_write: response.usage.input_tokens_details.cache_write_tokens,
-                            reasoning: response.usage.output_tokens_details.reasoning_tokens,
+                        result.usage = usage(response.usage);
+                        result.stop_reason = if result
+                            .content
+                            .iter()
+                            .any(|content| matches!(content, Content::ToolCall(_)))
+                        {
+                            StopReason::ToolUse
+                        } else {
+                            StopReason::Stop
                         };
+                        result.raw_stop_reason = Some("completed".into());
                         yield Ok(Event::Done(result));
+                        return;
+                    }
+                    StreamEvent::Incomplete { response }
+                        if response.incomplete_details.reason == "max_output_tokens" =>
+                    {
+                        result.id = Some(response.id);
+                        result.usage = usage(response.usage);
+                        result.stop_reason = StopReason::Length;
+                        result.raw_stop_reason = Some("incomplete.max_output_tokens".into());
+                        yield Ok(Event::Done(result));
+                        return;
+                    }
+                    StreamEvent::Incomplete { response } => {
+                        let reason = response.incomplete_details.reason;
+                        result.id = Some(response.id);
+                        result.usage = usage(response.usage);
+                        result.stop_reason = StopReason::Error;
+                        result.raw_stop_reason = Some(format!("incomplete.{reason}"));
+                        yield Err(Error::Response {
+                            code: None,
+                            message: format!("Response incomplete: {reason}"),
+                            partial: result,
+                        });
+                        return;
+                    }
+                    StreamEvent::Failed { response } => {
+                        let code = response.error.as_ref().and_then(|error| error.code.clone());
+                        let message = response
+                            .error
+                            .and_then(|error| error.message)
+                            .or_else(|| {
+                                response
+                                    .incomplete_details
+                                    .map(|details| format!("Response incomplete: {}", details.reason))
+                            })
+                            .unwrap_or_else(|| "Unknown provider error".into());
+                        if response.id.is_some() {
+                            result.id = response.id;
+                        }
+                        result.stop_reason = StopReason::Error;
+                        result.raw_stop_reason = Some("failed".into());
+                        yield Err(Error::Response {
+                            code,
+                            message,
+                            partial: result,
+                        });
+                        return;
+                    }
+                    StreamEvent::Error { code, message } => {
+                        result.stop_reason = StopReason::Error;
+                        result.raw_stop_reason = Some("error".into());
+                        yield Err(Error::Response {
+                            code,
+                            message,
+                            partial: result,
+                        });
                         return;
                     }
                     _ => {}
@@ -619,6 +709,19 @@ pub async fn stream(
 
 fn parse_arguments(arguments: &str) -> serde_json::Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn usage(usage: CompletedUsage) -> Usage {
+    Usage {
+        input: usage
+            .input_tokens
+            .saturating_sub(usage.input_tokens_details.cached_tokens)
+            .saturating_sub(usage.input_tokens_details.cache_write_tokens),
+        output: usage.output_tokens,
+        cache_read: usage.input_tokens_details.cached_tokens,
+        cache_write: usage.input_tokens_details.cache_write_tokens,
+        reasoning: usage.output_tokens_details.reasoning_tokens,
+    }
 }
 
 fn tool_result_output(result: &ToolResult) -> serde_json::Value {

@@ -148,8 +148,20 @@ pub struct Response {
     pub id: Option<String>,
     pub content: Vec<Content>,
     pub usage: Usage,
+    pub stop_reason: StopReason,
+    pub raw_stop_reason: Option<String>,
     #[serde(default, rename = "_provider")]
     provider: ProviderState,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum StopReason {
+    #[default]
+    Pending,
+    Stop,
+    Length,
+    ToolUse,
+    Error,
 }
 
 impl Response {
@@ -227,6 +239,12 @@ pub enum Error {
     Stream(String),
     #[error("provider stream ended before a terminal event")]
     IncompleteStream { partial: Response },
+    #[error("provider response failed: {message}")]
+    Response {
+        code: Option<String>,
+        message: String,
+        partial: Response,
+    },
     #[error("request cancelled")]
     Cancelled,
     #[error("provider retry delay {requested:?} exceeds {maximum:?}")]
