@@ -15,6 +15,8 @@ use std::{
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+pub mod auth;
+
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const OAUTH_TOOL_NAMES: [&str; 17] = [
@@ -50,7 +52,10 @@ impl Provider {
             id: crate::ProviderId::new("anthropic"),
             models: models.into_iter().collect(),
             headers: BTreeMap::new(),
-            auth: crate::ProviderAuth::api_key(AnthropicApiKeyAuth),
+            auth: crate::ProviderAuth {
+                api_key: Some(Arc::new(AnthropicApiKeyAuth)),
+                oauth: Some(Arc::new(auth::OAuth::new())),
+            },
         }
     }
 
