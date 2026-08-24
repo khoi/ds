@@ -1,11 +1,9 @@
-mod support;
-
+use crate::support::{Reply, serve};
 use ds_ai::{
     Context, Event, InputContent, Message, StopReason, Tool, ToolCall, ToolResult, openai,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use support::{Reply, serve};
 
 #[tokio::test]
 async fn streams_openai_text_until_the_provider_completes() {

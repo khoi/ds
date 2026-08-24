@@ -1,7 +1,9 @@
+mod http;
 mod retry;
 mod sse;
 mod types;
 
+pub mod anthropic;
 pub mod openai;
 
 pub use types::{

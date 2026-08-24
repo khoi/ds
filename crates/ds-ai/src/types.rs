@@ -220,6 +220,13 @@ impl Response {
             state.items.push(item);
         }
     }
+
+    pub(crate) fn anthropic(model: String) -> Self {
+        Self {
+            provider: ProviderState::Anthropic { model },
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -227,6 +234,9 @@ enum ProviderState {
     #[default]
     None,
     OpenAi(OpenAiState),
+    Anthropic {
+        model: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
