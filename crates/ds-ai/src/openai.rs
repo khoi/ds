@@ -184,7 +184,9 @@ pub async fn stream(
         {
             Ok(response) => response,
             Err(_) if retries < options.max_retries => {
+                let delay = retry_backoff(retries);
                 retries += 1;
+                wait_for_retry(delay, &options.cancellation).await?;
                 continue;
             }
             Err(error) => return Err(Error::Http(error.to_string())),
@@ -203,12 +205,7 @@ pub async fn stream(
                     maximum: DEFAULT_MAX_RETRY_DELAY,
                 });
             }
-            if !delay.is_zero() {
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = options.cancellation.cancelled() => return Err(Error::Cancelled),
-                }
-            }
+            wait_for_retry(delay, &options.cancellation).await?;
             continue;
         }
         let body = response.text().await.unwrap_or_default();
@@ -345,4 +342,14 @@ fn retry_delay(headers: &reqwest::header::HeaderMap, retry_index: usize) -> Dura
 fn retry_backoff(retry_index: usize) -> Duration {
     let base_seconds = (0.5 * 2_f64.powi(retry_index as i32)).min(8.0);
     Duration::from_secs_f64(base_seconds * (1.0 - rand::random::<f64>() * 0.25))
+}
+
+async fn wait_for_retry(delay: Duration, cancellation: &CancellationToken) -> Result<(), Error> {
+    if delay.is_zero() {
+        return Ok(());
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => Ok(()),
+        _ = cancellation.cancelled() => Err(Error::Cancelled),
+    }
 }
