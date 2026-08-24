@@ -11,14 +11,11 @@ use std::{
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-pub(crate) async fn connect<F>(
-    request: F,
+pub(crate) async fn connect(
+    request: impl Future<Output = Result<Response, Error>> + Send,
     connection_timeout: Option<Duration>,
     overall_deadline: Option<Instant>,
-) -> Result<Response, Error>
-where
-    F: FutureResponse,
-{
+) -> Result<Response, Error> {
     tokio::pin!(request);
     tokio::select! {
         biased;
@@ -33,10 +30,6 @@ where
         }),
     }
 }
-
-pub(crate) trait FutureResponse: Future<Output = Result<Response, Error>> + Send {}
-
-impl<T> FutureResponse for T where T: Future<Output = Result<Response, Error>> + Send {}
 
 pub(crate) struct EventStream {
     chunks: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
