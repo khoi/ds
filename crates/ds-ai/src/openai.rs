@@ -42,33 +42,23 @@ impl Provider {
         &self,
         model: &crate::Model,
         context: &Context,
-        options: &crate::StreamOptions,
-        thinking: Option<crate::ThinkingLevel>,
-        tool_choice: Option<crate::ToolChoice>,
+        options: &crate::OpenAiResponsesOptions,
     ) -> crate::AssistantMessageEventStream {
-        if model.api != crate::Api::OpenAiResponses {
-            let model = model.clone();
-            let api = model.api.clone();
-            return crate::legacy::adapt(model, async move {
-                Err(Error::InvalidRequest(format!(
-                    "OpenAI provider has no API implementation for {api}"
-                )))
-            });
-        }
         let requested_model = model.clone();
         let context = context.clone();
         let options = options.clone();
         crate::legacy::adapt(requested_model.clone(), async move {
-            let api_key = options
+            let stream_options = options.stream;
+            let api_key = stream_options
                 .api_key
                 .ok_or_else(|| Error::InvalidRequest("OpenAI API key is required".into()))?;
             let provider_model =
                 Model::new(&requested_model.id).with_base_url(requested_model.base_url.clone());
             let mut provider_options = Options::new(api_key)
-                .with_cancellation(options.cancellation)
-                .with_max_retries(options.max_retries.unwrap_or_default())
-                .with_max_retry_delay(options.max_retry_delay)
-                .with_cache_retention(options.cache_retention);
+                .with_cancellation(stream_options.cancellation)
+                .with_max_retries(stream_options.max_retries.unwrap_or_default())
+                .with_max_retry_delay(stream_options.max_retry_delay)
+                .with_cache_retention(stream_options.cache_retention);
             if let Some(crate::ModelCompatibility::OpenAi(compat)) = &requested_model.compat {
                 let mode = if compat.supports_additional_tools == Some(true) {
                     Some(DeferredToolsMode::AdditionalTools)
@@ -79,28 +69,31 @@ impl Provider {
                 };
                 provider_options = provider_options.with_deferred_tools_mode(mode);
             }
-            if let Some(max_tokens) = options.max_tokens {
+            if let Some(max_tokens) = stream_options.max_tokens {
                 provider_options = provider_options.with_max_output_tokens(max_tokens);
             }
-            provider_options = provider_options.with_sampling_params(options.sampling_params);
-            if let Some(temperature) = options.temperature {
+            provider_options =
+                provider_options.with_sampling_params(stream_options.sampling_params);
+            if let Some(temperature) = stream_options.temperature {
                 provider_options = provider_options.with_temperature(temperature);
             }
-            if let Some(timeout) = options.timeout {
+            if let Some(timeout) = stream_options.timeout {
                 provider_options = provider_options.with_overall_timeout(timeout);
             }
-            if let Some(session_id) = options.session_id {
+            if let Some(session_id) = stream_options.session_id {
                 provider_options = provider_options.with_session_id(session_id);
             }
-            if let Some(thinking) = thinking.and_then(reasoning_effort) {
-                provider_options =
-                    provider_options.with_reasoning(thinking, ReasoningSummary::Auto);
+            if let Some(effort) = options.reasoning_effort {
+                provider_options = provider_options.with_reasoning(
+                    effort,
+                    options.reasoning_summary.unwrap_or(ReasoningSummary::Auto),
+                );
             }
-            if let Some(tool_choice) = tool_choice {
-                provider_options = provider_options.with_tool_choice(match tool_choice {
-                    crate::ToolChoice::Auto => ToolChoice::Auto,
-                    crate::ToolChoice::None => ToolChoice::None,
-                });
+            if let Some(service_tier) = options.service_tier {
+                provider_options = provider_options.with_service_tier(service_tier);
+            }
+            if let Some(tool_choice) = options.tool_choice {
+                provider_options = provider_options.with_tool_choice(tool_choice);
             }
             stream(&provider_model, &context, &provider_options).await
         })
@@ -136,9 +129,26 @@ impl crate::Provider for Provider {
         &self,
         model: &crate::Model,
         context: &Context,
-        options: &crate::StreamOptions,
+        options: &crate::ApiStreamOptions,
     ) -> crate::AssistantMessageEventStream {
-        self.request(model, context, options, None, None)
+        if model.api != crate::Api::OpenAiResponses {
+            let model = model.clone();
+            let api = model.api.clone();
+            return crate::legacy::adapt(model, async move {
+                Err(Error::InvalidRequest(format!(
+                    "OpenAI provider has no API implementation for {api}"
+                )))
+            });
+        }
+        let crate::ApiStreamOptions::OpenAiResponses(options) = options else {
+            let model = model.clone();
+            return crate::legacy::adapt(model, async {
+                Err(Error::InvalidRequest(
+                    "OpenAI Responses options are required".into(),
+                ))
+            });
+        };
+        self.request(model, context, options)
     }
 
     fn stream_simple(
@@ -152,11 +162,18 @@ impl crate::Provider for Provider {
         self.request(
             model,
             context,
-            &stream,
-            options
-                .thinking
-                .map(|level| model.clamp_thinking_level(level)),
-            Some(options.tool_choice),
+            &crate::OpenAiResponsesOptions {
+                stream,
+                reasoning_effort: options
+                    .thinking
+                    .map(|level| model.clamp_thinking_level(level))
+                    .and_then(reasoning_effort),
+                tool_choice: Some(match options.tool_choice {
+                    crate::ToolChoice::Auto => ToolChoice::Auto,
+                    crate::ToolChoice::None => ToolChoice::None,
+                }),
+                ..Default::default()
+            },
         )
     }
 }

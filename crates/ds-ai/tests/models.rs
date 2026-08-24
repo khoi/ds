@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use ds_ai::{
-    Api, ApiKeyAuth, AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream,
-    AuthCheck, AuthContext, AuthError, AuthResolutionOverrides, AuthResult, Context, Credential,
-    CredentialType, Model, ModelAuth, ModelCost, ModelInput, Models, OAuthAuth, Provider,
-    ProviderAuth, ProviderId, SimpleStreamOptions, StopReason, StreamOptions,
+    Api, ApiKeyAuth, ApiStreamOptions, AssistantMessage, AssistantMessageEvent,
+    AssistantMessageEventStream, AuthCheck, AuthContext, AuthError, AuthResolutionOverrides,
+    AuthResult, Context, Credential, CredentialType, Model, ModelAuth, ModelCost, ModelInput,
+    Models, OAuthAuth, OpenAiResponsesOptions, Provider, ProviderAuth, ProviderId,
+    SimpleStreamOptions, StopReason, StreamOptions,
 };
 use futures_util::StreamExt;
 use futures_util::stream;
@@ -55,10 +56,10 @@ impl Provider for TestProvider {
         &self,
         model: &Model,
         _context: &Context,
-        options: &StreamOptions,
+        options: &ApiStreamOptions,
     ) -> AssistantMessageEventStream {
         if let Some(captured) = &self.captured {
-            *captured.lock().unwrap() = Some(options.clone());
+            *captured.lock().unwrap() = Some(options.stream().clone());
         }
         completed(model, &self.marker)
     }
@@ -90,10 +91,10 @@ async fn registers_replaces_lists_routes_and_deletes_providers() {
         .complete(
             &model,
             &Context::new([]),
-            &StreamOptions {
+            &api_options(StreamOptions {
                 api_key: Some("test-key".into()),
                 ..Default::default()
-            },
+            }),
         )
         .await
         .unwrap();
@@ -110,7 +111,11 @@ async fn registers_replaces_lists_routes_and_deletes_providers() {
 async fn returns_terminal_stream_errors_for_unknown_providers() {
     let model = model("missing", "gpt-test");
     let result = collection()
-        .complete(&model, &Context::new([]), &StreamOptions::default())
+        .complete(
+            &model,
+            &Context::new([]),
+            &api_options(StreamOptions::default()),
+        )
         .await
         .unwrap();
     assert_eq!(result.stop_reason, StopReason::Error);
@@ -130,10 +135,13 @@ async fn returns_terminal_stream_errors_for_unknown_provider_apis() {
         .complete(
             &model,
             &Context::new([]),
-            &StreamOptions {
-                api_key: Some("test-key".into()),
+            &ApiStreamOptions::AnthropicMessages(ds_ai::AnthropicOptions {
+                stream: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
+            }),
         )
         .await
         .unwrap();
@@ -160,10 +168,10 @@ async fn openai_provider_returns_a_stream_before_setup_and_emits_pi_events() {
     model.base_url = server.base_url;
     let mut models = collection();
     models.set_provider(Arc::new(ds_ai::openai::Provider::new([model.clone()])));
-    let options = StreamOptions {
+    let options = api_options(StreamOptions {
         api_key: Some("test-key".into()),
         ..Default::default()
-    };
+    });
 
     let events = models
         .stream(
@@ -364,14 +372,14 @@ async fn merges_provider_model_auth_and_request_headers_once() {
         .complete(
             &model,
             &Context::new([]),
-            &StreamOptions {
+            &api_options(StreamOptions {
                 api_key: Some("key".into()),
                 headers: BTreeMap::from([
                     ("X-TEST".into(), Some("request".into())),
                     ("auth-only".into(), None),
                 ]),
                 ..Default::default()
-            },
+            }),
         )
         .await
         .unwrap();
@@ -570,6 +578,13 @@ fn model(provider: &str, id: &str) -> Model {
         headers: BTreeMap::new(),
         compat: None,
     }
+}
+
+fn api_options(stream: StreamOptions) -> ApiStreamOptions {
+    ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+        stream,
+        ..Default::default()
+    })
 }
 
 fn completed(model: &Model, marker: &str) -> AssistantMessageEventStream {

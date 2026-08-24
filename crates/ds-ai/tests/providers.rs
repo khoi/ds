@@ -1,5 +1,7 @@
 #[path = "anthropic_stream.rs"]
 mod anthropic_stream;
+#[path = "api_options.rs"]
+mod api_options;
 #[path = "auth.rs"]
 mod auth;
 #[path = "catalog.rs"]

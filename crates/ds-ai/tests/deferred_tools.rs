@@ -1,8 +1,9 @@
 use crate::support::{Reply, serve};
 use base64::prelude::*;
 use ds_ai::{
-    Api, AssistantContent, AssistantMessage, AssistantToolCall, Context, InputContent, Message,
-    Model, ModelCompatibility, OpenAiResponsesCompatibility, Provider, ProviderId, StopReason,
+    AnthropicOptions, Api, ApiStreamOptions, AssistantContent, AssistantMessage, AssistantToolCall,
+    Context, InputContent, Message, Model, ModelCompatibility, OpenAiCodexResponsesOptions,
+    OpenAiResponsesCompatibility, OpenAiResponsesOptions, Provider, ProviderId, StopReason,
     StreamOptions, Tool, ToolResultMessage, Transport, Usage, builtin_model,
 };
 use serde_json::{Value, json};
@@ -200,10 +201,13 @@ async fn capture_openai(mut model: Model, context: Context) -> Value {
         .stream(
             &model,
             &context,
-            &StreamOptions {
-                api_key: Some("test-key".into()),
+            &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
+            }),
         )
         .result()
         .await
@@ -219,10 +223,13 @@ async fn capture_anthropic(mut model: Model, context: Context) -> Value {
         .stream(
             &model,
             &context,
-            &StreamOptions {
-                api_key: Some("test-key".into()),
+            &ApiStreamOptions::AnthropicMessages(AnthropicOptions {
+                stream: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
+            }),
         )
         .result()
         .await
@@ -238,11 +245,14 @@ async fn capture_codex(mut model: Model, context: Context) -> Value {
         .stream(
             &model,
             &context,
-            &StreamOptions {
-                api_key: Some(token()),
-                transport: Some(Transport::Sse),
+            &ApiStreamOptions::OpenAiCodexResponses(OpenAiCodexResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some(token()),
+                    transport: Some(Transport::Sse),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
+            }),
         )
         .result()
         .await

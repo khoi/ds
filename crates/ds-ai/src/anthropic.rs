@@ -39,24 +39,16 @@ impl Provider {
         &self,
         model: &crate::Model,
         context: &Context,
-        options: &crate::StreamOptions,
-        thinking: Option<crate::ThinkingLevel>,
-        tool_choice: Option<crate::ToolChoice>,
+        options: &crate::AnthropicOptions,
     ) -> crate::AssistantMessageEventStream {
-        if model.api != crate::Api::AnthropicMessages {
-            let model = model.clone();
-            let api = model.api.clone();
-            return crate::legacy::adapt(model, async move {
-                Err(Error::InvalidRequest(format!(
-                    "Anthropic provider has no API implementation for {api}"
-                )))
-            });
-        }
         let requested_model = model.clone();
         let context = context.clone();
         let options = options.clone();
         crate::legacy::adapt(requested_model.clone(), async move {
-            let api_key = options
+            let thinking = resolve_thinking(&requested_model, &options);
+            let tool_choice = options.tool_choice;
+            let stream_options = options.stream;
+            let api_key = stream_options
                 .api_key
                 .ok_or_else(|| Error::InvalidRequest("Anthropic API key is required".into()))?;
             let mut provider_model = Model::new(&requested_model.id)
@@ -78,37 +70,35 @@ impl Provider {
                         .unwrap_or_else(|| default_supports_tool_references(&requested_model)),
                 );
             }
-            let max_tokens = options
+            let max_tokens = stream_options
                 .max_tokens
                 .unwrap_or(requested_model.max_tokens)
                 .min(requested_model.max_tokens);
             let mut provider_options = Options::new(api_key)
                 .with_max_tokens(max_tokens)
-                .with_cancellation(options.cancellation)
-                .with_max_retries(options.max_retries.unwrap_or_default())
-                .with_max_retry_delay(options.max_retry_delay)
-                .with_cache_retention(options.cache_retention);
-            if let Some(temperature) = options.temperature {
+                .with_cancellation(stream_options.cancellation)
+                .with_max_retries(stream_options.max_retries.unwrap_or_default())
+                .with_max_retry_delay(stream_options.max_retry_delay)
+                .with_cache_retention(stream_options.cache_retention)
+                .with_interleaved_thinking(options.interleaved_thinking.unwrap_or(true));
+            if let Some(temperature) = stream_options.temperature {
                 provider_options = provider_options.with_temperature(temperature);
             }
-            if let Some(timeout) = options.timeout {
+            if let Some(timeout) = stream_options.timeout {
                 provider_options = provider_options.with_overall_timeout(timeout);
             }
-            if let Some(user_id) = options
+            if let Some(user_id) = stream_options
                 .metadata
                 .get("user_id")
                 .and_then(serde_json::Value::as_str)
             {
                 provider_options = provider_options.with_metadata_user_id(user_id);
             }
-            if let Some(thinking) = thinking.map(anthropic_thinking) {
+            if let Some(thinking) = thinking {
                 provider_options = provider_options.with_thinking(thinking);
             }
             if let Some(tool_choice) = tool_choice {
-                provider_options = provider_options.with_tool_choice(match tool_choice {
-                    crate::ToolChoice::Auto => ToolChoice::Auto,
-                    crate::ToolChoice::None => ToolChoice::None,
-                });
+                provider_options = provider_options.with_tool_choice(tool_choice);
             }
             stream(&provider_model, &context, &provider_options).await
         })
@@ -144,9 +134,26 @@ impl crate::Provider for Provider {
         &self,
         model: &crate::Model,
         context: &Context,
-        options: &crate::StreamOptions,
+        options: &crate::ApiStreamOptions,
     ) -> crate::AssistantMessageEventStream {
-        self.request(model, context, options, None, None)
+        if model.api != crate::Api::AnthropicMessages {
+            let model = model.clone();
+            let api = model.api.clone();
+            return crate::legacy::adapt(model, async move {
+                Err(Error::InvalidRequest(format!(
+                    "Anthropic provider has no API implementation for {api}"
+                )))
+            });
+        }
+        let crate::ApiStreamOptions::AnthropicMessages(options) = options else {
+            let model = model.clone();
+            return crate::legacy::adapt(model, async {
+                Err(Error::InvalidRequest(
+                    "Anthropic Messages options are required".into(),
+                ))
+            });
+        };
+        self.request(model, context, options)
     }
 
     fn stream_simple(
@@ -157,14 +164,22 @@ impl crate::Provider for Provider {
     ) -> crate::AssistantMessageEventStream {
         let stream =
             crate::provider::build_simple_stream_options(model, context, options.stream.clone());
+        let thinking = options
+            .thinking
+            .map(|level| model.clamp_thinking_level(level));
         self.request(
             model,
             context,
-            &stream,
-            options
-                .thinking
-                .map(|level| model.clamp_thinking_level(level)),
-            Some(options.tool_choice),
+            &crate::AnthropicOptions {
+                stream,
+                thinking_enabled: Some(!matches!(thinking, None | Some(crate::ThinkingLevel::Off))),
+                effort: thinking.and_then(anthropic_effort),
+                tool_choice: Some(match options.tool_choice {
+                    crate::ToolChoice::Auto => ToolChoice::Auto,
+                    crate::ToolChoice::None => ToolChoice::None,
+                }),
+                ..Default::default()
+            },
         )
     }
 }
@@ -173,29 +188,47 @@ pub fn provider() -> Arc<dyn crate::Provider> {
     Arc::new(Provider::new(crate::anthropic_models().iter().cloned()))
 }
 
-fn anthropic_thinking(level: crate::ThinkingLevel) -> Thinking {
+fn anthropic_effort(level: crate::ThinkingLevel) -> Option<Effort> {
     match level {
-        crate::ThinkingLevel::Off => Thinking::Disabled,
-        crate::ThinkingLevel::Minimal | crate::ThinkingLevel::Low => Thinking::Adaptive {
-            effort: Effort::Low,
-            display: ThinkingDisplay::Summarized,
-        },
-        crate::ThinkingLevel::Medium => Thinking::Adaptive {
-            effort: Effort::Medium,
-            display: ThinkingDisplay::Summarized,
-        },
-        crate::ThinkingLevel::High => Thinking::Adaptive {
-            effort: Effort::High,
-            display: ThinkingDisplay::Summarized,
-        },
-        crate::ThinkingLevel::XHigh => Thinking::Adaptive {
-            effort: Effort::XHigh,
-            display: ThinkingDisplay::Summarized,
-        },
-        crate::ThinkingLevel::Max => Thinking::Adaptive {
-            effort: Effort::Max,
-            display: ThinkingDisplay::Summarized,
-        },
+        crate::ThinkingLevel::Off => None,
+        crate::ThinkingLevel::Minimal | crate::ThinkingLevel::Low => Some(Effort::Low),
+        crate::ThinkingLevel::Medium => Some(Effort::Medium),
+        crate::ThinkingLevel::High => Some(Effort::High),
+        crate::ThinkingLevel::XHigh => Some(Effort::XHigh),
+        crate::ThinkingLevel::Max => Some(Effort::Max),
+    }
+}
+
+fn resolve_thinking(model: &crate::Model, options: &crate::AnthropicOptions) -> Option<Thinking> {
+    if !model.reasoning {
+        return None;
+    }
+    match options.thinking_enabled {
+        None => None,
+        Some(false) if model.thinking_level_map.get(&crate::ThinkingLevel::Off) != Some(&None) => {
+            Some(Thinking::Disabled)
+        }
+        Some(false) => None,
+        Some(true)
+            if matches!(
+                &model.compat,
+                Some(crate::ModelCompatibility::Anthropic(compat))
+                    if compat.force_adaptive_thinking == Some(true)
+            ) =>
+        {
+            Some(Thinking::Adaptive {
+                effort: options.effort,
+                display: options
+                    .thinking_display
+                    .unwrap_or(ThinkingDisplay::Summarized),
+            })
+        }
+        Some(true) => Some(Thinking::Enabled {
+            budget_tokens: options.thinking_budget_tokens.unwrap_or(1024),
+            display: options
+                .thinking_display
+                .unwrap_or(ThinkingDisplay::Summarized),
+        }),
     }
 }
 
@@ -362,6 +395,7 @@ pub struct Options {
     metadata_user_id: Option<String>,
     tool_choice: Option<ToolChoice>,
     cache_retention: CacheRetention,
+    interleaved_thinking: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -372,7 +406,7 @@ pub enum Thinking {
         display: ThinkingDisplay,
     },
     Adaptive {
-        effort: Effort,
+        effort: Option<Effort>,
         display: ThinkingDisplay,
     },
 }
@@ -420,6 +454,7 @@ impl Options {
             metadata_user_id: None,
             tool_choice: None,
             cache_retention: CacheRetention::Short,
+            interleaved_thinking: true,
         }
     }
 
@@ -493,6 +528,11 @@ impl Options {
 
     pub fn with_cache_retention(mut self, retention: CacheRetention) -> Self {
         self.cache_retention = retention;
+        self
+    }
+
+    pub fn with_interleaved_thinking(mut self, enabled: bool) -> Self {
+        self.interleaved_thinking = enabled;
         self
     }
 }
@@ -707,6 +747,14 @@ pub async fn stream(
     };
     let client = reqwest::Client::new();
     let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
+    let mut beta_features = Vec::new();
+    if legacy_tool_streaming {
+        beta_features.push("fine-grained-tool-streaming-2025-05-14");
+    }
+    if options.interleaved_thinking && matches!(options.thinking, Some(Thinking::Enabled { .. })) {
+        beta_features.push("interleaved-thinking-2025-05-14");
+    }
+    let beta_features = beta_features.join(",");
     let response = transport::connect(
         retry::send(
             retry::Policy {
@@ -719,10 +767,10 @@ pub async fn stream(
                     .post(&url)
                     .header("x-api-key", &options.api_key)
                     .header("anthropic-version", "2023-06-01");
-                let builder = if legacy_tool_streaming {
-                    builder.header("anthropic-beta", "fine-grained-tool-streaming-2025-05-14")
-                } else {
+                let builder = if beta_features.is_empty() {
                     builder
+                } else {
+                    builder.header("anthropic-beta", &beta_features)
                 };
                 builder.json(&request).send()
             },
@@ -1267,7 +1315,7 @@ fn thinking(thinking: &Option<Thinking>) -> (Option<serde_json::Value>, Option<s
         ),
         Some(Thinking::Adaptive { effort, display }) => (
             Some(serde_json::json!({"type": "adaptive", "display": display})),
-            Some(serde_json::json!({"effort": effort})),
+            effort.map(|effort| serde_json::json!({"effort": effort})),
         ),
     }
 }

@@ -77,6 +77,73 @@ pub struct SimpleStreamOptions {
     pub tool_choice: ToolChoice,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct OpenAiResponsesOptions {
+    pub stream: StreamOptions,
+    pub reasoning_effort: Option<crate::openai::ReasoningEffort>,
+    pub reasoning_summary: Option<crate::openai::ReasoningSummary>,
+    pub service_tier: Option<crate::openai::ServiceTier>,
+    pub tool_choice: Option<crate::openai::ToolChoice>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AnthropicOptions {
+    pub stream: StreamOptions,
+    pub thinking_enabled: Option<bool>,
+    pub thinking_budget_tokens: Option<u64>,
+    pub effort: Option<crate::anthropic::Effort>,
+    pub thinking_display: Option<crate::anthropic::ThinkingDisplay>,
+    pub interleaved_thinking: Option<bool>,
+    pub tool_choice: Option<crate::anthropic::ToolChoice>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OpenAiCodexResponsesOptions {
+    pub stream: StreamOptions,
+    pub reasoning_effort: Option<crate::codex::ReasoningEffort>,
+    pub reasoning_summary: Option<crate::codex::ReasoningSummary>,
+    pub service_tier: Option<crate::codex::ServiceTier>,
+    pub text_verbosity: Option<crate::codex::TextVerbosity>,
+    pub tool_choice: Option<crate::codex::ToolChoice>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ApiStreamOptions {
+    OpenAiResponses(OpenAiResponsesOptions),
+    AnthropicMessages(AnthropicOptions),
+    OpenAiCodexResponses(OpenAiCodexResponsesOptions),
+    Other(StreamOptions),
+}
+
+impl ApiStreamOptions {
+    pub fn for_model(model: &Model) -> Self {
+        match model.api {
+            crate::Api::OpenAiResponses => Self::OpenAiResponses(Default::default()),
+            crate::Api::AnthropicMessages => Self::AnthropicMessages(Default::default()),
+            crate::Api::OpenAiCodexResponses => Self::OpenAiCodexResponses(Default::default()),
+            crate::Api::Other(_) => Self::Other(Default::default()),
+        }
+    }
+
+    pub fn stream(&self) -> &StreamOptions {
+        match self {
+            Self::OpenAiResponses(options) => &options.stream,
+            Self::AnthropicMessages(options) => &options.stream,
+            Self::OpenAiCodexResponses(options) => &options.stream,
+            Self::Other(options) => options,
+        }
+    }
+
+    fn stream_mut(&mut self) -> &mut StreamOptions {
+        match self {
+            Self::OpenAiResponses(options) => &mut options.stream,
+            Self::AnthropicMessages(options) => &mut options.stream,
+            Self::OpenAiCodexResponses(options) => &mut options.stream,
+            Self::Other(options) => options,
+        }
+    }
+}
+
 pub trait Provider: Send + Sync {
     fn id(&self) -> &ProviderId;
     fn name(&self) -> &str;
@@ -88,7 +155,7 @@ pub trait Provider: Send + Sync {
         &self,
         model: &Model,
         context: &Context,
-        options: &StreamOptions,
+        options: &ApiStreamOptions,
     ) -> AssistantMessageEventStream;
     fn stream_simple(
         &self,
@@ -194,7 +261,7 @@ impl Models {
         &self,
         model: &Model,
         context: &Context,
-        options: &StreamOptions,
+        options: &ApiStreamOptions,
     ) -> AssistantMessageEventStream {
         let Some(provider) = self.provider(model.provider.as_str()) else {
             return error_stream(model, format!("Unknown provider {}", model.provider));
@@ -210,9 +277,9 @@ impl Models {
                 credentials,
                 auth_context,
                 crate::AuthResolutionOverrides {
-                    api_key: options.api_key.clone(),
-                    env: options.env.clone(),
-                    cancellation: options.cancellation.clone(),
+                    api_key: options.stream().api_key.clone(),
+                    env: options.stream().env.clone(),
+                    cancellation: options.stream().cancellation.clone(),
                     ..Default::default()
                 },
             )
@@ -233,7 +300,7 @@ impl Models {
         &self,
         model: &Model,
         context: &Context,
-        options: &StreamOptions,
+        options: &ApiStreamOptions,
     ) -> Result<AssistantMessage, AssistantMessageStreamError> {
         self.stream(model, context, options).result().await
     }
@@ -271,8 +338,9 @@ impl Models {
                     model.provider
                 ))
             })?;
-            let (request_model, stream_options) =
-                apply_auth(&provider, &model, options.stream, resolution);
+            let mut stream_options = options.stream;
+            let request_model =
+                apply_stream_auth(&provider, &model, &mut stream_options, resolution);
             Ok(provider.stream_simple(
                 &request_model,
                 &context,
@@ -481,22 +549,37 @@ fn lazy_stream(
 fn apply_auth(
     provider: &Arc<dyn Provider>,
     model: &Model,
-    mut options: StreamOptions,
+    mut options: ApiStreamOptions,
     resolution: crate::AuthResult,
-) -> (Model, StreamOptions) {
+) -> (Model, ApiStreamOptions) {
+    let stream = options.stream_mut();
+    let model = apply_stream_auth(provider, model, stream, resolution);
+    (model, options)
+}
+
+fn apply_stream_auth(
+    provider: &Arc<dyn Provider>,
+    model: &Model,
+    stream: &mut StreamOptions,
+    resolution: crate::AuthResult,
+) -> Model {
     let mut model = model.clone();
     if let Some(base_url) = resolution.auth.base_url {
         model.base_url = base_url;
     }
-    options.api_key = options.api_key.or(resolution.auth.api_key);
-    options.env = resolution.env.into_iter().chain(options.env).collect();
-    options.headers = merge_headers(
+    stream.api_key = stream.api_key.take().or(resolution.auth.api_key);
+    stream.env = resolution
+        .env
+        .into_iter()
+        .chain(std::mem::take(&mut stream.env))
+        .collect();
+    stream.headers = merge_headers(
         provider.headers(),
         &model.headers,
         &resolution.auth.headers,
-        &options.headers,
+        &stream.headers,
     );
-    (model, options)
+    model
 }
 
 fn merge_headers(

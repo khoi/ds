@@ -546,7 +546,7 @@ async fn encodes_anthropic_generation_thinking_and_cache_options() {
         .with_temperature(0.2)
         .with_stop_sequences(["END"])
         .with_thinking(anthropic::Thinking::Adaptive {
-            effort: anthropic::Effort::High,
+            effort: Some(anthropic::Effort::High),
             display: anthropic::ThinkingDisplay::Summarized,
         })
         .with_metadata_user_id("user_1")
