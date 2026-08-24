@@ -239,16 +239,22 @@ impl Response {
         let ProviderState::OpenAi(state) = &mut self.provider else {
             return;
         };
-        let Some(OpenAiReplay::Reasoning {
-            encrypted_content, ..
-        }) = state.items.iter_mut().find(
-            |item| matches!(item, OpenAiReplay::Reasoning { id: item_id, .. } if item_id == id),
-        )
-        else {
+        for item in &mut state.items {
+            let OpenAiReplay::Reasoning {
+                id: item_id,
+                encrypted_content,
+                ..
+            } = item
+            else {
+                continue;
+            };
+            if item_id != id {
+                continue;
+            }
+            if encrypted_content.is_none() {
+                *encrypted_content = Some(encrypted.to_owned());
+            }
             return;
-        };
-        if encrypted_content.is_none() {
-            *encrypted_content = Some(encrypted.to_owned());
         }
     }
 

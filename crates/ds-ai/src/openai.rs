@@ -326,24 +326,25 @@ enum Slot {
 
 #[derive(Deserialize)]
 struct CompletedResponse {
-    id: Option<String>,
+    #[serde(flatten)]
+    terminal: TerminalResponse,
     status: Option<String>,
-    service_tier: Option<String>,
-    end_turn: Option<bool>,
     incomplete_details: Option<IncompleteDetails>,
     error: Option<FailedDetail>,
-    #[serde(default)]
-    usage: CompletedUsage,
-    #[serde(default)]
-    output: Vec<OutputItem>,
 }
 
 #[derive(Deserialize)]
 struct IncompleteResponse {
+    #[serde(flatten)]
+    terminal: TerminalResponse,
+    incomplete_details: IncompleteDetails,
+}
+
+#[derive(Deserialize)]
+struct TerminalResponse {
     id: Option<String>,
     service_tier: Option<String>,
     end_turn: Option<bool>,
-    incomplete_details: IncompleteDetails,
     #[serde(default)]
     usage: CompletedUsage,
     #[serde(default)]
@@ -817,19 +818,19 @@ pub(crate) fn decode_events(
                         let Some(Slot::Reasoning(content_index)) = slots.get(&output_index) else {
                             continue;
                         };
-                        let summary = item
-                            .summary
-                            .iter()
-                            .map(|content| content.text.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n\n");
-                        let content = item
-                            .content
-                            .iter()
-                            .map(|content| content.text.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n\n");
-                        let reasoning = if summary.is_empty() { content } else { summary };
+                        let reasoning = if item.summary.is_empty() {
+                            item.content
+                                .iter()
+                                .map(|content| content.text.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n\n")
+                        } else {
+                            item.summary
+                                .iter()
+                                .map(|content| content.text.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n\n")
+                        };
                         if !reasoning.is_empty() {
                             result.content[*content_index] = Content::Reasoning(reasoning);
                         }
@@ -864,13 +865,7 @@ pub(crate) fn decode_events(
                         }
                     }
                     StreamEvent::Completed { response } => {
-                        backfill_reasoning(&mut result, &response.output);
-                        if response.id.is_some() {
-                            result.id = response.id;
-                        }
-                        result.service_tier = response.service_tier;
-                        result.end_turn = response.end_turn;
-                        result.usage = usage(response.usage);
+                        apply_terminal_response(&mut result, response.terminal);
                         if response.status.as_deref() == Some("incomplete") {
                             let reason = response
                                 .incomplete_details
@@ -920,30 +915,15 @@ pub(crate) fn decode_events(
                         yield Ok(Event::Done(Box::new(result)));
                         return;
                     }
-                    StreamEvent::Incomplete { response }
-                        if response.incomplete_details.reason == "max_output_tokens" =>
-                    {
-                        backfill_reasoning(&mut result, &response.output);
-                        if response.id.is_some() {
-                            result.id = response.id;
-                        }
-                        result.service_tier = response.service_tier;
-                        result.end_turn = response.end_turn;
-                        result.usage = usage(response.usage);
-                        result.stop_reason = StopReason::Length;
-                        result.raw_stop_reason = Some("incomplete.max_output_tokens".into());
-                        yield Ok(Event::Done(Box::new(result)));
-                        return;
-                    }
                     StreamEvent::Incomplete { response } => {
-                        backfill_reasoning(&mut result, &response.output);
                         let reason = response.incomplete_details.reason;
-                        if response.id.is_some() {
-                            result.id = response.id;
+                        apply_terminal_response(&mut result, response.terminal);
+                        if reason == "max_output_tokens" {
+                            result.stop_reason = StopReason::Length;
+                            result.raw_stop_reason = Some("incomplete.max_output_tokens".into());
+                            yield Ok(Event::Done(Box::new(result)));
+                            return;
                         }
-                        result.service_tier = response.service_tier;
-                        result.end_turn = response.end_turn;
-                        result.usage = usage(response.usage);
                         result.stop_reason = StopReason::Error;
                         result.raw_stop_reason = Some(format!("incomplete.{reason}"));
                         yield Err(Error::Response {
@@ -1011,6 +991,16 @@ fn backfill_reasoning(result: &mut Response, output: &[OutputItem]) {
             result.backfill_openai_reasoning(id, encrypted);
         }
     }
+}
+
+fn apply_terminal_response(result: &mut Response, response: TerminalResponse) {
+    backfill_reasoning(result, &response.output);
+    if response.id.is_some() {
+        result.id = response.id;
+    }
+    result.service_tier = response.service_tier;
+    result.end_turn = response.end_turn;
+    result.usage = usage(response.usage);
 }
 
 pub(crate) fn clamp_cache_key(key: &str) -> String {

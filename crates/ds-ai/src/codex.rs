@@ -53,12 +53,10 @@ struct WebSocketLease {
 }
 
 impl WebSocketLease {
-    fn new(key: Option<String>) -> Self {
-        Self { key }
-    }
-
-    fn release(&mut self) -> Option<String> {
-        self.key.take()
+    fn complete(&mut self, idle_ttl: Duration) {
+        if let Some(key) = self.key.take() {
+            schedule_websocket_expiry(key, idle_ttl);
+        }
     }
 
     fn evict(&mut self) {
@@ -553,7 +551,9 @@ async fn websocket_stream(
         }
         connection
     };
-    let mut lease = WebSocketLease::new(cache_key.clone());
+    let mut lease = WebSocketLease {
+        key: cache_key.clone(),
+    };
     let CachedWebSocket {
         socket,
         metadata,
@@ -833,9 +833,7 @@ async fn websocket_stream(
             match event {
                 Ok(crate::Event::Done(response)) => {
                     drop(decoded);
-                    if let Some(key) = lease.release() {
-                        schedule_websocket_expiry(key, websocket_cache_ttl);
-                    }
+                    lease.complete(websocket_cache_ttl);
                     yield Ok(crate::Event::Done(response));
                     return;
                 }
@@ -1032,47 +1030,48 @@ fn schedule_websocket_expiry(key: String, idle_ttl: Duration) {
     let age_remaining = WEBSOCKET_MAX_AGE.saturating_sub(connection.created_at.elapsed());
     tokio::spawn(async move {
         tokio::time::sleep(idle_remaining.min(age_remaining)).await;
-        let expired = connection.created_at.elapsed() >= WEBSOCKET_MAX_AGE
-            || connection.socket.try_lock().is_ok()
-                && connection
-                    .last_used
-                    .lock()
-                    .expect("websocket last-used lock")
-                    .elapsed()
-                    >= idle_ttl;
-        if !expired {
+        if !websocket_expired(&connection, idle_ttl) {
             return;
         }
-        let removed = {
+        let connection = {
             let mut cache = websockets().lock().expect("websocket cache lock");
-            let current = cache
+            let same_connection = cache
                 .get(&key)
                 .is_some_and(|current| Arc::ptr_eq(&current.socket, &connection.socket));
-            current.then(|| cache.remove(&key)).flatten()
+            if !same_connection {
+                return;
+            }
+            cache.remove(&key).expect("cached websocket exists")
         };
-        if let Some(connection) = removed {
-            let mut socket = connection.socket.lock().await;
-            let _ = socket.close(None).await;
-        }
+        let mut socket = connection.socket.lock().await;
+        let _ = socket.close(None).await;
     });
 }
 
 fn cached_websocket(key: &str, idle_ttl: Duration) -> Option<CachedWebSocket> {
     let mut cache = websockets().lock().expect("websocket cache lock");
-    let expired = cache.get(key).is_some_and(|connection| {
-        connection.created_at.elapsed() >= WEBSOCKET_MAX_AGE
-            || connection.socket.try_lock().is_ok()
-                && connection
-                    .last_used
-                    .lock()
-                    .expect("websocket last-used lock")
-                    .elapsed()
-                    >= idle_ttl
-    });
+    let expired = cache
+        .get(key)
+        .is_some_and(|connection| websocket_expired(connection, idle_ttl));
     if expired {
         cache.remove(key);
     }
     cache.get(key).cloned()
+}
+
+fn websocket_expired(connection: &CachedWebSocket, idle_ttl: Duration) -> bool {
+    if connection.created_at.elapsed() >= WEBSOCKET_MAX_AGE {
+        return true;
+    }
+    if connection.socket.try_lock().is_err() {
+        return false;
+    }
+    connection
+        .last_used
+        .lock()
+        .expect("websocket last-used lock")
+        .elapsed()
+        >= idle_ttl
 }
 
 fn continuation_request(
