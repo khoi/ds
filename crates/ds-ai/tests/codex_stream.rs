@@ -210,6 +210,58 @@ async fn reuses_a_codex_websocket_with_an_input_delta() {
 }
 
 #[tokio::test]
+async fn retries_a_missing_codex_continuation_with_full_context() {
+    let (base_url, capture) = serve_websocket([
+        text_events("resp_seed", "msg_seed", "Seed"),
+        vec![json!({
+            "type": "error",
+            "error": {
+                "code": "previous_response_not_found",
+                "message": "Continuation expired"
+            }
+        })],
+        text_events("resp_recovered", "msg_recovered", "Recovered"),
+    ])
+    .await;
+    let model = codex::Model::new("gpt-5.6-codex").with_base_url(base_url);
+    let options = codex::Options::new(token("acc_recovery"))
+        .with_session_id("session_recovery")
+        .with_transport(codex::Transport::WebSocket);
+    let first_events = codex::stream(
+        &model,
+        &Context::new([Message::user("Seed")]).with_system("Be brief"),
+        &options,
+    )
+    .await
+    .unwrap()
+    .collect::<Vec<_>>()
+    .await;
+    let first_response = done(&first_events).clone();
+    let second_context = Context::new([
+        Message::user("Seed"),
+        Message::assistant(first_response),
+        Message::user("Continue"),
+    ])
+    .with_system("Be brief");
+
+    let second_events = codex::stream(&model, &second_context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert_eq!(
+        done(&second_events).content,
+        [ds_ai::Content::Text("Recovered".into())]
+    );
+    let capture = capture.await.unwrap();
+    assert_eq!(capture.bodies.len(), 3);
+    assert_eq!(capture.bodies[1]["previous_response_id"], "resp_seed");
+    assert!(capture.bodies[2].get("previous_response_id").is_none());
+    assert_eq!(capture.bodies[2]["input"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn falls_back_to_sse_when_codex_websocket_connect_fails() {
     let sse = [
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_fallback\",\"type\":\"message\",\"content\":[]}}\n\n",

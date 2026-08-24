@@ -394,6 +394,7 @@ async fn websocket_stream(
             .expect("websocket continuation lock")
             .as_ref(),
     );
+    let used_continuation = body.get("previous_response_id").is_some();
     let body = serde_json::to_string(&body).map_err(|_| WebSocketConnectError::Transport)?;
     tokio::select! {
         biased;
@@ -406,6 +407,8 @@ async fn websocket_stream(
         }
     }
     let full_request = request.body;
+    let full_body =
+        serde_json::to_string(&full_request).map_err(|_| WebSocketConnectError::Transport)?;
     let continuation = connection.continuation;
     let metadata = connection.metadata;
     let cancellation = options.cancellation.clone();
@@ -416,6 +419,8 @@ async fn websocket_stream(
         let mut event_deadline = first_event_timeout.map(|timeout| Instant::now() + timeout);
         let mut response_id = None;
         let mut response_items = Vec::new();
+        let mut emitted = false;
+        let mut retried_missing_continuation = false;
         loop {
             let message = tokio::select! {
                 biased;
@@ -455,8 +460,39 @@ async fn websocket_stream(
                     return;
                 }
             };
-            if let Some(data) = data {
+            if let Some(mut data) = data {
+                if used_continuation
+                    && !emitted
+                    && !retried_missing_continuation
+                    && codex_error_code(&data).as_deref() == Some("previous_response_not_found")
+                {
+                    *continuation.lock().expect("websocket continuation lock") = None;
+                    let sent = tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => {
+                            yield Err(transport::ReadError::Cancelled);
+                            return;
+                        }
+                        _ = transport::wait_until(overall_deadline) => {
+                            yield Err(transport::ReadError::Timeout(crate::TimeoutPhase::Overall));
+                            return;
+                        }
+                        sent = socket.send(WebSocketMessage::Text(full_body.clone().into())) => sent,
+                    };
+                    if let Err(error) = sent {
+                        yield Err(transport::ReadError::Stream(error.to_string()));
+                        return;
+                    }
+                    retried_missing_continuation = true;
+                    saw_event = false;
+                    event_deadline = first_event_timeout.map(|timeout| Instant::now() + timeout);
+                    response_id = None;
+                    response_items.clear();
+                    continue;
+                }
+                data = normalize_codex_error(data);
                 saw_event = true;
+                emitted = true;
                 event_deadline = idle_timeout.map(|timeout| Instant::now() + timeout);
                 let terminal = observe_websocket_event(
                     &data,
@@ -484,6 +520,40 @@ async fn websocket_stream(
         request.model.to_owned(),
         metadata,
     ))
+}
+
+fn codex_error_code(data: &str) -> Option<String> {
+    let event = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    event
+        .get("code")
+        .or_else(|| event.get("error").and_then(|error| error.get("code")))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn normalize_codex_error(data: String) -> String {
+    let Ok(mut event) = serde_json::from_str::<serde_json::Value>(&data) else {
+        return data;
+    };
+    if event.get("type").and_then(serde_json::Value::as_str) != Some("error") {
+        return data;
+    }
+    let code = codex_error_code(&data);
+    let message = event
+        .get("message")
+        .or_else(|| event.get("error").and_then(|error| error.get("message")))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let Some(event) = event.as_object_mut() else {
+        return data;
+    };
+    if let Some(code) = code {
+        event.insert("code".into(), code.into());
+    }
+    if let Some(message) = message {
+        event.insert("message".into(), message.into());
+    }
+    serde_json::to_string(event).unwrap_or(data)
 }
 
 fn websockets() -> &'static StdMutex<HashMap<String, CachedWebSocket>> {
