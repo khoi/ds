@@ -172,6 +172,7 @@ name = "ds-ai"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "bytes",
  "futures-core",
  "futures-util",
  "httpdate",

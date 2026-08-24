@@ -12,6 +12,7 @@ path = "tests/providers.rs"
 
 [dependencies]
 async-stream.workspace = true
+bytes.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 httpdate.workspace = true

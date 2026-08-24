@@ -317,8 +317,8 @@ pub enum Error {
         retry_after: Option<Duration>,
         rate_limits: RateLimits,
     },
-    #[error("invalid provider stream: {0}")]
-    Stream(String),
+    #[error("invalid provider stream: {message}")]
+    Stream { message: String, partial: Response },
     #[error("provider stream ended before a terminal event")]
     IncompleteStream { partial: Response },
     #[error("provider response failed: {message}")]

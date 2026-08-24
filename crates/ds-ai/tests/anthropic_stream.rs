@@ -183,6 +183,92 @@ async fn streams_and_replays_anthropic_thinking_and_tool_calls() {
     );
 }
 
+#[tokio::test]
+async fn retries_anthropic_before_streaming_starts() {
+    let completed = [
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ]
+    .concat();
+    let server = serve([
+        Reply::json(
+            529,
+            json!({"error": {"type": "overloaded_error", "message": "busy"}}),
+        )
+        .with_header("retry-after-ms", "0"),
+        Reply::sse(completed),
+    ])
+    .await;
+    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options = anthropic::Options::new("test-key").with_max_retries(1);
+
+    let events = anthropic::stream(&model, &context, &options)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+
+    assert!(matches!(events.as_slice(), [Ok(Event::Done(_))]));
+    assert_eq!(server.requests().await.len(), 2);
+}
+
+#[tokio::test]
+async fn cancels_an_active_anthropic_stream_with_partial_content() {
+    let sse = [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_cancel\",\"usage\":{}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Visible\"}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::open_sse(sse)]).await;
+    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let options = anthropic::Options::new("test-key").with_cancellation(cancellation.clone());
+    let mut response = anthropic::stream(&model, &context, &options).await.unwrap();
+
+    assert!(matches!(
+        response.next().await,
+        Some(Ok(Event::TextDelta { .. }))
+    ));
+    cancellation.cancel();
+
+    match response.next().await {
+        Some(Err(ds_ai::Error::Cancelled {
+            partial: Some(partial),
+        })) => {
+            assert_eq!(partial.stop_reason, StopReason::Aborted);
+            assert_eq!(partial.content, [ds_ai::Content::Text("Visible".into())]);
+        }
+        event => panic!("unexpected cancellation event: {event:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn times_out_an_anthropic_stream_before_its_first_event() {
+    let server = serve([Reply::open_sse(": keepalive\n\n")]).await;
+    let model = anthropic::Model::new("claude-sonnet-4-5").with_base_url(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options = anthropic::Options::new("test-key")
+        .with_first_event_timeout(std::time::Duration::from_secs(5));
+    let mut response = anthropic::stream(&model, &context, &options).await.unwrap();
+    let next = tokio::spawn(async move { response.next().await });
+
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+
+    match next.await.unwrap() {
+        Some(Err(ds_ai::Error::Timeout {
+            phase,
+            partial: Some(partial),
+        })) => {
+            assert_eq!(phase, ds_ai::TimeoutPhase::FirstEvent);
+            assert_eq!(partial.stop_reason, StopReason::Error);
+        }
+        event => panic!("unexpected timeout event: {event:?}"),
+    }
+}
+
 fn done(events: &[Result<Event, ds_ai::Error>]) -> &ds_ai::Response {
     match events.last() {
         Some(Ok(Event::Done(response))) => response,

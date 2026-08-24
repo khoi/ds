@@ -9,6 +9,7 @@ rust-version = "1.95"
 
 [workspace.dependencies]
 async-stream = "0.3.6"
+bytes = "1.11.1"
 futures-core = "0.3.31"
 futures-util = "0.3.34"
 httpdate = "1.0.3"

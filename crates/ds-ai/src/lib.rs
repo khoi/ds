@@ -1,6 +1,7 @@
 mod http;
 mod retry;
 mod sse;
+mod transport;
 mod types;
 
 pub mod anthropic;

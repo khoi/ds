@@ -1,12 +1,11 @@
 use crate::{
     CacheRetention, Content, Context, Error, Event, InputContent, Message, Response,
-    ResponseStream, StopReason, TimeoutPhase, ToolCall, ToolResult, Usage, http, retry, sse,
+    ResponseStream, StopReason, TimeoutPhase, ToolCall, ToolResult, Usage, http, retry, transport,
     types::OpenAiReplay,
 };
 use async_stream::stream;
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, future::pending, time::Duration};
+use std::{collections::HashMap, time::Duration};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -587,37 +586,25 @@ pub async fn stream(
     };
     let client = reqwest::Client::new();
     let url = format!("{}/responses", model.base_url.trim_end_matches('/'));
-    let sending = retry::send(
-        retry::Policy {
-            max_retries: options.max_retries,
-            max_delay: options.max_retry_delay,
-            cancellation: &options.cancellation,
-        },
-        || {
-            client
-                .post(&url)
-                .bearer_auth(&options.api_key)
-                .json(&request)
-                .send()
-        },
-    );
-    tokio::pin!(sending);
-    let response = tokio::select! {
-        biased;
-        response = &mut sending => response?,
-        _ = wait_for(options.connection_timeout) => {
-            return Err(Error::Timeout {
-                phase: TimeoutPhase::Connection,
-                partial: None,
-            });
-        }
-        _ = wait_until(overall_deadline) => {
-            return Err(Error::Timeout {
-                phase: TimeoutPhase::Overall,
-                partial: None,
-            });
-        }
-    };
+    let response = transport::connect(
+        retry::send(
+            retry::Policy {
+                max_retries: options.max_retries,
+                max_delay: options.max_retry_delay,
+                cancellation: &options.cancellation,
+            },
+            || {
+                client
+                    .post(&url)
+                    .bearer_auth(&options.api_key)
+                    .json(&request)
+                    .send()
+            },
+        ),
+        options.connection_timeout,
+        overall_deadline,
+    )
+    .await?;
     if !response.status().is_success() {
         return Err(http::provider_error(response).await);
     }
@@ -628,43 +615,34 @@ pub async fn stream(
     let first_event_timeout = options.first_event_timeout;
     let idle_timeout = options.idle_timeout;
     let output = stream! {
-        let mut chunks = response.bytes_stream();
-        let mut decoder = sse::Decoder::default();
+        let mut events = transport::EventStream::new(
+            response,
+            stream_cancellation,
+            first_event_timeout,
+            idle_timeout,
+            overall_deadline,
+        );
         let mut result = Response::openai(response_model);
         result.metadata = metadata;
         let mut slots = HashMap::new();
-        let mut saw_event = false;
-        let mut event_deadline = first_event_timeout.map(|timeout| Instant::now() + timeout);
 
         loop {
-            let chunk = tokio::select! {
-                biased;
-                _ = stream_cancellation.cancelled() => {
+            let data = match events.next().await {
+                Ok(Some(data)) => data,
+                Ok(None) => break,
+                Err(transport::ReadError::Cancelled) => {
                     result.stop_reason = StopReason::Aborted;
                     result.raw_stop_reason = Some("cancelled".into());
                     yield Err(Error::Cancelled { partial: Some(result) });
                     return;
                 }
-                _ = wait_until(overall_deadline) => {
-                    result.stop_reason = StopReason::Error;
-                    result.raw_stop_reason = Some("timeout.overall".into());
-                    yield Err(Error::Timeout {
-                        phase: TimeoutPhase::Overall,
-                        partial: Some(result),
-                    });
-                    return;
-                }
-                _ = wait_until(event_deadline) => {
-                    let phase = if saw_event {
-                        TimeoutPhase::Idle
-                    } else {
-                        TimeoutPhase::FirstEvent
-                    };
+                Err(transport::ReadError::Timeout(phase)) => {
                     result.stop_reason = StopReason::Error;
                     result.raw_stop_reason = Some(match phase {
                         TimeoutPhase::FirstEvent => "timeout.first_event".into(),
                         TimeoutPhase::Idle => "timeout.idle".into(),
-                        _ => unreachable!(),
+                        TimeoutPhase::Overall => "timeout.overall".into(),
+                        TimeoutPhase::Connection => unreachable!(),
                     });
                     yield Err(Error::Timeout {
                         phase,
@@ -672,40 +650,23 @@ pub async fn stream(
                     });
                     return;
                 }
-                chunk = chunks.next() => chunk,
-            };
-            let Some(chunk) = chunk else {
-                break;
-            };
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    yield Err(Error::Stream(error.to_string()));
+                Err(transport::ReadError::Stream(message)) => {
+                    yield Err(Error::Stream { message, partial: result });
                     return;
                 }
             };
-            decoder.push(&chunk);
+            let event = match serde_json::from_str::<StreamEvent>(&data) {
+                Ok(event) => event,
+                Err(error) => {
+                    yield Err(Error::Stream {
+                        message: error.to_string(),
+                        partial: result,
+                    });
+                    return;
+                }
+            };
 
-            loop {
-                let data = match decoder.next_data() {
-                    Ok(Some(data)) => data,
-                    Ok(None) => break,
-                    Err(error) => {
-                        yield Err(Error::Stream(error));
-                        return;
-                    }
-                };
-                saw_event = true;
-                event_deadline = idle_timeout.map(|timeout| Instant::now() + timeout);
-                let event = match serde_json::from_str::<StreamEvent>(&data) {
-                    Ok(event) => event,
-                    Err(error) => {
-                        yield Err(Error::Stream(error.to_string()));
-                        return;
-                    }
-                };
-
-                match event {
+            match event {
                     StreamEvent::Created { response } => result.id = Some(response.id),
                     StreamEvent::OutputItemAdded { output_index, item } => {
                         let content_index = result.content.len();
@@ -921,7 +882,6 @@ pub async fn stream(
                     }
                     _ => {}
                 }
-            }
         }
 
         yield Err(Error::IncompleteStream { partial: result });
@@ -936,20 +896,6 @@ fn parse_arguments(arguments: &str) -> serde_json::Value {
 
 fn clamp_cache_key(key: &str) -> String {
     key.chars().take(64).collect()
-}
-
-async fn wait_for(timeout: Option<Duration>) {
-    match timeout {
-        Some(timeout) => tokio::time::sleep(timeout).await,
-        None => pending().await,
-    }
-}
-
-async fn wait_until(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => pending().await,
-    }
 }
 
 fn request_input_content(content: &[InputContent]) -> Vec<RequestInputContent<'_>> {

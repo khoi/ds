@@ -1,11 +1,11 @@
 use crate::{
     Content, Context, Error, Event, InputContent, Message, Response, ResponseStream, StopReason,
-    ToolResult, Usage, http, retry, sse, types::AnthropicReasoning,
+    ToolResult, Usage, http, retry, transport, types::AnthropicReasoning,
 };
 use async_stream::stream;
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -34,7 +34,13 @@ impl Model {
 pub struct Options {
     api_key: String,
     max_tokens: u64,
+    max_retries: usize,
+    max_retry_delay: Option<Duration>,
     cancellation: CancellationToken,
+    connection_timeout: Option<Duration>,
+    first_event_timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
+    overall_timeout: Option<Duration>,
 }
 
 impl Options {
@@ -42,12 +48,53 @@ impl Options {
         Self {
             api_key: api_key.into(),
             max_tokens: 4096,
+            max_retries: 0,
+            max_retry_delay: Some(DEFAULT_MAX_RETRY_DELAY),
             cancellation: CancellationToken::new(),
+            connection_timeout: None,
+            first_event_timeout: None,
+            idle_timeout: None,
+            overall_timeout: None,
         }
     }
 
     pub fn with_max_tokens(mut self, max_tokens: u64) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    pub fn with_max_retry_delay(mut self, max_retry_delay: Option<Duration>) -> Self {
+        self.max_retry_delay = max_retry_delay;
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    pub fn with_connection_timeout(mut self, timeout: Duration) -> Self {
+        self.connection_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_first_event_timeout(mut self, timeout: Duration) -> Self {
+        self.first_event_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_overall_timeout(mut self, timeout: Duration) -> Self {
+        self.overall_timeout = Some(timeout);
         self
     }
 }
@@ -176,6 +223,9 @@ pub async fn stream(
     context: &Context,
     options: &Options,
 ) -> Result<ResponseStream, Error> {
+    let overall_deadline = options
+        .overall_timeout
+        .map(|timeout| Instant::now() + timeout);
     let request = Request {
         model: &model.id,
         system: context.system(),
@@ -194,20 +244,24 @@ pub async fn stream(
     };
     let client = reqwest::Client::new();
     let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
-    let response = retry::send(
-        retry::Policy {
-            max_retries: 0,
-            max_delay: Some(DEFAULT_MAX_RETRY_DELAY),
-            cancellation: &options.cancellation,
-        },
-        || {
-            client
-                .post(&url)
-                .header("x-api-key", &options.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&request)
-                .send()
-        },
+    let response = transport::connect(
+        retry::send(
+            retry::Policy {
+                max_retries: options.max_retries,
+                max_delay: options.max_retry_delay,
+                cancellation: &options.cancellation,
+            },
+            || {
+                client
+                    .post(&url)
+                    .header("x-api-key", &options.api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&request)
+                    .send()
+            },
+        ),
+        options.connection_timeout,
+        overall_deadline,
     )
     .await?;
     if !response.status().is_success() {
@@ -216,39 +270,61 @@ pub async fn stream(
 
     let metadata = http::metadata(response.headers());
     let response_model = model.id.clone();
+    let stream_cancellation = options.cancellation.clone();
+    let first_event_timeout = options.first_event_timeout;
+    let idle_timeout = options.idle_timeout;
     let output = stream! {
-        let mut chunks = response.bytes_stream();
-        let mut decoder = sse::Decoder::default();
+        let mut events = transport::EventStream::new(
+            response,
+            stream_cancellation,
+            first_event_timeout,
+            idle_timeout,
+            overall_deadline,
+        );
         let mut result = Response::anthropic(response_model);
         result.metadata = metadata;
         let mut slots = HashMap::new();
 
-        while let Some(chunk) = chunks.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    yield Err(Error::Stream(error.to_string()));
+        loop {
+            let data = match events.next().await {
+                Ok(Some(data)) => data,
+                Ok(None) => break,
+                Err(transport::ReadError::Cancelled) => {
+                    result.stop_reason = StopReason::Aborted;
+                    result.raw_stop_reason = Some("cancelled".into());
+                    yield Err(Error::Cancelled { partial: Some(result) });
+                    return;
+                }
+                Err(transport::ReadError::Timeout(phase)) => {
+                    result.stop_reason = StopReason::Error;
+                    result.raw_stop_reason = Some(match phase {
+                        crate::TimeoutPhase::FirstEvent => "timeout.first_event".into(),
+                        crate::TimeoutPhase::Idle => "timeout.idle".into(),
+                        crate::TimeoutPhase::Overall => "timeout.overall".into(),
+                        crate::TimeoutPhase::Connection => unreachable!(),
+                    });
+                    yield Err(Error::Timeout {
+                        phase,
+                        partial: Some(result),
+                    });
+                    return;
+                }
+                Err(transport::ReadError::Stream(message)) => {
+                    yield Err(Error::Stream { message, partial: result });
                     return;
                 }
             };
-            decoder.push(&chunk);
-            loop {
-                let data = match decoder.next_data() {
-                    Ok(Some(data)) => data,
-                    Ok(None) => break,
-                    Err(error) => {
-                        yield Err(Error::Stream(error));
-                        return;
-                    }
-                };
-                let event = match serde_json::from_str::<StreamEvent>(&data) {
-                    Ok(event) => event,
-                    Err(error) => {
-                        yield Err(Error::Stream(error.to_string()));
-                        return;
-                    }
-                };
-                match event {
+            let event = match serde_json::from_str::<StreamEvent>(&data) {
+                Ok(event) => event,
+                Err(error) => {
+                    yield Err(Error::Stream {
+                        message: error.to_string(),
+                        partial: result,
+                    });
+                    return;
+                }
+            };
+            match event {
                     StreamEvent::MessageStart { message } => {
                         result.id = Some(message.id);
                         apply_usage(&mut result.usage, message.usage);
@@ -365,14 +441,16 @@ pub async fn stream(
                     }
                     StreamEvent::MessageStop => {
                         if result.stop_reason == StopReason::Pending {
-                            yield Err(Error::Stream("message_stop arrived without a stop reason".into()));
+                            yield Err(Error::Stream {
+                                message: "message_stop arrived without a stop reason".into(),
+                                partial: result,
+                            });
                         } else {
                             yield Ok(Event::Done(Box::new(result)));
                         }
                         return;
                     }
-                    _ => {}
-                }
+                _ => {}
             }
         }
 
