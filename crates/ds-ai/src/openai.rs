@@ -1,11 +1,13 @@
 use crate::{
     CacheRetention, Content, Context, Error, Event, InputContent, Message, Response,
-    ResponseStream, StopReason, TimeoutPhase, ToolCall, ToolResult, Usage, http, json, retry,
-    schema, transport, types::OpenAiReplay,
+    ResponseMetadata, ResponseStream, StopReason, TimeoutPhase, ToolCall, ToolResult, Usage, http,
+    json, retry, schema, transport, types::OpenAiReplay,
 };
 use async_stream::stream;
+use futures_core::Stream;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, pin::Pin, time::Duration};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -642,29 +644,52 @@ pub(crate) fn decode_stream(
     overall_deadline: Option<Instant>,
 ) -> ResponseStream {
     let metadata = http::metadata(response.headers());
+    let mut events = transport::EventStream::new(
+        response,
+        stream_cancellation,
+        first_event_timeout,
+        idle_timeout,
+        overall_deadline,
+    );
+    let events = stream! {
+        loop {
+            match events.next().await {
+                Ok(Some(data)) => yield Ok(data),
+                Ok(None) => return,
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            }
+        }
+    };
+    decode_events(Box::pin(events), response_model, metadata)
+}
+
+pub(crate) type ProviderEvents =
+    Pin<Box<dyn Stream<Item = Result<String, transport::ReadError>> + Send>>;
+
+pub(crate) fn decode_events(
+    mut events: ProviderEvents,
+    response_model: String,
+    metadata: ResponseMetadata,
+) -> ResponseStream {
     let output = stream! {
-        let mut events = transport::EventStream::new(
-            response,
-            stream_cancellation,
-            first_event_timeout,
-            idle_timeout,
-            overall_deadline,
-        );
         let mut result = Response::openai(response_model);
         result.metadata = metadata;
         let mut slots = HashMap::new();
 
         loop {
             let data = match events.next().await {
-                Ok(Some(data)) => data,
-                Ok(None) => break,
-                Err(transport::ReadError::Cancelled) => {
+                Some(Ok(data)) => data,
+                None => break,
+                Some(Err(transport::ReadError::Cancelled)) => {
                     result.stop_reason = StopReason::Aborted;
                     result.raw_stop_reason = Some("cancelled".into());
                     yield Err(Error::Cancelled { partial: Some(result) });
                     return;
                 }
-                Err(transport::ReadError::Timeout(phase)) => {
+                Some(Err(transport::ReadError::Timeout(phase))) => {
                     result.stop_reason = StopReason::Error;
                     result.raw_stop_reason = Some(match phase {
                         TimeoutPhase::FirstEvent => "timeout.first_event".into(),
@@ -678,7 +703,7 @@ pub(crate) fn decode_stream(
                     });
                     return;
                 }
-                Err(transport::ReadError::Stream(message)) => {
+                Some(Err(transport::ReadError::Stream(message))) => {
                     yield Err(Error::Stream { message, partial: result });
                     return;
                 }

@@ -116,7 +116,7 @@ async fn wait_for(timeout: Option<Duration>) {
     }
 }
 
-async fn wait_until(deadline: Option<Instant>) {
+pub(crate) async fn wait_until(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => pending().await,
