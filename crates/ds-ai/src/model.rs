@@ -1,6 +1,7 @@
 use crate::Usage;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, marker::PhantomData, ops::Deref};
+use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Api {
@@ -244,6 +245,75 @@ pub struct Model {
     pub compat: Option<ModelCompatibility>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApiModel<O: crate::ApiOptions> {
+    model: Model,
+    options: PhantomData<fn() -> O>,
+}
+
+impl<O: crate::ApiOptions> ApiModel<O> {
+    pub fn new(model: Model) -> Result<Self, ApiModelError> {
+        let expected = O::api();
+        if model.api != expected {
+            return Err(ApiModelError {
+                actual: model.api,
+                expected,
+            });
+        }
+        Ok(Self {
+            model,
+            options: PhantomData,
+        })
+    }
+
+    pub fn as_model(&self) -> &Model {
+        &self.model
+    }
+
+    pub fn into_model(self) -> Model {
+        self.model
+    }
+}
+
+impl<O: crate::ApiOptions> Deref for ApiModel<O> {
+    type Target = Model;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_model()
+    }
+}
+
+impl<O: crate::ApiOptions> AsRef<Model> for ApiModel<O> {
+    fn as_ref(&self) -> &Model {
+        self.as_model()
+    }
+}
+
+impl<O: crate::ApiOptions> Serialize for ApiModel<O> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.model.serialize(serializer)
+    }
+}
+
+impl<'de, O: crate::ApiOptions> Deserialize<'de> for ApiModel<O> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(Model::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("model API {actual} does not match options API {expected}")]
+pub struct ApiModelError {
+    pub actual: Api,
+    pub expected: Api,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelWire {
@@ -301,6 +371,10 @@ impl<'de> Deserialize<'de> for Model {
 }
 
 impl Model {
+    pub fn typed<O: crate::ApiOptions>(&self) -> Result<ApiModel<O>, ApiModelError> {
+        ApiModel::new(self.clone())
+    }
+
     pub fn supported_thinking_levels(&self) -> Vec<ThinkingLevel> {
         if !self.reasoning {
             return vec![ThinkingLevel::Off];

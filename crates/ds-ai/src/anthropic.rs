@@ -60,6 +60,14 @@ impl Provider {
 }
 
 pub fn stream(
+    model: &crate::AnthropicModel,
+    context: &Context,
+    options: &crate::AnthropicOptions,
+) -> crate::AssistantMessageEventStream {
+    stream_model(model.as_model(), context, options)
+}
+
+fn stream_model(
     model: &crate::Model,
     context: &Context,
     options: &crate::AnthropicOptions,
@@ -168,7 +176,7 @@ impl crate::Provider for Provider {
                 Error::InvalidRequest("Anthropic Messages options are required".into()),
             );
         };
-        stream(model, context, options)
+        stream_model(model, context, options)
     }
 
     fn stream_simple(
@@ -200,7 +208,7 @@ impl crate::Provider for Provider {
                 stream_options.max_tokens = Some(max_tokens);
                 budget.min(max_tokens.saturating_sub(1024))
             });
-        stream(
+        stream_model(
             model,
             context,
             &crate::AnthropicOptions {

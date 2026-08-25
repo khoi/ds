@@ -1461,7 +1461,11 @@ async fn cancels_an_active_anthropic_stream_with_partial_content() {
     let context = Context::new([Message::user("Hello")]);
     let cancellation = tokio_util::sync::CancellationToken::new();
     let options = options(|stream| stream.cancellation = cancellation.clone());
-    let mut response = anthropic::stream(&model, &context, &options);
+    let mut response = anthropic::stream(
+        &model.typed::<ds_ai::AnthropicOptions>().unwrap(),
+        &context,
+        &options,
+    );
 
     while !matches!(
         response.next().await,
@@ -1533,7 +1537,11 @@ async fn accepts_an_anthropic_stream_body_after_the_header_timeout() {
         stream.timeout = Some(std::time::Duration::from_secs(5));
         stream.cancellation = cancellation.clone();
     });
-    let mut response = anthropic::stream(&model, &context, &options);
+    let mut response = anthropic::stream(
+        &model.typed::<ds_ai::AnthropicOptions>().unwrap(),
+        &context,
+        &options,
+    );
     assert!(matches!(
         response.next().await,
         Some(AssistantMessageEvent::Start { .. })
@@ -2078,7 +2086,11 @@ async fn auth_request(
         ..Default::default()
     };
     models
-        .complete_simple(&model, &Context::new([Message::user("Hello")]), &options)
+        .complete_simple(
+            &model.typed::<ds_ai::AnthropicOptions>().unwrap(),
+            &Context::new([Message::user("Hello")]),
+            &options,
+        )
         .await
         .unwrap();
     server.requests().await.pop().unwrap()
@@ -2160,7 +2172,13 @@ async fn events(
     context: &Context,
     options: &AnthropicOptions,
 ) -> Vec<AssistantMessageEvent> {
-    anthropic::stream(model, context, options).collect().await
+    anthropic::stream(
+        &model.typed::<ds_ai::AnthropicOptions>().unwrap(),
+        context,
+        options,
+    )
+    .collect()
+    .await
 }
 
 fn text(value: &str) -> AssistantContent {

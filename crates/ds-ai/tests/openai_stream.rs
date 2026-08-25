@@ -1750,7 +1750,11 @@ async fn cancels_an_active_openai_stream_with_partial_content() {
     let context = Context::new([Message::user("Hello")]);
     let cancellation = tokio_util::sync::CancellationToken::new();
     let options = options(|options| options.stream.cancellation = cancellation.clone());
-    let mut response = openai::stream(&model, &context, &options);
+    let mut response = openai::stream(
+        &model.typed::<ds_ai::OpenAiResponsesOptions>().unwrap(),
+        &context,
+        &options,
+    );
 
     while !matches!(
         response.next().await,
@@ -1832,7 +1836,11 @@ async fn accepts_an_openai_stream_body_after_the_header_timeout() {
         options.stream.timeout = Some(std::time::Duration::from_secs(5));
         options.stream.cancellation = cancellation.clone();
     });
-    let mut response = openai::stream(&model, &context, &options);
+    let mut response = openai::stream(
+        &model.typed::<ds_ai::OpenAiResponsesOptions>().unwrap(),
+        &context,
+        &options,
+    );
     assert!(matches!(
         response.next().await,
         Some(AssistantMessageEvent::Start { .. })
@@ -2061,7 +2069,13 @@ async fn events(
     context: &Context,
     options: &OpenAiResponsesOptions,
 ) -> Vec<AssistantMessageEvent> {
-    openai::stream(model, context, options).collect().await
+    openai::stream(
+        &model.typed::<ds_ai::OpenAiResponsesOptions>().unwrap(),
+        context,
+        options,
+    )
+    .collect()
+    .await
 }
 
 fn text(value: &str, signature: Option<(&str, Option<&str>)>) -> AssistantContent {

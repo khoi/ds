@@ -32,8 +32,9 @@ pub use auth::{
     ModelAuth, OAuthAuth, ProviderAuth, SystemAuthContext,
 };
 pub use catalog::{
-    CatalogError, CatalogInfo, anthropic_models, builtin_catalog_info, builtin_model,
-    builtin_models, builtin_provider_models, builtin_providers, codex_models, openai_models,
+    CatalogError, CatalogInfo, anthropic_models, builtin_anthropic_model, builtin_catalog_info,
+    builtin_codex_model, builtin_model, builtin_models, builtin_openai_model,
+    builtin_provider_models, builtin_providers, codex_models, openai_models,
     validate_builtin_catalog, validate_model_catalog,
 };
 
@@ -52,13 +53,14 @@ pub use message::{
     AssistantToolCall, DiagnosticError, ImageContent, TextContent, ThinkingContent,
 };
 pub use model::{
-    AnthropicFallbackModel, AnthropicMessagesCompatibility, Api, Model, ModelCompatibility,
-    ModelCost, ModelCostRates, ModelCostTier, ModelInput, OpenAiResponsesCompatibility, ProviderId,
-    SessionAffinityFormat, ThinkingLevel,
+    AnthropicFallbackModel, AnthropicMessagesCompatibility, Api, ApiModel, ApiModelError, Model,
+    ModelCompatibility, ModelCost, ModelCostRates, ModelCostTier, ModelInput,
+    OpenAiResponsesCompatibility, ProviderId, SessionAffinityFormat, ThinkingLevel,
 };
 pub use overflow::{is_context_overflow, is_recoverable_length};
 pub use provider::{
-    AnthropicOptions, ApiStreamOptions, HeaderHook, Models, OpenAiCodexResponsesOptions,
+    AnthropicModel, AnthropicOptions, ApiOptions, ApiStreamOptions, HeaderHook, Models,
+    OpenAiCodexResponsesModel, OpenAiCodexResponsesOptions, OpenAiResponsesModel,
     OpenAiResponsesOptions, PayloadHook, Provider, ProviderResponse, ResponseHook,
     SimpleStreamOptions, StreamOptions, ThinkingBudgets, ToolChoice, Transport,
 };

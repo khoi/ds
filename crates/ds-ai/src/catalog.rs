@@ -68,6 +68,22 @@ pub fn builtin_model(provider: &str, id: &str) -> Option<Model> {
         .cloned()
 }
 
+pub fn builtin_openai_model(id: &str) -> Option<crate::OpenAiResponsesModel> {
+    builtin_model("openai", id)
+        .map(|model| crate::ApiModel::new(model).expect("validated OpenAI Responses model catalog"))
+}
+
+pub fn builtin_anthropic_model(id: &str) -> Option<crate::AnthropicModel> {
+    builtin_model("anthropic", id)
+        .map(|model| crate::ApiModel::new(model).expect("validated Anthropic model catalog"))
+}
+
+pub fn builtin_codex_model(id: &str) -> Option<crate::OpenAiCodexResponsesModel> {
+    builtin_model("openai-codex", id).map(|model| {
+        crate::ApiModel::new(model).expect("validated OpenAI Codex Responses model catalog")
+    })
+}
+
 pub fn builtin_provider_models(provider: &str) -> &'static [Model] {
     match provider {
         "openai" => openai_models(),

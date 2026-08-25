@@ -311,6 +311,45 @@ pub struct OpenAiCodexResponsesOptions {
     pub tool_choice: Option<crate::codex::ToolChoice>,
 }
 
+pub trait ApiOptions: Clone + fmt::Debug + Send + Sync + 'static {
+    fn api() -> crate::Api;
+    fn erase(self) -> ApiStreamOptions;
+}
+
+impl ApiOptions for OpenAiResponsesOptions {
+    fn api() -> crate::Api {
+        crate::Api::OpenAiResponses
+    }
+
+    fn erase(self) -> ApiStreamOptions {
+        ApiStreamOptions::OpenAiResponses(self)
+    }
+}
+
+impl ApiOptions for AnthropicOptions {
+    fn api() -> crate::Api {
+        crate::Api::AnthropicMessages
+    }
+
+    fn erase(self) -> ApiStreamOptions {
+        ApiStreamOptions::AnthropicMessages(self)
+    }
+}
+
+impl ApiOptions for OpenAiCodexResponsesOptions {
+    fn api() -> crate::Api {
+        crate::Api::OpenAiCodexResponses
+    }
+
+    fn erase(self) -> ApiStreamOptions {
+        ApiStreamOptions::OpenAiCodexResponses(self)
+    }
+}
+
+pub type OpenAiResponsesModel = crate::ApiModel<OpenAiResponsesOptions>;
+pub type AnthropicModel = crate::ApiModel<AnthropicOptions>;
+pub type OpenAiCodexResponsesModel = crate::ApiModel<OpenAiCodexResponsesOptions>;
+
 #[derive(Clone, Debug)]
 pub enum ApiStreamOptions {
     OpenAiResponses(OpenAiResponsesOptions),
@@ -461,7 +500,16 @@ impl Models {
             .find(|model| model.id == id)
     }
 
-    pub fn stream(
+    pub fn stream<O: ApiOptions>(
+        &self,
+        model: &crate::ApiModel<O>,
+        context: &Context,
+        options: &O,
+    ) -> AssistantMessageEventStream {
+        self.stream_erased(model.as_model(), context, &options.clone().erase())
+    }
+
+    fn stream_erased(
         &self,
         model: &Model,
         context: &Context,
@@ -500,16 +548,25 @@ impl Models {
         })
     }
 
-    pub async fn complete(
+    pub async fn complete<O: ApiOptions>(
         &self,
-        model: &Model,
+        model: &crate::ApiModel<O>,
         context: &Context,
-        options: &ApiStreamOptions,
+        options: &O,
     ) -> Result<AssistantMessage, AssistantMessageStreamError> {
         self.stream(model, context, options).result().await
     }
 
-    pub fn stream_simple(
+    pub fn stream_simple<O: ApiOptions>(
+        &self,
+        model: &crate::ApiModel<O>,
+        context: &Context,
+        options: &SimpleStreamOptions,
+    ) -> AssistantMessageEventStream {
+        self.stream_simple_erased(model.as_model(), context, options)
+    }
+
+    fn stream_simple_erased(
         &self,
         model: &Model,
         context: &Context,
@@ -559,13 +616,23 @@ impl Models {
         })
     }
 
-    pub async fn complete_simple(
+    pub async fn complete_simple<O: ApiOptions>(
         &self,
-        model: &Model,
+        model: &crate::ApiModel<O>,
         context: &Context,
         options: &SimpleStreamOptions,
     ) -> Result<AssistantMessage, AssistantMessageStreamError> {
         self.stream_simple(model, context, options).result().await
+    }
+
+    pub fn api_model<O: ApiOptions>(
+        &self,
+        provider: &str,
+        id: &str,
+    ) -> Result<Option<crate::ApiModel<O>>, crate::ApiModelError> {
+        self.model(provider, id)
+            .map(|model| crate::ApiModel::new(model))
+            .transpose()
     }
 
     pub async fn auth(

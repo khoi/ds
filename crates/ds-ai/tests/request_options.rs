@@ -25,7 +25,9 @@ async fn uses_a_custom_http_client_for_each_api() {
     let mut openai_model = builtin_model("openai", "gpt-5.6-sol").unwrap();
     openai_model.base_url = openai_server.base_url.clone();
     ds_ai::openai::stream(
-        &openai_model,
+        &openai_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
         &Context::new([Message::user("Hello")]),
         &OpenAiResponsesOptions {
             stream: StreamOptions {
@@ -44,7 +46,7 @@ async fn uses_a_custom_http_client_for_each_api() {
     let mut anthropic_model = builtin_model("anthropic", "claude-opus-4-5").unwrap();
     anthropic_model.base_url = anthropic_server.base_url.clone();
     ds_ai::anthropic::stream(
-        &anthropic_model,
+        &anthropic_model.typed::<ds_ai::AnthropicOptions>().unwrap(),
         &Context::new([Message::user("Hello")]),
         &AnthropicOptions {
             stream: StreamOptions {
@@ -63,7 +65,9 @@ async fn uses_a_custom_http_client_for_each_api() {
     let mut codex_model = builtin_model("openai-codex", "gpt-5.6-sol").unwrap();
     codex_model.base_url = codex_server.base_url.clone();
     ds_ai::codex::stream(
-        &codex_model,
+        &codex_model
+            .typed::<ds_ai::OpenAiCodexResponsesOptions>()
+            .unwrap(),
         &Context::new([Message::user("Hello")]),
         &OpenAiCodexResponsesOptions {
             stream: StreamOptions {
@@ -188,10 +192,14 @@ async fn forces_anthropic_payloads_to_stream_after_hook_replacement() {
             ..Default::default()
         };
 
-        ds_ai::anthropic::stream(&model, &Context::new([Message::user("Hello")]), &options)
-            .result()
-            .await
-            .unwrap();
+        ds_ai::anthropic::stream(
+            &model.typed::<ds_ai::AnthropicOptions>().unwrap(),
+            &Context::new([Message::user("Hello")]),
+            &options,
+        )
+        .result()
+        .await
+        .unwrap();
 
         let request = server.requests().await.pop().unwrap();
         assert_eq!(request_json(&request), expected);
@@ -342,9 +350,9 @@ async fn sends_transformed_models_headers_on_the_provider_request() {
 
     models
         .complete(
-            &model,
+            &model.typed::<ds_ai::OpenAiResponsesOptions>().unwrap(),
             &Context::new([Message::user("Hello")]),
-            &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+            &OpenAiResponsesOptions {
                 stream: StreamOptions {
                     api_key: Some("test-key".into()),
                     headers: [
@@ -361,7 +369,7 @@ async fn sends_transformed_models_headers_on_the_provider_request() {
                     Ok(headers)
                 }),
                 ..Default::default()
-            }),
+            },
         )
         .await
         .unwrap();

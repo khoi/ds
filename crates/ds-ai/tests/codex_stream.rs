@@ -855,7 +855,11 @@ async fn cancels_an_active_codex_sse_body_with_partial_content() {
         options.stream.cancellation = cancellation.clone();
         options.stream.transport = Some(ProviderTransport::Sse);
     });
-    let mut stream = codex::stream(&model, &Context::new([Message::user("Cancel")]), &options);
+    let mut stream = codex::stream(
+        &model.typed::<ds_ai::OpenAiCodexResponsesOptions>().unwrap(),
+        &Context::new([Message::user("Cancel")]),
+        &options,
+    );
 
     while !matches!(
         stream.next().await,
@@ -2681,7 +2685,13 @@ async fn events(
     context: &Context,
     options: &OpenAiCodexResponsesOptions,
 ) -> Vec<AssistantMessageEvent> {
-    codex::stream(model, context, options).collect().await
+    codex::stream(
+        &model.typed::<ds_ai::OpenAiCodexResponsesOptions>().unwrap(),
+        context,
+        options,
+    )
+    .collect()
+    .await
 }
 
 fn assert_text(message: &AssistantMessage, expected: &str) {

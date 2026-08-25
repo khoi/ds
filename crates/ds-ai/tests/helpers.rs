@@ -234,7 +234,9 @@ async fn preserves_structured_provider_error_fields() {
         ..Default::default()
     };
     let events = openai::stream(
-        &provider_model,
+        &provider_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
         &Context::new([Message::user("Hello")]),
         &options,
     )
@@ -282,9 +284,15 @@ async fn preserves_nested_provider_codes_and_metadata_once() {
     };
     let context = Context::new([Message::user("Hello")]);
 
-    let structured = openai::stream(&provider_model, &context, &options)
-        .collect::<Vec<_>>()
-        .await;
+    let structured = openai::stream(
+        &provider_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
+        &context,
+        &options,
+    )
+    .collect::<Vec<_>>()
+    .await;
     let Some(AssistantMessageEvent::Error { error, .. }) = structured.last() else {
         panic!("stream did not fail");
     };
@@ -294,9 +302,15 @@ async fn preserves_nested_provider_codes_and_metadata_once() {
         r#"OpenAI API error (400): {"code":"rate_limit_exceeded","message":"slow down","metadata":{"raw":"upstream WAF blocked policy XYZ"}}"#
     );
 
-    let simple = openai::stream(&provider_model, &context, &options)
-        .collect::<Vec<_>>()
-        .await;
+    let simple = openai::stream(
+        &provider_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
+        &context,
+        &options,
+    )
+    .collect::<Vec<_>>()
+    .await;
     let Some(AssistantMessageEvent::Error { error, .. }) = simple.last() else {
         panic!("stream did not fail");
     };
@@ -305,9 +319,15 @@ async fn preserves_nested_provider_codes_and_metadata_once() {
         Some(r#"OpenAI API error (400): {"message":"slow down"}"#)
     );
 
-    let empty_inner = openai::stream(&provider_model, &context, &options)
-        .collect::<Vec<_>>()
-        .await;
+    let empty_inner = openai::stream(
+        &provider_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
+        &context,
+        &options,
+    )
+    .collect::<Vec<_>>()
+    .await;
     let Some(AssistantMessageEvent::Error { error, .. }) = empty_inner.last() else {
         panic!("stream did not fail");
     };
@@ -316,9 +336,15 @@ async fn preserves_nested_provider_codes_and_metadata_once() {
         Some("OpenAI API error (403): 403 {}")
     );
 
-    let top_level = openai::stream(&provider_model, &context, &options)
-        .collect::<Vec<_>>()
-        .await;
+    let top_level = openai::stream(
+        &provider_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
+        &context,
+        &options,
+    )
+    .collect::<Vec<_>>()
+    .await;
     let Some(AssistantMessageEvent::Error { error, .. }) = top_level.last() else {
         panic!("stream did not fail");
     };
@@ -342,7 +368,9 @@ async fn rejects_a_provider_error_body_read_failure() {
         ..Default::default()
     };
     let events = openai::stream(
-        &provider_model,
+        &provider_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
         &Context::new([Message::user("Hello")]),
         &options,
     )

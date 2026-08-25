@@ -32,7 +32,9 @@ async fn normalizes_a_cross_provider_tool_transcript() {
     let mut source_model = builtin_model("openai", "gpt-5.6-sol").unwrap();
     source_model.base_url = source_server.base_url.clone();
     let mut source_stream = openai::stream(
-        &source_model,
+        &source_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
         &Context::new([Message::user("Run")]),
         &OpenAiResponsesOptions {
             stream: StreamOptions {
@@ -64,7 +66,7 @@ async fn normalizes_a_cross_provider_tool_transcript() {
     ]);
 
     anthropic::stream(
-        &target_model,
+        &target_model.typed::<ds_ai::AnthropicOptions>().unwrap(),
         &target_context,
         &AnthropicOptions {
             stream: StreamOptions {
@@ -262,7 +264,7 @@ async fn replays_an_anthropic_transcript_to_openai() {
     let mut source_model = builtin_model("anthropic", "claude-sonnet-4-5").unwrap();
     source_model.base_url = source_server.base_url.clone();
     let source = anthropic::stream(
-        &source_model,
+        &source_model.typed::<ds_ai::AnthropicOptions>().unwrap(),
         &Context::new([Message::user("Run")]),
         &AnthropicOptions {
             stream: StreamOptions {
@@ -283,7 +285,9 @@ async fn replays_an_anthropic_transcript_to_openai() {
     let mut target_model = builtin_model("openai", "gpt-5.6-sol").unwrap();
     target_model.base_url = target_server.base_url.clone();
     openai::stream(
-        &target_model,
+        &target_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
         &Context::new([
             Message::user("Run"),
             Message::assistant(source),
@@ -544,7 +548,9 @@ async fn accepts_empty_turns_for_all_selected_provider_apis() {
     };
     for context in empty_contexts(&openai_source) {
         openai::stream(
-            &openai_model,
+            &openai_model
+                .typed::<ds_ai::OpenAiResponsesOptions>()
+                .unwrap(),
             &context,
             &OpenAiResponsesOptions {
                 stream: StreamOptions {
@@ -597,7 +603,7 @@ async fn accepts_empty_turns_for_all_selected_provider_apis() {
     };
     for context in empty_contexts(&anthropic_source) {
         anthropic::stream(
-            &anthropic_model,
+            &anthropic_model.typed::<ds_ai::AnthropicOptions>().unwrap(),
             &context,
             &AnthropicOptions {
                 stream: StreamOptions {
@@ -638,7 +644,9 @@ async fn accepts_empty_turns_for_all_selected_provider_apis() {
     };
     for context in empty_contexts(&codex_source) {
         codex::stream(
-            &codex_model,
+            &codex_model
+                .typed::<ds_ai::OpenAiCodexResponsesOptions>()
+                .unwrap(),
             &context,
             &OpenAiCodexResponsesOptions {
                 stream: StreamOptions {
@@ -669,7 +677,9 @@ async fn cancels_selected_provider_streams_and_preserves_provider_usage() {
     openai_model.base_url = openai_server.base_url.clone();
     let openai_cancellation = CancellationToken::new();
     let mut openai_stream = openai::stream(
-        &openai_model,
+        &openai_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
         &Context::new([Message::user("Cancel")]),
         &OpenAiResponsesOptions {
             stream: StreamOptions {
@@ -695,7 +705,7 @@ async fn cancels_selected_provider_streams_and_preserves_provider_usage() {
     anthropic_model.base_url = anthropic_server.base_url.clone();
     let anthropic_cancellation = CancellationToken::new();
     let mut anthropic_stream = anthropic::stream(
-        &anthropic_model,
+        &anthropic_model.typed::<ds_ai::AnthropicOptions>().unwrap(),
         &Context::new([Message::user("Cancel")]),
         &AnthropicOptions {
             stream: StreamOptions {
@@ -724,7 +734,9 @@ async fn cancels_selected_provider_streams_and_preserves_provider_usage() {
     codex_model.base_url = codex_server.base_url.clone();
     let codex_cancellation = CancellationToken::new();
     let mut codex_stream = codex::stream(
-        &codex_model,
+        &codex_model
+            .typed::<ds_ai::OpenAiCodexResponsesOptions>()
+            .unwrap(),
         &Context::new([Message::user("Cancel")]),
         &OpenAiCodexResponsesOptions {
             stream: StreamOptions {
@@ -751,7 +763,9 @@ async fn rejects_already_cancelled_requests_without_connecting() {
     let openai_cancellation = CancellationToken::new();
     openai_cancellation.cancel();
     let openai_response = openai::stream(
-        &openai_model,
+        &openai_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
         &Context::new([Message::user("Cancel")]),
         &OpenAiResponsesOptions {
             stream: StreamOptions {
@@ -778,7 +792,7 @@ async fn rejects_already_cancelled_requests_without_connecting() {
     let anthropic_cancellation = CancellationToken::new();
     anthropic_cancellation.cancel();
     let anthropic_response = anthropic::stream(
-        &anthropic_model,
+        &anthropic_model.typed::<ds_ai::AnthropicOptions>().unwrap(),
         &Context::new([Message::user("Cancel")]),
         &AnthropicOptions {
             stream: StreamOptions {
@@ -805,7 +819,9 @@ async fn rejects_already_cancelled_requests_without_connecting() {
     let codex_cancellation = CancellationToken::new();
     codex_cancellation.cancel();
     let codex_response = codex::stream(
-        &codex_model,
+        &codex_model
+            .typed::<ds_ai::OpenAiCodexResponsesOptions>()
+            .unwrap(),
         &Context::new([Message::user("Cancel")]),
         &OpenAiCodexResponsesOptions {
             stream: StreamOptions {
@@ -835,7 +851,9 @@ async fn completes_a_follow_up_after_cancelling_each_provider() {
     openai_model.base_url = openai_server.base_url.clone();
     let openai_cancellation = CancellationToken::new();
     let mut openai_stream = openai::stream(
-        &openai_model,
+        &openai_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
         &Context::new([Message::user("Start")]),
         &OpenAiResponsesOptions {
             stream: StreamOptions {
@@ -852,7 +870,9 @@ async fn completes_a_follow_up_after_cancelling_each_provider() {
     let openai_followup_server = serve([Reply::sse(openai_done())]).await;
     openai_model.base_url = openai_followup_server.base_url.clone();
     let openai_followup = openai::stream(
-        &openai_model,
+        &openai_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
         &Context::new([
             Message::user("Start"),
             Message::assistant(openai_aborted),
@@ -890,7 +910,7 @@ async fn completes_a_follow_up_after_cancelling_each_provider() {
     anthropic_model.base_url = anthropic_server.base_url.clone();
     let anthropic_cancellation = CancellationToken::new();
     let mut anthropic_stream = anthropic::stream(
-        &anthropic_model,
+        &anthropic_model.typed::<ds_ai::AnthropicOptions>().unwrap(),
         &Context::new([Message::user("Start")]),
         &AnthropicOptions {
             stream: StreamOptions {
@@ -907,7 +927,7 @@ async fn completes_a_follow_up_after_cancelling_each_provider() {
     let anthropic_followup_server = serve([Reply::sse(anthropic_followup_done())]).await;
     anthropic_model.base_url = anthropic_followup_server.base_url.clone();
     let anthropic_followup = anthropic::stream(
-        &anthropic_model,
+        &anthropic_model.typed::<ds_ai::AnthropicOptions>().unwrap(),
         &Context::new([
             Message::user("Start"),
             Message::assistant(anthropic_aborted),
@@ -946,7 +966,9 @@ async fn completes_a_follow_up_after_cancelling_each_provider() {
     codex_model.base_url = codex_server.base_url.clone();
     let codex_cancellation = CancellationToken::new();
     let mut codex_stream = codex::stream(
-        &codex_model,
+        &codex_model
+            .typed::<ds_ai::OpenAiCodexResponsesOptions>()
+            .unwrap(),
         &Context::new([Message::user("Start")]),
         &OpenAiCodexResponsesOptions {
             stream: StreamOptions {
@@ -964,7 +986,9 @@ async fn completes_a_follow_up_after_cancelling_each_provider() {
     let codex_followup_server = serve([Reply::sse(codex_done())]).await;
     codex_model.base_url = codex_followup_server.base_url.clone();
     let codex_followup = codex::stream(
-        &codex_model,
+        &codex_model
+            .typed::<ds_ai::OpenAiCodexResponsesOptions>()
+            .unwrap(),
         &Context::new([
             Message::user("Start"),
             Message::assistant(codex_aborted),
@@ -1010,7 +1034,9 @@ async fn preserves_totals_and_cache_accounting_across_consecutive_calls() {
     openai_model.base_url = openai_server.base_url.clone();
     let openai_context = Context::new([Message::user("Cache this context")]);
     let openai_first = openai::stream(
-        &openai_model,
+        &openai_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
         &openai_context,
         &OpenAiResponsesOptions {
             stream: StreamOptions {
@@ -1027,7 +1053,9 @@ async fn preserves_totals_and_cache_accounting_across_consecutive_calls() {
     .unwrap();
     assert_usage_totals(&openai_first.usage, 20, 2, 0, 80, 102);
     let openai_second = openai::stream(
-        &openai_model,
+        &openai_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
         &openai_context,
         &OpenAiResponsesOptions {
             stream: StreamOptions {
@@ -1058,7 +1086,7 @@ async fn preserves_totals_and_cache_accounting_across_consecutive_calls() {
     anthropic_model.base_url = anthropic_server.base_url.clone();
     let anthropic_context = Context::new([Message::user("Cache this context")]);
     let anthropic_first = anthropic::stream(
-        &anthropic_model,
+        &anthropic_model.typed::<ds_ai::AnthropicOptions>().unwrap(),
         &anthropic_context,
         &AnthropicOptions {
             stream: StreamOptions {
@@ -1075,7 +1103,7 @@ async fn preserves_totals_and_cache_accounting_across_consecutive_calls() {
     .unwrap();
     assert_usage_totals(&anthropic_first.usage, 20, 2, 0, 80, 102);
     let anthropic_second = anthropic::stream(
-        &anthropic_model,
+        &anthropic_model.typed::<ds_ai::AnthropicOptions>().unwrap(),
         &anthropic_context,
         &AnthropicOptions {
             stream: StreamOptions {
@@ -1102,7 +1130,9 @@ async fn preserves_totals_and_cache_accounting_across_consecutive_calls() {
     codex_model.base_url = codex_server.base_url.clone();
     let codex_context = Context::new([Message::user("Cache this context")]);
     let codex_first = codex::stream(
-        &codex_model,
+        &codex_model
+            .typed::<ds_ai::OpenAiCodexResponsesOptions>()
+            .unwrap(),
         &codex_context,
         &OpenAiCodexResponsesOptions {
             stream: StreamOptions {
@@ -1120,7 +1150,9 @@ async fn preserves_totals_and_cache_accounting_across_consecutive_calls() {
     .unwrap();
     assert_usage_totals(&codex_first.usage, 20, 2, 0, 80, 102);
     let codex_second = codex::stream(
-        &codex_model,
+        &codex_model
+            .typed::<ds_ai::OpenAiCodexResponsesOptions>()
+            .unwrap(),
         &codex_context,
         &OpenAiCodexResponsesOptions {
             stream: StreamOptions {

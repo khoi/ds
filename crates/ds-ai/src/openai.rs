@@ -41,6 +41,14 @@ impl Provider {
 }
 
 pub fn stream(
+    model: &crate::OpenAiResponsesModel,
+    context: &Context,
+    options: &crate::OpenAiResponsesOptions,
+) -> crate::AssistantMessageEventStream {
+    stream_model(model.as_model(), context, options)
+}
+
+fn stream_model(
     model: &crate::Model,
     context: &Context,
     options: &crate::OpenAiResponsesOptions,
@@ -178,7 +186,7 @@ impl crate::Provider for Provider {
                 Error::InvalidRequest("OpenAI Responses options are required".into()),
             );
         };
-        stream(model, context, options)
+        stream_model(model, context, options)
     }
 
     fn stream_simple(
@@ -189,7 +197,7 @@ impl crate::Provider for Provider {
     ) -> crate::AssistantMessageEventStream {
         let stream_options =
             crate::provider::build_simple_stream_options(model, context, options.stream.clone());
-        stream(
+        stream_model(
             model,
             context,
             &crate::OpenAiResponsesOptions {

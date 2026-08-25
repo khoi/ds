@@ -11,7 +11,7 @@ async fn openai_live_smoke() {
         model.base_url = base_url;
     }
     let stream = ds_ai::openai::stream(
-        &model,
+        &model.typed::<ds_ai::OpenAiResponsesOptions>().unwrap(),
         &Context::new([Message::user("Reply with OK")]),
         &OpenAiResponsesOptions {
             stream: StreamOptions {
@@ -32,7 +32,7 @@ async fn anthropic_live_smoke() {
         model.base_url = base_url;
     }
     let stream = ds_ai::anthropic::stream(
-        &model,
+        &model.typed::<ds_ai::AnthropicOptions>().unwrap(),
         &Context::new([Message::user("Reply with OK")]),
         &AnthropicOptions {
             stream: StreamOptions {
@@ -53,7 +53,7 @@ async fn codex_live_smoke() {
         model.base_url = base_url;
     }
     let stream = ds_ai::codex::stream(
-        &model,
+        &model.typed::<ds_ai::OpenAiCodexResponsesOptions>().unwrap(),
         &Context::new([Message::user("Reply with OK")]),
         &OpenAiCodexResponsesOptions {
             stream: StreamOptions {

@@ -91,7 +91,7 @@ async fn registers_replaces_lists_routes_and_deletes_providers() {
     models.set_provider(provider(&model, "replacement"));
     let result = models
         .complete(
-            &model,
+            &model.typed().unwrap(),
             &Context::new([]),
             &api_options(StreamOptions {
                 api_key: Some("test-key".into()),
@@ -114,7 +114,7 @@ async fn returns_terminal_stream_errors_for_unknown_providers() {
     let model = model("missing", "gpt-test");
     let result = collection()
         .complete(
-            &model,
+            &model.typed().unwrap(),
             &Context::new([]),
             &api_options(StreamOptions::default()),
         )
@@ -135,15 +135,15 @@ async fn returns_terminal_stream_errors_for_unknown_provider_apis() {
     models.set_provider(Arc::new(ds_ai::openai::Provider::new([model.clone()])));
     let result = models
         .complete(
-            &model,
+            &model.typed::<ds_ai::AnthropicOptions>().unwrap(),
             &Context::new([]),
-            &ApiStreamOptions::AnthropicMessages(ds_ai::AnthropicOptions {
+            &ds_ai::AnthropicOptions {
                 stream: StreamOptions {
                     api_key: Some("test-key".into()),
                     ..Default::default()
                 },
                 ..Default::default()
-            }),
+            },
         )
         .await
         .unwrap();
@@ -177,7 +177,7 @@ async fn openai_provider_returns_a_stream_before_setup_and_emits_provider_events
 
     let events = models
         .stream(
-            &model,
+            &model.typed().unwrap(),
             &Context::new([ds_ai::Message::user("Hello")]),
             &options,
         )
@@ -374,7 +374,7 @@ async fn merges_model_auth_and_request_headers_once() {
     }));
     models
         .complete(
-            &model,
+            &model.typed().unwrap(),
             &Context::new([]),
             &api_options(StreamOptions {
                 api_key: Some("key".into()),
@@ -420,7 +420,7 @@ async fn transforms_final_headers_before_provider_dispatch() {
     let transformed_for_hook = transformed.clone();
     models
         .complete(
-            &model,
+            &model.typed().unwrap(),
             &Context::new([]),
             &api_options(StreamOptions {
                 api_key: Some("key".into()),
@@ -521,7 +521,7 @@ async fn returns_header_transform_errors_before_provider_dispatch() {
 
     let result = models
         .complete(
-            &model,
+            &model.typed().unwrap(),
             &Context::new([]),
             &api_options(
                 StreamOptions {
@@ -557,7 +557,7 @@ async fn cancels_model_auth_before_provider_dispatch() {
 
     let result = models
         .complete(
-            &model,
+            &model.typed().unwrap(),
             &Context::new([]),
             &api_options(StreamOptions {
                 api_key: Some("key".into()),
@@ -988,7 +988,7 @@ async fn preserves_auth_failure_reasons_in_stream_setup_errors() {
 
     let result = models
         .complete(
-            &model,
+            &model.typed().unwrap(),
             &Context::new([]),
             &api_options(StreamOptions::default()),
         )
@@ -1274,7 +1274,7 @@ async fn prepares_simple_options_from_the_model_and_context() {
     models.set_provider(Arc::new(ds_ai::openai::Provider::new([model.clone()])));
     models
         .complete_simple(
-            &model,
+            &model.typed::<ds_ai::OpenAiResponsesOptions>().unwrap(),
             &Context::new([ds_ai::Message::user("x".repeat(4_000))]),
             &SimpleStreamOptions {
                 stream: StreamOptions {
@@ -1296,7 +1296,9 @@ async fn prepares_simple_options_from_the_model_and_context() {
     plain_model.sampling_params.clear();
     models
         .complete_simple(
-            &plain_model,
+            &plain_model
+                .typed::<ds_ai::OpenAiResponsesOptions>()
+                .unwrap(),
             &Context::new([ds_ai::Message::user("Hello")]),
             &SimpleStreamOptions {
                 stream: StreamOptions {
@@ -1860,11 +1862,11 @@ fn model(provider: &str, id: &str) -> Model {
     }
 }
 
-fn api_options(stream: StreamOptions) -> ApiStreamOptions {
-    ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+fn api_options(stream: StreamOptions) -> OpenAiResponsesOptions {
+    OpenAiResponsesOptions {
         stream,
         ..Default::default()
-    })
+    }
 }
 
 fn completed(model: &Model, marker: &str) -> AssistantMessageEventStream {

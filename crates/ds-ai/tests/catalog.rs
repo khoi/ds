@@ -1,8 +1,8 @@
 use ds_ai::{
     Api, ModelCompatibility, ModelInput, ProviderId, ThinkingLevel, anthropic_models,
-    builtin_catalog_info, builtin_model, builtin_models, builtin_provider_models,
-    builtin_providers, codex_models, openai_models, validate_builtin_catalog,
-    validate_model_catalog,
+    builtin_anthropic_model, builtin_catalog_info, builtin_codex_model, builtin_model,
+    builtin_models, builtin_openai_model, builtin_provider_models, builtin_providers, codex_models,
+    openai_models, validate_builtin_catalog, validate_model_catalog,
 };
 
 #[test]
@@ -24,6 +24,22 @@ fn loads_and_validates_the_pinned_catalogs() {
     for models in [openai_models(), anthropic_models(), codex_models()] {
         assert!(models.windows(2).all(|pair| pair[0].id < pair[1].id));
     }
+}
+
+#[test]
+fn returns_api_typed_catalog_models() {
+    assert_eq!(
+        builtin_openai_model("gpt-5.6-sol").unwrap().api,
+        Api::OpenAiResponses
+    );
+    assert_eq!(
+        builtin_anthropic_model("claude-sonnet-5").unwrap().api,
+        Api::AnthropicMessages
+    );
+    assert_eq!(
+        builtin_codex_model("gpt-5.6-luna").unwrap().api,
+        Api::OpenAiCodexResponses
+    );
 }
 
 #[test]

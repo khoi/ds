@@ -18,7 +18,7 @@ async fn completes_a_provider_stream_from_its_result() {
     let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
     model.base_url = server.base_url.clone();
     let mut stream = ds_ai::openai::stream(
-        &model,
+        &model.typed::<ds_ai::OpenAiResponsesOptions>().unwrap(),
         &Context::new([Message::user("Complete")]),
         &OpenAiResponsesOptions {
             stream: StreamOptions {

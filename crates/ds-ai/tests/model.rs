@@ -1,6 +1,7 @@
 use ds_ai::{
-    Api, Model, ModelCompatibility, ModelCost, ModelCostRates, ModelCostTier, ModelInput,
-    OpenAiResponsesCompatibility, ProviderId, SessionAffinityFormat, ThinkingLevel, Usage,
+    AnthropicOptions, Api, Model, ModelCompatibility, ModelCost, ModelCostRates, ModelCostTier,
+    ModelInput, OpenAiResponsesCompatibility, OpenAiResponsesOptions, ProviderId,
+    SessionAffinityFormat, ThinkingLevel, Usage,
 };
 use std::collections::BTreeMap;
 
@@ -29,6 +30,17 @@ fn model() -> Model {
         headers: BTreeMap::new(),
         compat: None,
     }
+}
+
+#[test]
+fn binds_models_to_matching_api_options() {
+    let model = model();
+    let typed = model.typed::<OpenAiResponsesOptions>().unwrap();
+    assert_eq!(typed.as_model(), &model);
+
+    let error = model.typed::<AnthropicOptions>().unwrap_err();
+    assert_eq!(error.actual, Api::OpenAiResponses);
+    assert_eq!(error.expected, Api::AnthropicMessages);
 }
 
 #[test]

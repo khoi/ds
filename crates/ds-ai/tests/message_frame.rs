@@ -231,7 +231,7 @@ async fn round_trips_provider_content_from_authoritative_end_events() {
     let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
     model.base_url = server.base_url.clone();
     let mut stream = ds_ai::openai::stream(
-        &model,
+        &model.typed::<ds_ai::OpenAiResponsesOptions>().unwrap(),
         &Context::new([Message::user("Hello")]),
         &OpenAiResponsesOptions {
             stream: StreamOptions {

@@ -18,7 +18,7 @@ async fn emits_openai_content_events_from_done_items() {
     let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
     model.base_url = server.base_url.clone();
     let mut stream = ds_ai::openai::stream(
-        &model,
+        &model.typed::<ds_ai::OpenAiResponsesOptions>().unwrap(),
         &Context::new([Message::user("Hello")]),
         &OpenAiResponsesOptions {
             stream: StreamOptions {
@@ -108,7 +108,7 @@ async fn emits_codex_content_events_with_partial_identity() {
     let mut model = builtin_model("openai-codex", "gpt-5.4").unwrap();
     model.base_url = server.base_url.clone();
     let mut stream = ds_ai::codex::stream(
-        &model,
+        &model.typed::<ds_ai::OpenAiCodexResponsesOptions>().unwrap(),
         &Context::new([Message::user("Hello")]),
         &OpenAiCodexResponsesOptions {
             stream: StreamOptions {
@@ -159,7 +159,7 @@ async fn emits_anthropic_content_events_at_block_boundaries() {
     let mut model = builtin_model("anthropic", "claude-opus-4-5").unwrap();
     model.base_url = server.base_url.clone();
     let mut stream = ds_ai::anthropic::stream(
-        &model,
+        &model.typed::<ds_ai::AnthropicOptions>().unwrap(),
         &Context::new([Message::user("Hello")]),
         &AnthropicOptions {
             stream: StreamOptions {
