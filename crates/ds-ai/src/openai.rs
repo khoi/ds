@@ -1249,6 +1249,11 @@ fn openai_call_id(id: &str) -> String {
     normalize_response_id(id.split('|').next().unwrap_or(id))
 }
 
+fn response_tool_call_parts(id: &str) -> Option<(&str, &str)> {
+    let mut parts = id.split('|');
+    Some((parts.next()?, parts.next()?))
+}
+
 fn normalize_response_id(id: &str) -> String {
     id.encode_utf16()
         .map(|code_unit| match u8::try_from(code_unit) {
@@ -1264,7 +1269,7 @@ fn normalize_response_id(id: &str) -> String {
 }
 
 fn response_tool_call_id(id: &str, foreign: bool) -> String {
-    let Some((call_id, item_id)) = id.split_once('|') else {
+    let Some((call_id, item_id)) = response_tool_call_parts(id) else {
         return normalize_response_id(id);
     };
     let call_id = normalize_response_id(call_id);
@@ -1489,8 +1494,7 @@ pub(crate) fn response_input(
                                 id: normalized_id.clone(),
                                 name: call.name.clone(),
                             });
-                            let (call_id, item_id) = normalized_id
-                                .split_once('|')
+                            let (call_id, item_id) = response_tool_call_parts(&normalized_id)
                                 .map_or((normalized_id.as_str(), None), |(call_id, item_id)| {
                                     (call_id, Some(item_id))
                                 });

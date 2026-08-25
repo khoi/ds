@@ -780,13 +780,13 @@ async fn hashes_deferred_tool_loads_from_the_original_tool_result_id() {
 }
 
 #[tokio::test]
-async fn hashes_long_foreign_openai_tool_item_ids() {
+async fn uses_only_the_first_two_pipe_fields_for_long_foreign_openai_tool_item_ids() {
     let server = serve([Reply::sse(
         "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_foreign\",\"usage\":{}}}\n\n",
     )])
     .await;
     let model = model(&server.base_url);
-    let raw_id = "call_4VnzVawQXPB9MgYib7CiQFEY|I9b95oN1wD/cHXKTw3PpRkL6KkCtzTJhUxMouMWYwHeTo2j3htzfSk7YPx2vifiIM4g3A8XXyOj8q4Bt6SLUG7gqY1E3ELkrkVQNHglRfUmWj84lqxJY+Puieb3VKyX0FB+83TUzn91cDMF/4gzt990IzqVrc+nIb9RRscRD070Du16q1glydVjWR0SBJsE6TbY/esOjFpqplogQqrajm1eI++f3eLi73R6q7hVusY0QbeFySVxABCjhN0lXB04caBe1rzHjYzul6MAXj7uq+0r17VLq+yrtyYhN12wkmFqHeqTyEei6EFPbMy24Nc+IbJlkP0OCg02W+gOnyBFcbi2ctvJFSOhSjt1CqBdqCnnhwUqXjbWiT0wh3DmLScRgTHmGkaI+oAcQQjfic65nxj+TnEkReA==";
+    let raw_id = "call_4VnzVawQXPB9MgYib7CiQFEY|I9b95oN1wD/cHXKTw3PpRkL6KkCtzTJhUxMouMWYwHeTo2j3htzfSk7YPx2vifiIM4g3A8XXyOj8q4Bt6SLUG7gqY1E3ELkrkVQNHglRfUmWj84lqxJY+Puieb3VKyX0FB+83TUzn91cDMF/4gzt990IzqVrc+nIb9RRscRD070Du16q1glydVjWR0SBJsE6TbY/esOjFpqplogQqrajm1eI++f3eLi73R6q7hVusY0QbeFySVxABCjhN0lXB04caBe1rzHjYzul6MAXj7uq+0r17VLq+yrtyYhN12wkmFqHeqTyEei6EFPbMy24Nc+IbJlkP0OCg02W+gOnyBFcbi2ctvJFSOhSjt1CqBdqCnnhwUqXjbWiT0wh3DmLScRgTHmGkaI+oAcQQjfic65nxj+TnEkReA==|ignored|also_ignored";
     let assistant = AssistantMessage {
         content: vec![AssistantContent::ToolCall(AssistantToolCall {
             id: raw_id.into(),
@@ -841,6 +841,183 @@ async fn hashes_long_foreign_openai_tool_item_ids() {
     assert_eq!(function_call["id"], "fc_ifd2c719fz6a9");
     assert_eq!(function_call["id"].as_str().unwrap().len(), 16);
     assert_eq!(function_call["call_id"], "call_4VnzVawQXPB9MgYib7CiQFEY");
+}
+
+#[tokio::test]
+async fn uses_only_the_first_two_pipe_fields_for_same_provider_openai_tool_item_ids() {
+    let server = serve([Reply::sse(
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_same_model\",\"usage\":{}}}\n\n",
+    )])
+    .await;
+    let model = model(&server.base_url);
+    let assistant = |id: &str, model: &str, name: &str| AssistantMessage {
+        content: vec![AssistantContent::ToolCall(AssistantToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: json!({}),
+            thought_signature: None,
+            namespace: None,
+        })],
+        api: Api::OpenAiResponses,
+        provider: ProviderId::new("openai"),
+        model: model.into(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 2,
+    };
+    let same_model_id = "call_same|fc_same|ignored|also_ignored";
+    let different_model_id = "call_other|item_other|ignored|also_ignored";
+    let context = Context::new([
+        Message::user("Use the tool."),
+        Message::assistant(assistant(same_model_id, "gpt-5.6", "edit")),
+        Message::tool_result(ToolResultMessage::new(
+            same_model_id,
+            "edit",
+            [InputContent::text("ok")],
+        )),
+        Message::assistant(assistant(different_model_id, "gpt-5.5", "lookup")),
+        Message::tool_result(ToolResultMessage::new(
+            different_model_id,
+            "lookup",
+            [InputContent::text("found")],
+        )),
+        Message::user("Continue"),
+    ]);
+
+    done(&events(&model, &context, &options(|_| {})).await);
+
+    let body: Value = serde_json::from_str(
+        server
+            .requests()
+            .await
+            .pop()
+            .unwrap()
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        body["input"],
+        json!([
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Use the tool."}]
+            },
+            {
+                "type": "function_call",
+                "id": "fc_same",
+                "call_id": "call_same",
+                "name": "edit",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_same",
+                "output": "ok"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_other",
+                "name": "lookup",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_other",
+                "output": "found"
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Continue"}]
+            }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn normalizes_foreign_openai_tool_call_ids_without_item_fields() {
+    let server = serve([Reply::sse(
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_no_item\",\"usage\":{}}}\n\n",
+    )])
+    .await;
+    let model = model(&server.base_url);
+    let raw_id = "call/foreign😀Z";
+    let assistant = AssistantMessage {
+        content: vec![AssistantContent::ToolCall(AssistantToolCall {
+            id: raw_id.into(),
+            name: "lookup".into(),
+            arguments: json!({"value": "hello"}),
+            thought_signature: None,
+            namespace: None,
+        })],
+        api: Api::AnthropicMessages,
+        provider: ProviderId::new("anthropic"),
+        model: "claude-sonnet-4-5".into(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 2,
+    };
+    let context = Context::new([
+        Message::user("Use the tool."),
+        Message::assistant(assistant),
+        Message::tool_result(ToolResultMessage::new(
+            raw_id,
+            "lookup",
+            [InputContent::text("ok")],
+        )),
+        Message::user("Continue"),
+    ]);
+
+    done(&events(&model, &context, &options(|_| {})).await);
+
+    let body: Value = serde_json::from_str(
+        server
+            .requests()
+            .await
+            .pop()
+            .unwrap()
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        body["input"],
+        json!([
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Use the tool."}]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_foreign__Z",
+                "name": "lookup",
+                "arguments": "{\"value\":\"hello\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_foreign__Z",
+                "output": "ok"
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Continue"}]
+            }
+        ])
+    );
 }
 
 #[tokio::test]
