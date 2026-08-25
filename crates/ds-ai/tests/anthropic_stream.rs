@@ -48,6 +48,19 @@ async fn streams_anthropic_text_until_message_stop() {
             ..
         } if delta == "Hello"
     )));
+    let partial = events
+        .iter()
+        .find_map(|event| match event {
+            AssistantMessageEvent::TextDelta { partial, .. } => Some(partial),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(partial.usage.input, 12);
+    assert_eq!(partial.usage.output, 0);
+    assert_eq!(partial.usage.cache_read, 2);
+    assert_eq!(partial.usage.cache_write, 3);
+    assert_eq!(partial.usage.total_tokens, 17);
+    assert!((partial.usage.cost.total - 0.00004785).abs() < 1e-12);
     let response = done(&events);
     assert_eq!(response.response_id.as_deref(), Some("msg_1"));
     assert_eq!(response.content, [text("Hello")]);
@@ -403,6 +416,25 @@ async fn keeps_anthropic_plain_text_and_same_role_messages_separate() {
             {"role": "user", "content": "first"},
             {"role": "user", "content": "second"}
         ])
+    );
+}
+
+#[tokio::test]
+async fn applies_anthropic_long_cache_ttl_to_plain_user_messages() {
+    let body = request_body_for(
+        "claude-sonnet-4-5",
+        Context::new([Message::user("Hello")]),
+        options(|stream| stream.cache_retention = CacheRetention::Long),
+    )
+    .await;
+
+    assert_eq!(
+        body["messages"][0]["content"],
+        json!([{
+            "type": "text",
+            "text": "Hello",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+        }])
     );
 }
 
@@ -2114,10 +2146,10 @@ async fn encodes_legacy_tool_streaming_and_strict_schemas() {
 }
 
 #[tokio::test]
-async fn replays_empty_signature_thinking_as_text_unless_enabled() {
+async fn replays_whitespace_signature_thinking_as_text_unless_enabled() {
     let thinking = [
         "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_unsigned\",\"usage\":{}}}\n\n",
-        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"unsigned\",\"signature\":\"\"}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"unsigned\",\"signature\":\"  \"}}\n\n",
         "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
         "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"signed\"}}\n\n",
         "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",

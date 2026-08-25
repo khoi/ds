@@ -225,6 +225,39 @@ async fn anthropic_rechecks_cancellation_before_done() {
 }
 
 #[tokio::test]
+async fn anthropic_reports_pre_cancelled_setup_as_aborted() {
+    let server = serve(std::iter::empty::<Reply>()).await;
+    let mut model = builtin_model("anthropic", "claude-sonnet-4-5").unwrap();
+    model.base_url = server.base_url.clone();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let options = AnthropicOptions {
+        stream: StreamOptions {
+            cancellation,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let events = anthropic::stream(
+        &model.typed::<AnthropicOptions>().unwrap(),
+        &Context::new([Message::user("Hello")]),
+        &options,
+    )
+    .collect::<Vec<_>>()
+    .await;
+
+    assert!(matches!(
+        events.last(),
+        Some(AssistantMessageEvent::Error {
+            reason: ErrorReason::Aborted,
+            error,
+        }) if error.error_message.as_deref() == Some("No API key for provider: anthropic")
+    ));
+    assert!(server.requests().await.is_empty());
+}
+
+#[tokio::test]
 async fn exposes_progressive_codex_sse_tool_arguments() {
     let sse = [
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"weather\",\"arguments\":\"\"}}\n\n",

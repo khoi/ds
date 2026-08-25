@@ -1106,9 +1106,13 @@ async fn response_events(
                                 .cache_creation
                                 .as_ref()
                                 .and_then(|cache| cache.ephemeral_1h_input_tokens)
-                                .unwrap_or_default(),
+                            .unwrap_or_default(),
                         );
                         apply_usage(&mut result.usage, message.usage);
+                        yield Ok(crate::provider_stream::ProviderEvent::Usage {
+                            usage: result.usage.clone(),
+                            response_model: result.response_model.clone(),
+                        });
                     }
                     StreamEvent::ContentBlockStart { index, content_block }
                         if content_block.r#type == "text" =>
@@ -1282,6 +1286,10 @@ async fn response_events(
                         if let Some(usage) = usage {
                             apply_usage(&mut result.usage, usage);
                         }
+                        yield Ok(crate::provider_stream::ProviderEvent::Usage {
+                            usage: result.usage.clone(),
+                            response_model: result.response_model.clone(),
+                        });
                         if let Some(reason) = delta.stop_reason.filter(|reason| !reason.is_empty()) {
                             terminal_error = None;
                             result.stop_reason = match reason.as_str() {
@@ -1661,13 +1669,17 @@ fn assistant_content(
                     .thinking_signature
                     .as_deref()
                     .filter(|_| same_model);
-                if signature.is_some_and(|signature| !signature.trim().is_empty())
-                    || signature.is_some() && model.empty_thinking_signatures
-                {
+                if signature.is_some_and(|signature| !signature.trim().is_empty()) {
                     Some(serde_json::json!({
                         "type": "thinking",
                         "thinking": thinking.thinking,
                         "signature": signature.unwrap_or_default()
+                    }))
+                } else if signature.is_some() && model.empty_thinking_signatures {
+                    Some(serde_json::json!({
+                        "type": "thinking",
+                        "thinking": thinking.thinking,
+                        "signature": ""
                     }))
                 } else if thinking.thinking.trim().is_empty() {
                     None

@@ -1,7 +1,7 @@
 use crate::{
     AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantMessageEvent,
     AssistantMessageEventStream, AssistantToolCall, Error, Model, Response, StopReason,
-    TextContent, ThinkingContent, json,
+    TextContent, ThinkingContent, Usage, json,
 };
 use async_stream::stream;
 use futures_util::StreamExt;
@@ -15,6 +15,10 @@ use tokio_util::sync::CancellationToken;
 pub(crate) enum ProviderEvent {
     ResponseId(String),
     ModelOverride(String),
+    Usage {
+        usage: Usage,
+        response_model: String,
+    },
     TextStart {
         content_index: usize,
         content: TextContent,
@@ -110,7 +114,13 @@ where
             Ok(setup) => setup.into(),
             Err(error) => {
                 let response = error.partial().cloned();
-                yield error_event(&model, error, response, None);
+                yield error_event(
+                    &model,
+                    error,
+                    response,
+                    None,
+                    cancellation.is_cancelled(),
+                );
                 return;
             }
         };
@@ -131,6 +141,19 @@ where
                 Ok(ProviderEvent::ModelOverride(model)) => {
                     partial.model = model;
                     partial.response_model = None;
+                }
+                Ok(ProviderEvent::Usage {
+                    usage,
+                    response_model,
+                }) => {
+                    partial.usage = usage;
+                    if matches!(model.api, crate::Api::AnthropicMessages) {
+                        crate::anthropic::calculate_cost(
+                            &model,
+                            Some(&response_model),
+                            &mut partial.usage,
+                        );
+                    }
                 }
                 Ok(ProviderEvent::TextStart {
                     content_index,
@@ -332,6 +355,7 @@ where
                             Error::Cancelled { partial: None },
                             Some(response),
                             Some(&partial),
+                            false,
                         );
                         return;
                     }
@@ -354,7 +378,7 @@ where
                 }
                 Err(error) => {
                     let response = error.partial().cloned();
-                    yield error_event(&model, error, response, Some(&partial));
+                    yield error_event(&model, error, response, Some(&partial), false);
                     return;
                 }
             }
@@ -366,7 +390,7 @@ where
                 partial: Response::default(),
             }
         };
-        yield error_event(&model, error, None, Some(&partial));
+        yield error_event(&model, error, None, Some(&partial), false);
     };
     AssistantMessageEventStream::new(output)
 }
@@ -446,11 +470,13 @@ fn error_event(
     error: Error,
     response: Option<Response>,
     stream_partial: Option<&AssistantMessage>,
+    aborted: bool,
 ) -> AssistantMessageEvent {
-    let reason = if matches!(
-        error,
-        Error::Cancelled { .. } | Error::Hook { aborted: true, .. }
-    ) {
+    let reason = if aborted
+        || matches!(
+            error,
+            Error::Cancelled { .. } | Error::Hook { aborted: true, .. }
+        ) {
         crate::ErrorReason::Aborted
     } else {
         crate::ErrorReason::Error
