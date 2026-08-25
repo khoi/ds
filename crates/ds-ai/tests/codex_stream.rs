@@ -2609,21 +2609,58 @@ async fn evicts_a_cached_codex_websocket_after_stream_failure() {
 }
 
 #[tokio::test]
-async fn keeps_cached_codex_websocket_after_terminal_response_error() {
-    let (base_url, requests) = serve_terminal_error_then_reusable_websocket().await;
-    let model = model(base_url);
-    let options = options(token("acc_terminal_reuse"), |options| {
-        options.stream.session_id = Some("session_terminal_reuse".into());
-        options.stream.transport = Some(ProviderTransport::WebSocketCached);
-    });
-    let context = Context::new([Message::user("Connect")]);
+async fn evicts_cached_codex_websocket_after_terminal_response_errors() {
+    for status in ["failed", "cancelled", "incomplete"] {
+        let session = format!("session_terminal_{status}");
+        let (base_url, capture) = serve_terminal_error_then_fresh_websockets(status).await;
+        let model = model(base_url);
+        let options = options(token(&format!("acc_terminal_{status}")), |options| {
+            options.stream.session_id = Some(session.clone());
+            options.stream.transport = Some(ProviderTransport::WebSocketCached);
+        });
 
-    let first = events(&model, &context, &options).await;
-    assert_eq!(failed(&first).stop_reason, StopReason::Error);
-    let second = events(&model, &context, &options).await;
-    assert_text(done(&second), "Recovered");
-    assert_eq!(requests.await.unwrap(), 2);
-    codex::close_websocket_sessions(Some("session_terminal_reuse"));
+        let first = events(&model, &Context::new([Message::user("Connect")]), &options).await;
+        let first_response = done(&first).clone();
+        let second_context = Context::new([
+            Message::user("Connect"),
+            Message::assistant(first_response),
+            Message::user("Continue"),
+        ]);
+        let second = events(&model, &second_context, &options).await;
+        assert_eq!(failed(&second).raw_stop_reason.as_deref(), Some(status));
+
+        let third = events(&model, &second_context, &options).await;
+        assert_text(done(&third), "Fresh");
+
+        let bodies = capture.await.unwrap();
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies[0].get("previous_response_id").is_none());
+        assert_eq!(bodies[1]["previous_response_id"], "resp_seed");
+        assert_eq!(
+            bodies[1]["input"],
+            json!([{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Continue"}]
+            }])
+        );
+        assert!(bodies[2].get("previous_response_id").is_none());
+        assert_eq!(bodies[2]["input"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            codex::websocket_debug_stats(&session),
+            Some(codex::WebSocketDebugStats {
+                requests: 3,
+                connections_created: 2,
+                connections_reused: 1,
+                cached_context_requests: 3,
+                full_context_requests: 2,
+                delta_requests: 1,
+                last_input_items: 3,
+                ..Default::default()
+            })
+        );
+        codex::close_websocket_sessions(Some(&session));
+        codex::reset_websocket_debug_stats(Some(&session));
+    }
 }
 
 #[tokio::test]
@@ -3637,40 +3674,59 @@ async fn serve_failed_then_fresh_websockets() -> (String, oneshot::Receiver<bool
     (format!("http://{address}"), receiver)
 }
 
-async fn serve_terminal_error_then_reusable_websocket() -> (String, oneshot::Receiver<usize>) {
+async fn serve_terminal_error_then_fresh_websockets(
+    status: &'static str,
+) -> (String, oneshot::Receiver<Vec<Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (sender, receiver) = oneshot::channel();
     tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
-        for index in 0..2 {
-            assert!(matches!(
-                socket.next().await,
-                Some(Ok(WebSocketMessage::Text(_)))
-            ));
-            if index == 0 {
-                socket
-                    .send(WebSocketMessage::Text(
-                        json!({
-                            "type": "response.completed",
-                            "response": {"id": "resp_failed_terminal", "status": "failed", "usage": {}}
-                        })
-                        .to_string()
-                        .into(),
-                    ))
-                    .await
-                    .unwrap();
-            } else {
-                for event in text_events("resp_recovered", "msg_recovered", "Recovered") {
-                    socket
-                        .send(WebSocketMessage::Text(event.to_string().into()))
-                        .await
-                        .unwrap();
-                }
-            }
+        let mut bodies = Vec::new();
+        bodies.push(match socket.next().await {
+            Some(Ok(WebSocketMessage::Text(body))) => serde_json::from_str(&body).unwrap(),
+            message => panic!("unexpected websocket request: {message:?}"),
+        });
+        for event in text_events("resp_seed", "msg_seed", "Seed") {
+            socket
+                .send(WebSocketMessage::Text(event.to_string().into()))
+                .await
+                .unwrap();
         }
-        sender.send(2).ok();
+        bodies.push(match socket.next().await {
+            Some(Ok(WebSocketMessage::Text(body))) => serde_json::from_str(&body).unwrap(),
+            message => panic!("unexpected websocket request: {message:?}"),
+        });
+        socket
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_terminal", "status": status, "usage": {}}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), socket.next()).await,
+            Ok(Some(Ok(WebSocketMessage::Close(_)))) | Ok(None)
+        ));
+
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        bodies.push(match socket.next().await {
+            Some(Ok(WebSocketMessage::Text(body))) => serde_json::from_str(&body).unwrap(),
+            message => panic!("unexpected websocket request: {message:?}"),
+        });
+        for event in text_events("resp_fresh", "msg_fresh", "Fresh") {
+            socket
+                .send(WebSocketMessage::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        sender.send(bodies).ok();
     });
     (format!("http://{address}"), receiver)
 }

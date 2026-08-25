@@ -1547,26 +1547,15 @@ async fn websocket_stream(
                 Err(error) => {
                     drop(decoded);
                     let error = codex_protocol_error(error);
-                    if keep_cached_websocket_after_response_error(&error) {
-                        if cached_context && let Some(response) = error.partial() {
-                            let state = output_continuation_state
-                                .lock()
-                                .expect("websocket continuation state lock")
-                                .clone();
-                            cache_continuation(
-                                &state.continuation,
-                                &state.last_used,
-                                &output_request,
-                                &output_model,
-                                response,
-                                &output_grammar_input_properties,
-                                output_tool_options,
-                            );
-                        }
-                        lease.complete(WEBSOCKET_IDLE_TTL);
-                    } else {
-                        lease.evict();
-                    }
+                    let continuation = output_continuation_state
+                        .lock()
+                        .expect("websocket continuation state lock")
+                        .continuation
+                        .clone();
+                    *continuation
+                        .lock()
+                        .expect("websocket continuation lock") = None;
+                    lease.evict();
                     yield Err(error);
                     return;
                 }
@@ -1586,20 +1575,6 @@ fn codex_protocol_error(error: Error) -> Error {
         },
         error => error,
     }
-}
-
-fn keep_cached_websocket_after_response_error(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::Response {
-            code: None,
-            partial,
-            ..
-        } if partial.raw_stop_reason.as_deref().is_some_and(|status| {
-            matches!(status, "failed" | "cancelled" | "incomplete")
-                || status.starts_with("incomplete.")
-        })
-    )
 }
 
 fn resolve_websocket_proxy(
