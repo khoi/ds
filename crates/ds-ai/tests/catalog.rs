@@ -16,10 +16,22 @@ fn loads_and_validates_the_pinned_catalogs() {
     let info = builtin_catalog_info();
     assert_eq!(
         info.source_commit,
-        "94108a1ac65a2cfce5d97431e9d24d14f6da858e"
+        "5c6655e76e07996e53ebc45226ec4dc32b79323b"
     );
-    assert_eq!(info.generated_at, "2026-08-24T17:26:15.442Z");
+    assert_eq!(info.generated_at, "2026-08-25T10:34:47.107Z");
     assert_eq!(info.files.len(), 3);
+    assert_eq!(
+        info.files["anthropic.json"],
+        "4d44dd3f78d21dd1d0fba878bd58026914ba98dba3083212059b4710dc13eeb3"
+    );
+    assert_eq!(
+        info.files["openai-codex.json"],
+        "2712c2924a4a75213dddc743c0e5f08d50a781fe807f16d5afb5fb65b41c64c7"
+    );
+    assert_eq!(
+        info.files["openai.json"],
+        "2f32f5796138f03153a0314edf4c8ee27531d62f3477de0da46e51095f5e4782"
+    );
 
     for models in [openai_models(), anthropic_models(), codex_models()] {
         assert!(models.windows(2).all(|pair| pair[0].id < pair[1].id));
@@ -54,6 +66,14 @@ fn exposes_catalog_capabilities_costs_and_compatibility() {
         Some(&Some("max".into()))
     );
     assert_eq!(openai.cost.tiers[0].input_tokens_above, 272_000);
+    assert_eq!(openai.cost.rates.input, 4.0);
+    assert_eq!(openai.cost.rates.output, 20.0);
+    assert_eq!(openai.cost.rates.cache_read, 0.4);
+    assert_eq!(openai.cost.rates.cache_write, 5.0);
+    assert_eq!(openai.cost.tiers[0].rates.input, 8.0);
+    assert_eq!(openai.cost.tiers[0].rates.output, 30.0);
+    assert_eq!(openai.cost.tiers[0].rates.cache_read, 0.8);
+    assert_eq!(openai.cost.tiers[0].rates.cache_write, 10.0);
     assert!(matches!(openai.compat, Some(ModelCompatibility::OpenAi(_))));
 
     let anthropic = builtin_model("anthropic", "claude-opus-5").unwrap();
@@ -128,6 +148,16 @@ fn matches_selected_catalog_thinking_level_matrices() {
         (
             "openai",
             "gpt-5.6-sol",
+            &[Off, Low, Medium, High, XHigh, Max][..],
+        ),
+        (
+            "openai",
+            "gpt-5.6-terra",
+            &[Off, Low, Medium, High, XHigh, Max][..],
+        ),
+        (
+            "openai",
+            "gpt-5.6-luna",
             &[Off, Low, Medium, High, XHigh, Max][..],
         ),
     ];

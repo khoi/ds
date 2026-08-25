@@ -36,6 +36,8 @@ mod models;
 mod openai_stream;
 #[path = "request_options.rs"]
 mod request_options;
+#[path = "stream_core_parity.rs"]
+mod stream_core_parity;
 mod support;
 mod transcript;
 mod uuid;

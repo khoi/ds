@@ -187,3 +187,42 @@ fn calculates_base_tier_and_long_cache_costs() {
     assert_eq!(usage.cost.cache_write, 0.00062);
     assert_eq!(usage.cost.total, 0.00562);
 }
+
+#[test]
+fn returns_cost_and_switches_tiers_only_above_the_threshold() {
+    let mut model = model();
+    model.cost.tiers.push(ModelCostTier {
+        rates: ModelCostRates {
+            input: 4.0,
+            output: 16.0,
+            cache_read: 1.0,
+            cache_write: 5.0,
+        },
+        input_tokens_above: 1_000,
+    });
+
+    let mut boundary = Usage {
+        input: 800,
+        output: 100,
+        cache_read: 200,
+        cache_write: 0,
+        cache_write_1h: None,
+        reasoning: None,
+        total_tokens: 1_100,
+        cost: Default::default(),
+    };
+    let returned = model.calculate_cost(&mut boundary).clone();
+    assert_eq!(returned, boundary.cost);
+    assert_eq!(boundary.cost.input, 0.0016);
+    assert_eq!(boundary.cost.output, 0.0008);
+    assert_eq!(boundary.cost.cache_read, 0.0001);
+
+    let mut above = Usage {
+        input: 801,
+        ..boundary
+    };
+    model.calculate_cost(&mut above);
+    assert_eq!(above.cost.input, 0.003204);
+    assert_eq!(above.cost.output, 0.0016);
+    assert_eq!(above.cost.cache_read, 0.0002);
+}

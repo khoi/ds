@@ -23,7 +23,7 @@ pub(crate) fn json_schema(
         return match strict {
             ConstrainedSamplingStrictness::Prefer => Ok(None),
             ConstrainedSamplingStrictness::Require => Err(format!(
-                "tool {:?} requires JSON-schema constrained sampling, but strict tools are unsupported",
+                "Tool {:?} requires JSON-schema constrained sampling, but strict tools are unsupported.",
                 tool.name
             )),
         };
@@ -35,7 +35,7 @@ pub(crate) fn json_schema(
         })),
         Err(_) if strict == ConstrainedSamplingStrictness::Prefer => Ok(None),
         Err(error) => Err(format!(
-            "tool {:?} requires JSON-schema constrained sampling, but {error}",
+            "Tool {:?} requires JSON-schema constrained sampling, but {error}.",
             tool.name
         )),
     }

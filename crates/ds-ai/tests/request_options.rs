@@ -2,8 +2,8 @@ use crate::support::{Reply, serve};
 use base64::prelude::*;
 use ds_ai::{
     AnthropicOptions, ApiStreamOptions, Context, Message, Models, OpenAiCodexResponsesOptions,
-    OpenAiResponsesOptions, PayloadHook, Provider, ProviderResponse, ResponseHook, StopReason,
-    StreamOptions, Transport, builtin_model,
+    OpenAiResponsesOptions, PayloadHook, Provider, ProviderResponse, ResponseHook,
+    SimpleStreamOptions, StopReason, StreamOptions, Transport, builtin_model,
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -339,7 +339,7 @@ async fn sends_and_suppresses_headers_for_each_api() {
 
 #[tokio::test]
 async fn sends_transformed_models_headers_on_the_provider_request() {
-    let server = serve([Reply::sse(openai_done())]).await;
+    let server = serve([Reply::sse(openai_done()), Reply::sse(openai_done())]).await;
     let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
     model.base_url = server.base_url.clone();
     model
@@ -347,38 +347,76 @@ async fn sends_transformed_models_headers_on_the_provider_request() {
         .insert("X-Model-Header".into(), "model".into());
     let mut models = Models::new();
     models.set_provider(Arc::new(ds_ai::openai::Provider::new([model.clone()])));
+    let hook_models = Arc::new(Mutex::new(Vec::new()));
+    let stream = StreamOptions {
+        api_key: Some("test-key".into()),
+        headers: [
+            ("X-Request-Header".into(), Some("request".into())),
+            ("X-Shared".into(), Some("request".into())),
+        ]
+        .into_iter()
+        .collect(),
+        on_payload: Some(PayloadHook::new({
+            let hook_models = hook_models.clone();
+            move |_, model| {
+                hook_models.lock().unwrap().push(model);
+                async { Ok(None) }
+            }
+        })),
+        on_response: Some(ResponseHook::new({
+            let hook_models = hook_models.clone();
+            move |_, model| {
+                hook_models.lock().unwrap().push(model);
+                async { Ok(()) }
+            }
+        })),
+        ..Default::default()
+    }
+    .with_transform_headers(|mut headers| async move {
+        headers.remove("X-Model-Header");
+        headers.insert("X-Transformed".into(), Some("yes".into()));
+        Ok(headers)
+    });
 
     models
         .complete(
             &model.typed::<ds_ai::OpenAiResponsesOptions>().unwrap(),
             &Context::new([Message::user("Hello")]),
             &OpenAiResponsesOptions {
-                stream: StreamOptions {
-                    api_key: Some("test-key".into()),
-                    headers: [
-                        ("X-Request-Header".into(), Some("request".into())),
-                        ("X-Shared".into(), Some("request".into())),
-                    ]
-                    .into_iter()
-                    .collect(),
-                    ..Default::default()
-                }
-                .with_transform_headers(|mut headers| async move {
-                    headers.remove("X-Model-Header");
-                    headers.insert("X-Transformed".into(), Some("yes".into()));
-                    Ok(headers)
-                }),
+                stream: stream.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    models
+        .complete_simple(
+            &model,
+            &Context::new([Message::user("Hello")]),
+            &SimpleStreamOptions {
+                stream,
                 ..Default::default()
             },
         )
         .await
         .unwrap();
 
-    let request = server.requests().await.pop().unwrap().to_ascii_lowercase();
-    assert!(!request.contains("x-model-header:"));
-    assert!(request.contains("x-request-header: request\r\n"));
-    assert!(request.contains("x-shared: request\r\n"));
-    assert!(request.contains("x-transformed: yes\r\n"));
+    for request in server.requests().await {
+        let request = request.to_ascii_lowercase();
+        assert!(!request.contains("x-model-header:"));
+        assert!(request.contains("x-request-header: request\r\n"));
+        assert!(request.contains("x-shared: request\r\n"));
+        assert!(request.contains("x-transformed: yes\r\n"));
+    }
+    assert_eq!(
+        hook_models
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|model| model.headers.get("X-Model-Header").map(String::as_str))
+            .collect::<Vec<_>>(),
+        [Some("model"), Some("model"), Some("model"), Some("model")]
+    );
 }
 
 #[tokio::test]

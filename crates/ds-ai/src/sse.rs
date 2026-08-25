@@ -43,8 +43,7 @@ impl Decoder {
             let line = std::str::from_utf8(&line).map_err(|error| error.to_string())?;
 
             if line.is_empty() {
-                if self.data.is_empty() {
-                    self.event = None;
+                if self.event.is_none() && self.data.is_empty() {
                     self.raw.clear();
                     continue;
                 }

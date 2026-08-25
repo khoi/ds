@@ -8,7 +8,7 @@ use crate::{
     ThinkingLevel,
 };
 use async_stream::stream;
-use futures_util::{StreamExt, stream as futures_stream};
+use futures_util::{StreamExt, future::try_join_all, stream as futures_stream};
 use std::{
     collections::BTreeMap,
     fmt,
@@ -278,7 +278,7 @@ pub struct SimpleStreamOptions {
     pub stream: StreamOptions,
     pub reasoning: Option<ThinkingLevel>,
     pub thinking_budgets: Option<ThinkingBudgets>,
-    pub tool_choice: ToolChoice,
+    pub tool_choice: Option<ToolChoice>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -593,7 +593,7 @@ impl Models {
             })?;
             let mut stream_options = options.stream;
             let request_model = apply_stream_auth(&model, &mut stream_options, resolution);
-            apply_header_transform(&mut stream_options).await?;
+            apply_header_transform(&request_model, &mut stream_options).await?;
             Ok(provider.stream_simple(
                 &request_model,
                 &context,
@@ -696,17 +696,17 @@ impl Models {
             Some(provider_id) => self.provider(provider_id).into_iter().collect(),
             None => self.providers(),
         };
-        let mut models = Vec::new();
-        for provider in providers {
-            if self
+        let checks = try_join_all(providers.into_iter().map(|provider| async move {
+            let auth = self
                 .check_auth(provider.id().as_str(), cancellation)
-                .await?
-                .is_some()
-            {
-                models.extend(provider.models());
-            }
-        }
-        Ok(models)
+                .await?;
+            Ok::<_, crate::AuthError>((provider, auth))
+        }))
+        .await?;
+        Ok(checks
+            .into_iter()
+            .flat_map(|(provider, auth)| auth.map_or_else(Vec::new, |_| provider.models()))
+            .collect())
     }
 
     pub async fn login(
@@ -835,7 +835,7 @@ fn error_event(model: &Model, message: String) -> AssistantMessageEvent {
         timestamp: timestamp(),
     };
     AssistantMessageEvent::Error {
-        reason: StopReason::Error,
+        reason: crate::ErrorReason::Error,
         error,
     }
 }
@@ -893,9 +893,9 @@ async fn apply_auth(
     resolution: crate::AuthResult,
 ) -> Result<(Model, ApiStreamOptions), crate::AuthError> {
     let stream = options.stream_mut();
-    let model = apply_stream_auth(model, stream, resolution);
-    apply_header_transform(stream).await?;
-    Ok((model, options))
+    let request_model = apply_stream_auth(model, stream, resolution);
+    apply_header_transform(&request_model, stream).await?;
+    Ok((request_model, options))
 }
 
 fn apply_stream_auth(
@@ -914,16 +914,23 @@ fn apply_stream_auth(
         .chain(std::mem::take(&mut stream.env))
         .collect();
     stream.headers = merge_headers(&[&resolution.auth.headers, &stream.headers]);
-    model.headers.clear();
     model
 }
 
-async fn apply_header_transform(stream: &mut StreamOptions) -> Result<(), crate::AuthError> {
+async fn apply_header_transform(
+    model: &Model,
+    stream: &mut StreamOptions,
+) -> Result<(), crate::AuthError> {
     let headers = std::mem::take(&mut stream.headers);
     stream.headers = stream
         .run_header_transform(headers)
         .await
         .map_err(crate::AuthError::Provider)?;
+    for name in model.headers.keys() {
+        if !contains_header(&stream.headers, name) {
+            insert_header(&mut stream.headers, name, None);
+        }
+    }
     Ok(())
 }
 
@@ -950,6 +957,12 @@ fn insert_header(
         headers.remove(&existing);
     }
     headers.insert(name.to_owned(), value);
+}
+
+fn contains_header(headers: &HeaderMap, name: &str) -> bool {
+    headers
+        .keys()
+        .any(|existing| existing.eq_ignore_ascii_case(name))
 }
 
 async fn resolve_model_auth(

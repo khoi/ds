@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use ds_ai::{
     Api, ApiKeyAuth, ApiStreamOptions, AssistantMessage, AssistantMessageEvent,
     AssistantMessageEventStream, AuthCheck, AuthContext, AuthError, AuthResolutionOverrides,
-    AuthResult, Context, Credential, CredentialType, HeaderHook, Model, ModelAuth, ModelCost,
-    ModelInput, Models, OAuthAuth, OpenAiResponsesOptions, Provider, ProviderAuth, ProviderId,
-    SimpleStreamOptions, StopReason, StreamOptions,
+    AuthResult, Context, Credential, CredentialStore, CredentialType, DoneReason, HeaderHook,
+    Model, ModelAuth, ModelCost, ModelInput, Models, OAuthAuth, OpenAiResponsesOptions, Provider,
+    ProviderAuth, ProviderId, SimpleStreamOptions, StopReason, StreamOptions,
 };
 use futures_util::StreamExt;
 use futures_util::stream;
@@ -14,7 +14,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::{collections::BTreeMap, sync::Arc};
-use tokio::sync::Notify;
+use tokio::sync::{Barrier, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::support::{Reply, serve};
@@ -27,6 +27,59 @@ struct TestProvider {
     auth: ds_ai::ProviderAuth,
     headers: BTreeMap<String, Option<String>>,
     captured: Option<Arc<Mutex<Option<StreamOptions>>>>,
+}
+
+struct ModelCaptureProvider {
+    model: Model,
+    auth: ProviderAuth,
+    captured: Arc<Mutex<Vec<Model>>>,
+    headers: BTreeMap<String, Option<String>>,
+}
+
+impl Provider for ModelCaptureProvider {
+    fn id(&self) -> &ProviderId {
+        &self.model.provider
+    }
+
+    fn name(&self) -> &str {
+        "Model capture"
+    }
+
+    fn base_url(&self) -> Option<&str> {
+        None
+    }
+
+    fn headers(&self) -> &BTreeMap<String, Option<String>> {
+        &self.headers
+    }
+
+    fn auth(&self) -> &ProviderAuth {
+        &self.auth
+    }
+
+    fn models(&self) -> Vec<Model> {
+        vec![self.model.clone()]
+    }
+
+    fn stream(
+        &self,
+        model: &Model,
+        _context: &Context,
+        _options: &ApiStreamOptions,
+    ) -> AssistantMessageEventStream {
+        self.captured.lock().unwrap().push(model.clone());
+        completed(model, "done")
+    }
+
+    fn stream_simple(
+        &self,
+        model: &Model,
+        _context: &Context,
+        _options: &SimpleStreamOptions,
+    ) -> AssistantMessageEventStream {
+        self.captured.lock().unwrap().push(model.clone());
+        completed(model, "done")
+    }
 }
 
 impl Provider for TestProvider {
@@ -142,6 +195,11 @@ async fn streams_and_completes_a_runtime_model_through_its_registered_provider()
     assert_eq!(result.error_message.as_deref(), Some("runtime"));
 }
 
+#[test]
+fn leaves_simple_tool_choice_unspecified_by_default() {
+    assert_eq!(SimpleStreamOptions::default().tool_choice, None);
+}
+
 #[tokio::test]
 async fn returns_terminal_stream_errors_for_unknown_providers() {
     let model = model("missing", "gpt-test");
@@ -158,6 +216,34 @@ async fn returns_terminal_stream_errors_for_unknown_providers() {
         result.error_message.as_deref(),
         Some("Unknown provider missing")
     );
+}
+
+#[tokio::test]
+async fn emits_only_error_when_auth_fails_before_provider_start() {
+    let model = model("openai", "gpt-test");
+    let mut models = collection();
+    models.set_provider(provider(&model, "done"));
+
+    let typed = models
+        .stream(
+            &model.typed().unwrap(),
+            &Context::new([]),
+            &api_options(StreamOptions::default()),
+        )
+        .collect::<Vec<_>>()
+        .await;
+    let simple = models
+        .stream_simple(&model, &Context::new([]), &SimpleStreamOptions::default())
+        .collect::<Vec<_>>()
+        .await;
+
+    for events in [typed, simple] {
+        assert!(matches!(
+            events.as_slice(),
+            [AssistantMessageEvent::Error { error, .. }]
+                if error.error_message.as_deref() == Some("Provider is not configured: openai")
+        ));
+    }
 }
 
 #[tokio::test]
@@ -289,6 +375,73 @@ async fn resolves_explicit_and_stored_auth_and_lists_available_models() {
         models.available_models(None, &cancellation).await.unwrap(),
         [model]
     );
+}
+
+#[tokio::test]
+async fn wrong_stored_credential_kind_blocks_ambient_auth_fallback() {
+    let stored = Arc::new(ds_ai::InMemoryCredentialStore::new());
+    let cancellation = CancellationToken::new();
+    stored
+        .modify(
+            "openai",
+            Box::new(|_| Box::pin(async { Ok(Some(oauth("stored", u64::MAX))) })),
+            &cancellation,
+        )
+        .await
+        .unwrap();
+    let model = model("openai", "gpt-test");
+    let mut models = Models::with_auth(stored, Arc::new(AmbientAuthContext));
+    models.set_provider(provider(&model, "done"));
+
+    assert_eq!(
+        models
+            .auth("openai", AuthResolutionOverrides::default())
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        models.check_auth("openai", &cancellation).await.unwrap(),
+        None
+    );
+    assert!(
+        models
+            .available_models(None, &cancellation)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn checks_provider_availability_concurrently_and_keeps_provider_order() {
+    let first = model("first", "model-a");
+    let second = model("second", "model-b");
+    let barrier = Arc::new(Barrier::new(2));
+    let mut models = collection();
+    for model in [&first, &second] {
+        models.set_provider(Arc::new(TestProvider {
+            id: model.provider.clone(),
+            name: model.name.clone(),
+            models: vec![model.clone()],
+            marker: "done".into(),
+            auth: ProviderAuth::api_key(BarrierApiAuth {
+                barrier: barrier.clone(),
+            }),
+            headers: BTreeMap::new(),
+            captured: None,
+        }));
+    }
+
+    let available = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        models.available_models(None, &CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(available, [first, second]);
 }
 
 #[tokio::test]
@@ -498,6 +651,52 @@ async fn transforms_final_headers_before_provider_dispatch() {
         ])
     );
     assert!(options.transform_headers.is_none());
+}
+
+#[tokio::test]
+async fn keeps_model_headers_visible_to_typed_and_simple_provider_dispatch() {
+    let mut model = model("model-visibility", "gpt-test");
+    model
+        .headers
+        .insert("X-Model-Header".into(), "model".into());
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut models = collection();
+    models.set_provider(Arc::new(ModelCaptureProvider {
+        model: model.clone(),
+        auth: ProviderAuth::api_key(HeaderAuth),
+        captured: captured.clone(),
+        headers: BTreeMap::new(),
+    }));
+    let stream = StreamOptions {
+        api_key: Some("key".into()),
+        ..Default::default()
+    }
+    .with_transform_headers(|mut headers| async move {
+        headers.remove("X-Model-Header");
+        Ok(headers)
+    });
+
+    models
+        .complete(
+            &model.typed().unwrap(),
+            &Context::new([]),
+            &api_options(stream.clone()),
+        )
+        .await
+        .unwrap();
+    models
+        .complete_simple(
+            &model,
+            &Context::new([]),
+            &SimpleStreamOptions {
+                stream,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(captured.lock().unwrap().as_slice(), [model.clone(), model]);
 }
 
 #[tokio::test]
@@ -1388,6 +1587,19 @@ impl ds_ai::AuthContext for EmptyAuthContext {
     }
 }
 
+struct AmbientAuthContext;
+
+#[async_trait]
+impl ds_ai::AuthContext for AmbientAuthContext {
+    async fn env(&self, name: &str) -> Option<String> {
+        (name == "TEST_KEY").then(|| "ambient".into())
+    }
+
+    async fn file_exists(&self, _path: &str) -> bool {
+        false
+    }
+}
+
 struct HeaderAuth;
 
 #[async_trait]
@@ -1462,6 +1674,39 @@ impl OAuthAuth for TestOAuth {
 
 struct BlockingApiAuth {
     started: Arc<Notify>,
+}
+
+struct BarrierApiAuth {
+    barrier: Arc<Barrier>,
+}
+
+#[async_trait]
+impl ApiKeyAuth for BarrierApiAuth {
+    fn name(&self) -> &str {
+        "Barrier auth"
+    }
+
+    async fn check(
+        &self,
+        _context: &dyn AuthContext,
+        _credential: Option<&Credential>,
+        _cancellation: &CancellationToken,
+    ) -> Result<Option<AuthCheck>, AuthError> {
+        self.barrier.wait().await;
+        Ok(Some(AuthCheck {
+            source: Some("barrier".into()),
+            credential_type: CredentialType::ApiKey,
+        }))
+    }
+
+    async fn resolve(
+        &self,
+        _context: &dyn AuthContext,
+        _credential: Option<&Credential>,
+        _cancellation: &CancellationToken,
+    ) -> Result<Option<AuthResult>, AuthError> {
+        Ok(None)
+    }
 }
 
 #[async_trait]
@@ -1917,7 +2162,7 @@ fn completed(model: &Model, marker: &str) -> AssistantMessageEventStream {
         timestamp: 42,
     };
     AssistantMessageEventStream::new(stream::iter([AssistantMessageEvent::Done {
-        reason: StopReason::Stop,
+        reason: DoneReason::Stop,
         message,
     }]))
 }

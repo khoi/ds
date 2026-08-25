@@ -72,6 +72,47 @@ async fn ignores_empty_anthropic_api_keys() {
 }
 
 #[tokio::test]
+async fn ignores_whitespace_anthropic_environment_auth_during_precedence() {
+    let auth = ds_ai::anthropic::provider().auth().api_key.clone().unwrap();
+    let cancellation = CancellationToken::new();
+    let whitespace = StaticContext {
+        values: BTreeMap::from([
+            ("ANTHROPIC_AUTH_TOKEN".into(), " \t".into()),
+            ("ANTHROPIC_OAUTH_TOKEN".into(), "\n".into()),
+            ("ANTHROPIC_API_KEY".into(), "  ".into()),
+        ]),
+    };
+
+    assert_eq!(
+        auth.resolve(&whitespace, None, &cancellation)
+            .await
+            .unwrap(),
+        None
+    );
+
+    for (oauth_token, expected_key) in [("sk-ant-oat-valid", "sk-ant-oat-valid"), ("\t", "api-key")]
+    {
+        let context = StaticContext {
+            values: BTreeMap::from([
+                ("ANTHROPIC_AUTH_TOKEN".into(), "  ".into()),
+                ("ANTHROPIC_OAUTH_TOKEN".into(), oauth_token.into()),
+                ("ANTHROPIC_API_KEY".into(), "api-key".into()),
+            ]),
+        };
+        assert_eq!(
+            auth.resolve(&context, None, &cancellation)
+                .await
+                .unwrap()
+                .unwrap()
+                .auth
+                .api_key
+                .as_deref(),
+            Some(expected_key)
+        );
+    }
+}
+
+#[tokio::test]
 async fn cancels_anthropic_api_key_resolution_after_each_env_read() {
     let auth = ds_ai::anthropic::provider().auth().api_key.clone().unwrap();
 
@@ -471,6 +512,7 @@ async fn logs_in_to_anthropic_oauth_through_the_browser_callback() {
         } if refresh == "refresh_browser" && access == "access_browser"
     ));
     assert!(interaction.prompt_was_cancelled());
+    assert_eq!(*interaction.missing_state_status.lock().unwrap(), Some(400));
     let request = server.requests().await.pop().unwrap();
     let body: serde_json::Value =
         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -541,6 +583,7 @@ impl AuthInteraction for ManualInteraction {
 struct CallbackInteraction {
     cancellation: CancellationToken,
     prompt_cancellation: Mutex<Option<CancellationToken>>,
+    missing_state_status: Arc<Mutex<Option<u16>>>,
 }
 
 impl CallbackInteraction {
@@ -578,7 +621,14 @@ impl AuthInteraction for CallbackInteraction {
             query(&authorization_url, "redirect_uri"),
             query(&authorization_url, "state")
         );
+        let missing_state = format!(
+            "{}?code=missing_state_code",
+            query(&authorization_url, "redirect_uri")
+        );
+        let missing_state_status = self.missing_state_status.clone();
         tokio::spawn(async move {
+            let response = reqwest::get(missing_state).await.unwrap();
+            *missing_state_status.lock().unwrap() = Some(response.status().as_u16());
             reqwest::get(callback)
                 .await
                 .unwrap()

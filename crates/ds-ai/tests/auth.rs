@@ -227,7 +227,7 @@ async fn resolves_stored_keys_before_ambient_keys() {
 }
 
 #[tokio::test]
-async fn distinguishes_empty_and_whitespace_api_keys() {
+async fn rejects_whitespace_ambient_keys_without_rewriting_stored_keys() {
     let auth = EnvApiKeyAuth::new("API key", ["TEST_API_KEY"]);
     let empty = TestContext(BTreeMap::from([("TEST_API_KEY".into(), "".into())]));
     let cancellation = CancellationToken::new();
@@ -251,12 +251,12 @@ async fn distinguishes_empty_and_whitespace_api_keys() {
     assert_eq!(stored.auth.api_key.as_deref(), Some("   "));
 
     let whitespace = TestContext(BTreeMap::from([("TEST_API_KEY".into(), "   ".into())]));
-    let ambient = auth
-        .resolve(&whitespace, None, &cancellation)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(ambient.auth.api_key.as_deref(), Some("   "));
+    assert_eq!(
+        auth.resolve(&whitespace, None, &cancellation)
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 fn api_key(key: &str) -> Credential {

@@ -1,9 +1,9 @@
 use crate::support::{Reply, serve};
 use ds_ai::{
     Api, AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantMessageEvent,
-    AssistantMessageFrame, AssistantToolCall, Context, Message, OpenAiResponsesOptions, ProviderId,
-    StopReason, StreamOptions, TextContent, ThinkingContent, assistant_message_event_to_frame,
-    builtin_model, reduce_assistant_message_frames,
+    AssistantMessageFrame, AssistantMessageFrameEncoder, AssistantToolCall, Context, DoneReason,
+    ErrorReason, Message, OpenAiResponsesOptions, ProviderId, StopReason, StreamOptions,
+    TextContent, ThinkingContent, builtin_model, reduce_assistant_message_frames,
 };
 use futures_util::StreamExt;
 
@@ -25,10 +25,22 @@ fn seed() -> AssistantMessage {
     }
 }
 
-fn frame(event: AssistantMessageEvent) -> AssistantMessageFrame {
-    assistant_message_event_to_frame(&event)
-        .unwrap()
-        .expect("non-terminal event")
+fn frame(
+    encoder: &mut AssistantMessageFrameEncoder,
+    event: AssistantMessageEvent,
+) -> AssistantMessageFrame {
+    encoder.encode(&event).unwrap().expect("non-terminal event")
+}
+
+fn reduce(frames: impl IntoIterator<Item = AssistantMessageFrame>) -> AssistantMessage {
+    reduce_assistant_message_frames(frames).unwrap().unwrap()
+}
+
+fn encoding_error(
+    encoder: &mut AssistantMessageFrameEncoder,
+    event: AssistantMessageEvent,
+) -> String {
+    encoder.encode(&event).unwrap_err().to_string()
 }
 
 fn text(value: impl Into<String>) -> AssistantContent {
@@ -57,36 +69,150 @@ fn tool(id: &str, name: &str, arguments: serde_json::Value) -> AssistantToolCall
 }
 
 #[test]
+fn normalizes_start_and_reconciles_queued_text() {
+    let mut partial = seed();
+    partial.stop_reason = StopReason::Stop;
+    partial.error_message = Some("stale".into());
+    partial.content.push(text("Hello world"));
+    let events = [
+        AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        },
+        AssistantMessageEvent::TextStart {
+            content_index: 0,
+            partial: partial.clone(),
+        },
+        AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "Hell".into(),
+            partial: partial.clone(),
+        },
+        AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "o".into(),
+            partial: partial.clone(),
+        },
+        AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: " ".into(),
+            partial: partial.clone(),
+        },
+        AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "world".into(),
+            partial,
+        },
+    ];
+
+    let mut encoder = AssistantMessageFrameEncoder::new();
+    let frames = events
+        .iter()
+        .filter_map(|event| encoder.encode(event).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| serde_json::to_value(frame).unwrap()["type"].clone())
+            .collect::<Vec<_>>(),
+        [serde_json::json!("start"), serde_json::json!("text_start")]
+    );
+    let AssistantMessageFrame::Start { partial } = &frames[0] else {
+        panic!("start frame")
+    };
+    assert!(partial.content.is_empty());
+    assert_eq!(partial.stop_reason, StopReason::Pending);
+    assert_eq!(partial.error_message, None);
+    assert_eq!(reduce(frames).content, [text("Hello world")]);
+}
+#[test]
+fn trims_only_the_covered_text_prefix() {
+    let mut partial = seed();
+    let mut encoder = AssistantMessageFrameEncoder::new();
+    let mut frames = vec![frame(
+        &mut encoder,
+        AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        },
+    )];
+    partial.content.push(text("Hello"));
+    frames.push(frame(
+        &mut encoder,
+        AssistantMessageEvent::TextStart {
+            content_index: 0,
+            partial: partial.clone(),
+        },
+    ));
+    assert_eq!(
+        encoder
+            .encode(&AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "Hell".into(),
+                partial: partial.clone(),
+            })
+            .unwrap(),
+        None
+    );
+    let remainder = frame(
+        &mut encoder,
+        AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "o world".into(),
+            partial,
+        },
+    );
+    assert_eq!(
+        remainder,
+        AssistantMessageFrame::TextDelta {
+            content_index: 0,
+            delta: " world".into(),
+        }
+    );
+    frames.push(remainder);
+    assert_eq!(reduce(frames).content, [text("Hello world")]);
+}
+
+#[test]
 fn uses_authoritative_text_end_content_and_signature() {
     let mut partial = seed();
-    let mut frames = vec![frame(AssistantMessageEvent::Start {
-        partial: partial.clone(),
-    })];
+    let mut encoder = AssistantMessageFrameEncoder::new();
+    let mut frames = vec![frame(
+        &mut encoder,
+        AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        },
+    )];
     partial.content.push(text("Hello "));
-    frames.push(frame(AssistantMessageEvent::TextStart {
-        content_index: 0,
-        partial: partial.clone(),
-    }));
+    frames.push(frame(
+        &mut encoder,
+        AssistantMessageEvent::TextStart {
+            content_index: 0,
+            partial: partial.clone(),
+        },
+    ));
     partial.content[0] = AssistantContent::Text(TextContent {
         text: "Hello world".into(),
         text_signature: Some("sig-text".into()),
     });
-    frames.push(frame(AssistantMessageEvent::TextDelta {
-        content_index: 0,
-        delta: "incorrect".into(),
-        partial: partial.clone(),
-    }));
-    frames.push(frame(AssistantMessageEvent::TextEnd {
-        content_index: 0,
-        content: "Hello world".into(),
-        partial,
-    }));
+    frames.push(frame(
+        &mut encoder,
+        AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "incorrect".into(),
+            partial: partial.clone(),
+        },
+    ));
+    frames.push(frame(
+        &mut encoder,
+        AssistantMessageEvent::TextEnd {
+            content_index: 0,
+            content: "Hello world".into(),
+            partial,
+        },
+    ));
 
     assert_eq!(
-        reduce_assistant_message_frames(frames)
-            .unwrap()
-            .unwrap()
-            .content,
+        reduce(frames).content,
         [AssistantContent::Text(TextContent {
             text: "Hello world".into(),
             text_signature: Some("sig-text".into()),
@@ -97,9 +223,13 @@ fn uses_authoritative_text_end_content_and_signature() {
 #[test]
 fn preserves_authoritative_thinking_metadata() {
     let mut partial = seed();
-    let mut frames = vec![frame(AssistantMessageEvent::Start {
-        partial: partial.clone(),
-    })];
+    let mut encoder = AssistantMessageFrameEncoder::new();
+    let mut frames = vec![frame(
+        &mut encoder,
+        AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        },
+    )];
     partial
         .content
         .push(AssistantContent::Thinking(ThinkingContent {
@@ -107,26 +237,29 @@ fn preserves_authoritative_thinking_metadata() {
             thinking_signature: Some("encrypted-start".into()),
             redacted: Some(true),
         }));
-    frames.push(frame(AssistantMessageEvent::ThinkingStart {
-        content_index: 0,
-        partial: partial.clone(),
-    }));
+    frames.push(frame(
+        &mut encoder,
+        AssistantMessageEvent::ThinkingStart {
+            content_index: 0,
+            partial: partial.clone(),
+        },
+    ));
     partial.content[0] = AssistantContent::Thinking(ThinkingContent {
         thinking: "[redacted]".into(),
         thinking_signature: Some("encrypted-final".into()),
         redacted: Some(true),
     });
-    frames.push(frame(AssistantMessageEvent::ThinkingEnd {
-        content_index: 0,
-        content: "[redacted]".into(),
-        partial,
-    }));
+    frames.push(frame(
+        &mut encoder,
+        AssistantMessageEvent::ThinkingEnd {
+            content_index: 0,
+            content: "[redacted]".into(),
+            partial,
+        },
+    ));
 
     assert_eq!(
-        reduce_assistant_message_frames(frames)
-            .unwrap()
-            .unwrap()
-            .content[0],
+        reduce(frames).content[0],
         AssistantContent::Thinking(ThinkingContent {
             thinking: "[redacted]".into(),
             thinking_signature: Some("encrypted-final".into()),
@@ -150,9 +283,7 @@ fn parses_unfinished_tool_json_and_uses_final_arguments() {
             delta: r#"{"path":"READ"#.into(),
         },
     ];
-    let partial = reduce_assistant_message_frames(initial.clone())
-        .unwrap()
-        .unwrap();
+    let partial = reduce(initial.clone());
     assert_eq!(
         partial.content[0],
         AssistantContent::ToolCall(tool(
@@ -176,7 +307,7 @@ fn parses_unfinished_tool_json_and_uses_final_arguments() {
             namespace: Some("files".into()),
         },
     ]);
-    let complete = reduce_assistant_message_frames(complete).unwrap().unwrap();
+    let complete = reduce(complete);
     assert_eq!(
         complete.content[0],
         AssistantContent::ToolCall(AssistantToolCall {
@@ -186,6 +317,105 @@ fn parses_unfinished_tool_json_and_uses_final_arguments() {
             thought_signature: Some("thought".into()),
             namespace: Some("files".into()),
         })
+    );
+}
+
+#[test]
+fn checkpoints_queued_tool_json_without_replaying_deltas() {
+    let mut partial = seed();
+    partial.content.push(AssistantContent::ToolCall(tool(
+        "call",
+        "write",
+        serde_json::json!({"path": "README.md"}),
+    )));
+    let events = [
+        AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        },
+        AssistantMessageEvent::ToolCallStart {
+            content_index: 0,
+            partial: partial.clone(),
+        },
+        AssistantMessageEvent::ToolCallDelta {
+            content_index: 0,
+            delta: r#"{"path":"READ"#.into(),
+            partial: partial.clone(),
+        },
+        AssistantMessageEvent::ToolCallDelta {
+            content_index: 0,
+            delta: r#"ME.md"}"#.into(),
+            partial,
+        },
+    ];
+    let mut encoder = AssistantMessageFrameEncoder::new();
+    let frames = events
+        .iter()
+        .filter_map(|event| encoder.encode(event).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(frames.len(), 3);
+    assert_eq!(
+        frames[2],
+        AssistantMessageFrame::ToolCallCheckpoint {
+            content_index: 0,
+            json: r#"{"path":"README.md"}"#.into(),
+        }
+    );
+    assert_eq!(
+        reduce(frames).content,
+        [AssistantContent::ToolCall(tool(
+            "call",
+            "write",
+            serde_json::json!({"path": "README.md"})
+        ))]
+    );
+}
+
+#[test]
+fn streams_complete_tool_json_from_an_empty_start() {
+    let mut partial = seed();
+    let mut encoder = AssistantMessageFrameEncoder::new();
+    let mut frames = vec![frame(
+        &mut encoder,
+        AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        },
+    )];
+    partial.content.push(AssistantContent::ToolCall(tool(
+        "call",
+        "bash",
+        serde_json::json!({}),
+    )));
+    frames.push(frame(
+        &mut encoder,
+        AssistantMessageEvent::ToolCallStart {
+            content_index: 0,
+            partial: partial.clone(),
+        },
+    ));
+    let delta = frame(
+        &mut encoder,
+        AssistantMessageEvent::ToolCallDelta {
+            content_index: 0,
+            delta: r#"{"command":"ls -la /tmp"}"#.into(),
+            partial,
+        },
+    );
+    assert_eq!(
+        delta,
+        AssistantMessageFrame::ToolCallDelta {
+            content_index: 0,
+            delta: r#"{"command":"ls -la /tmp"}"#.into(),
+        }
+    );
+    frames.push(delta);
+    assert_eq!(
+        reduce(frames).content,
+        [AssistantContent::ToolCall(tool(
+            "call",
+            "bash",
+            serde_json::json!({"command": "ls -la /tmp"})
+        ))]
     );
 }
 
@@ -208,9 +438,24 @@ fn stores_authoritative_tool_call_end_fields_in_the_frame() {
         },
         partial,
     };
+    let mut encoder = AssistantMessageFrameEncoder::new();
+    frame(
+        &mut encoder,
+        AssistantMessageEvent::Start { partial: seed() },
+    );
+    let AssistantMessageEvent::ToolCallEnd { partial, .. } = &event else {
+        unreachable!()
+    };
+    frame(
+        &mut encoder,
+        AssistantMessageEvent::ToolCallStart {
+            content_index: 0,
+            partial: partial.clone(),
+        },
+    );
 
     assert_eq!(
-        frame(event),
+        frame(&mut encoder, event),
         AssistantMessageFrame::ToolCallEnd {
             content_index: 0,
             id: "final-id".into(),
@@ -242,21 +487,16 @@ async fn round_trips_provider_content_from_authoritative_end_events() {
         },
     );
     let mut frames = Vec::new();
+    let mut encoder = AssistantMessageFrameEncoder::new();
 
     while let Some(event) = stream.next().await {
-        if let Some(frame) = assistant_message_event_to_frame(&event).unwrap() {
+        if let Some(frame) = encoder.encode(&event).unwrap() {
             frames.push(frame);
         }
     }
 
     let message = stream.result().await.unwrap();
-    assert_eq!(
-        reduce_assistant_message_frames(frames)
-            .unwrap()
-            .unwrap()
-            .content,
-        message.content
-    );
+    assert_eq!(reduce(frames).content, message.content);
     server.requests().await;
 }
 
@@ -311,10 +551,7 @@ fn treats_absent_end_metadata_as_authoritative() {
     ];
 
     assert_eq!(
-        reduce_assistant_message_frames(frames)
-            .unwrap()
-            .unwrap()
-            .content,
+        reduce(frames).content,
         [
             text(""),
             AssistantContent::Thinking(ThinkingContent {
@@ -385,10 +622,7 @@ fn supports_interleaved_content_indexes() {
         },
     ];
     assert_eq!(
-        reduce_assistant_message_frames(frames)
-            .unwrap()
-            .unwrap()
-            .content,
+        reduce(frames).content,
         [
             text("answer"),
             AssistantContent::ToolCall(tool("call", "lookup", serde_json::json!({"query": "pi"}))),
@@ -409,9 +643,13 @@ fn snapshots_events_and_reduces_without_mutating_frames() {
             serde_json::json!("original"),
         )])),
     }]);
-    let start = frame(AssistantMessageEvent::Start {
-        partial: partial.clone(),
-    });
+    let mut encoder = AssistantMessageFrameEncoder::new();
+    let start = frame(
+        &mut encoder,
+        AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        },
+    );
     partial.diagnostics.as_mut().unwrap()[0]
         .details
         .as_mut()
@@ -423,13 +661,14 @@ fn snapshots_events_and_reduces_without_mutating_frames() {
         "run",
         serde_json::json!({"nested": {"value": "original"}}),
     )));
-    let tool_start = frame(AssistantMessageEvent::ToolCallStart {
-        content_index: 0,
-        partial,
-    });
-    let mut reduced = reduce_assistant_message_frames([start, tool_start.clone()])
-        .unwrap()
-        .unwrap();
+    let tool_start = frame(
+        &mut encoder,
+        AssistantMessageEvent::ToolCallStart {
+            content_index: 0,
+            partial,
+        },
+    );
+    let mut reduced = reduce([start, tool_start.clone()]);
     assert_eq!(
         reduced.diagnostics.as_ref().unwrap()[0]
             .details
@@ -452,24 +691,163 @@ fn snapshots_events_and_reduces_without_mutating_frames() {
 #[test]
 fn omits_terminal_events() {
     let mut message = seed();
+    let mut completed = AssistantMessageFrameEncoder::new();
+    frame(
+        &mut completed,
+        AssistantMessageEvent::Start {
+            partial: message.clone(),
+        },
+    );
     message.stop_reason = StopReason::Stop;
     assert_eq!(
-        assistant_message_event_to_frame(&AssistantMessageEvent::Done {
-            reason: StopReason::Stop,
-            message: message.clone(),
-        })
-        .unwrap(),
+        completed
+            .encode(&AssistantMessageEvent::Done {
+                reason: DoneReason::Stop,
+                message: message.clone(),
+            })
+            .unwrap(),
         None
     );
     message.stop_reason = StopReason::Error;
     assert_eq!(
-        assistant_message_event_to_frame(&AssistantMessageEvent::Error {
-            reason: StopReason::Error,
-            error: message,
-        })
-        .unwrap(),
+        AssistantMessageFrameEncoder::new()
+            .encode(&AssistantMessageEvent::Error {
+                reason: ErrorReason::Error,
+                error: message,
+            })
+            .unwrap(),
         None
     );
+}
+
+#[test]
+fn enforces_encoder_protocol_order() {
+    let mut encoder = AssistantMessageFrameEncoder::new();
+    assert!(
+        encoding_error(
+            &mut encoder,
+            AssistantMessageEvent::Done {
+                reason: DoneReason::Stop,
+                message: seed(),
+            },
+        )
+        .contains("done event appears before start")
+    );
+    assert!(
+        encoding_error(
+            &mut encoder,
+            AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "x".into(),
+                partial: seed(),
+            },
+        )
+        .contains("text_delta event appears before start")
+    );
+
+    let mut partial = seed();
+    let mut encoder = AssistantMessageFrameEncoder::new();
+    frame(
+        &mut encoder,
+        AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        },
+    );
+    assert!(
+        encoding_error(
+            &mut encoder,
+            AssistantMessageEvent::Start {
+                partial: partial.clone(),
+            },
+        )
+        .contains("more than one start event")
+    );
+    partial.content.push(text(""));
+    frame(
+        &mut encoder,
+        AssistantMessageEvent::TextStart {
+            content_index: 0,
+            partial: partial.clone(),
+        },
+    );
+    assert!(
+        encoding_error(
+            &mut encoder,
+            AssistantMessageEvent::TextStart {
+                content_index: 0,
+                partial: partial.clone(),
+            },
+        )
+        .contains("starts more than once")
+    );
+    frame(
+        &mut encoder,
+        AssistantMessageEvent::TextEnd {
+            content_index: 0,
+            content: String::new(),
+            partial: partial.clone(),
+        },
+    );
+    assert!(
+        encoding_error(
+            &mut encoder,
+            AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "x".into(),
+                partial: partial.clone(),
+            },
+        )
+        .contains("has not started")
+    );
+    assert_eq!(
+        encoder
+            .encode(&AssistantMessageEvent::Done {
+                reason: DoneReason::Stop,
+                message: partial.clone(),
+            })
+            .unwrap(),
+        None
+    );
+    assert!(
+        encoding_error(
+            &mut encoder,
+            AssistantMessageEvent::Error {
+                reason: ErrorReason::Error,
+                error: partial,
+            },
+        )
+        .contains("follows a terminal event")
+    );
+}
+
+#[test]
+fn repairs_incomplete_streaming_json_values() {
+    for (input, expected) in [
+        (&"true"[..3], serde_json::json!(true)),
+        (&"false"[..3], serde_json::json!(false)),
+        (&"null"[..3], serde_json::Value::Null),
+        ("1e", serde_json::json!(1)),
+        (r#"{"a":1,"b":"#, serde_json::json!({"a": 1})),
+    ] {
+        let frames = [
+            AssistantMessageFrame::Start {
+                partial: Box::new(seed()),
+            },
+            AssistantMessageFrame::ToolCallStart {
+                content_index: 0,
+                tool_call: tool("call", "parse", serde_json::json!({})),
+            },
+            AssistantMessageFrame::ToolCallDelta {
+                content_index: 0,
+                delta: input.into(),
+            },
+        ];
+        let message = reduce(frames);
+        let AssistantContent::ToolCall(tool_call) = &message.content[0] else {
+            panic!("tool call")
+        };
+        assert_eq!(tool_call.arguments, expected, "{input}");
+    }
 }
 
 #[test]
@@ -482,6 +860,28 @@ fn returns_none_without_a_start_frame() {
         }])
         .unwrap(),
         None
+    );
+}
+
+#[test]
+fn stops_reading_frames_after_a_prestart_protocol_error() {
+    let frames = [
+        AssistantMessageFrame::TextDelta {
+            content_index: 0,
+            delta: "x".into(),
+        },
+        AssistantMessageFrame::Start {
+            partial: Box::new(seed()),
+        },
+    ]
+    .into_iter()
+    .chain(std::iter::once_with(|| panic!("read past protocol error")));
+
+    assert!(
+        reduce_assistant_message_frames(frames)
+            .unwrap_err()
+            .to_string()
+            .contains("before the start frame")
     );
 }
 
@@ -559,12 +959,20 @@ fn rejects_invalid_frame_sequences() {
 #[test]
 fn rejects_event_indexes_with_the_wrong_block_kind() {
     let mut partial = seed();
+    let mut encoder = AssistantMessageFrameEncoder::new();
+    frame(
+        &mut encoder,
+        AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        },
+    );
     partial.content.push(thinking(""));
-    let error = assistant_message_event_to_frame(&AssistantMessageEvent::TextStart {
-        content_index: 0,
-        partial,
-    })
-    .unwrap_err();
+    let error = encoder
+        .encode(&AssistantMessageEvent::TextStart {
+            content_index: 0,
+            partial,
+        })
+        .unwrap_err();
     assert!(
         error
             .to_string()
@@ -598,6 +1006,18 @@ fn serializes_frames_with_wire_field_names_and_public_content() {
     assert_eq!(
         serde_json::from_value::<AssistantMessageFrame>(value).unwrap(),
         text_start
+    );
+
+    let checkpoint = AssistantMessageFrame::ToolCallCheckpoint {
+        content_index: 4,
+        json: r#"{"value":1}"#.into(),
+    };
+    let value = serde_json::to_value(&checkpoint).unwrap();
+    assert_eq!(value["type"], "toolcall_checkpoint");
+    assert_eq!(value["contentIndex"], 4);
+    assert_eq!(
+        serde_json::from_value::<AssistantMessageFrame>(value).unwrap(),
+        checkpoint
     );
 }
 

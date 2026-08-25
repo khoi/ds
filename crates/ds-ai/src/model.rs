@@ -408,7 +408,7 @@ impl Model {
             .unwrap_or(ThinkingLevel::Off)
     }
 
-    pub fn calculate_cost(&self, usage: &mut Usage) {
+    pub fn calculate_cost<'a>(&self, usage: &'a mut Usage) -> &'a crate::UsageCost {
         let input_tokens = usage.input + usage.cache_read + usage.cache_write;
         let rates = self
             .cost
@@ -427,6 +427,7 @@ impl Model {
             / 1_000_000.0;
         usage.cost.total =
             usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
+        &usage.cost
     }
 
     pub fn is_same_as(&self, other: &Self) -> bool {

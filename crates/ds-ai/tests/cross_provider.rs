@@ -3,9 +3,9 @@ use base64::prelude::*;
 use ds_ai::{
     AnthropicOptions, Api, ApiStreamOptions, AssistantContent, AssistantMessage,
     AssistantMessageEvent, AssistantMessageEventStream, AssistantToolCall, CacheRetention, Context,
-    InputContent, Message, OpenAiCodexResponsesOptions, OpenAiResponsesOptions, Provider,
-    ProviderId, StopReason, StreamOptions, TextContent, ThinkingContent, ToolResultMessage,
-    Transport, Usage, anthropic, builtin_model, codex, openai,
+    InputContent, Message, ModelInput, OpenAiCodexResponsesOptions, OpenAiResponsesOptions,
+    Provider, ProviderId, StopReason, StreamOptions, TextContent, ThinkingContent,
+    ToolResultMessage, Transport, Usage, anthropic, builtin_model, codex, openai,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -248,6 +248,282 @@ async fn preserves_emoji_in_an_openai_tool_result() {
             .unwrap()["output"],
         "🙈 👍 ❤️ 🤔 🚀 こんにちは 你好"
     );
+}
+
+#[tokio::test]
+async fn collapses_adjacent_unsupported_images_for_selected_provider_apis() {
+    const USER_PLACEHOLDER: &str = "(image omitted: model does not support images)";
+    const TOOL_PLACEHOLDER: &str = "(tool image omitted: model does not support images)";
+
+    let context = Context::new([
+        Message::user_content([
+            InputContent::text(USER_PLACEHOLDER),
+            InputContent::image("image/png", "first"),
+            InputContent::image("image/png", "second"),
+            InputContent::text("separate"),
+            InputContent::image("image/png", "third"),
+        ]),
+        Message::tool_result(ToolResultMessage::new(
+            "call_images",
+            "inspect",
+            [
+                InputContent::text(TOOL_PLACEHOLDER),
+                InputContent::image("image/png", "first"),
+                InputContent::image("image/png", "second"),
+                InputContent::text("separate"),
+                InputContent::image("image/png", "third"),
+            ],
+        )),
+    ]);
+
+    let openai_server = serve([Reply::sse(openai_done())]).await;
+    let mut openai_model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    openai_model.base_url = openai_server.base_url.clone();
+    openai_model.input = vec![ModelInput::Text];
+    openai::stream(
+        &openai_model
+            .typed::<ds_ai::OpenAiResponsesOptions>()
+            .unwrap(),
+        &context,
+        &OpenAiResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .result()
+    .await
+    .unwrap();
+    let openai = request_json(&openai_server.requests().await.pop().unwrap()).to_string();
+
+    let anthropic_server = serve([Reply::sse(anthropic_done())]).await;
+    let mut anthropic_model = builtin_model("anthropic", "claude-sonnet-4-5").unwrap();
+    anthropic_model.base_url = anthropic_server.base_url.clone();
+    anthropic_model.input = vec![ModelInput::Text];
+    anthropic::stream(
+        &anthropic_model.typed::<ds_ai::AnthropicOptions>().unwrap(),
+        &context,
+        &AnthropicOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                cache_retention: CacheRetention::None,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .result()
+    .await
+    .unwrap();
+    let anthropic = request_json(&anthropic_server.requests().await.pop().unwrap()).to_string();
+
+    let codex_server = serve([Reply::sse(codex_done())]).await;
+    let mut codex_model = builtin_model("openai-codex", "gpt-5.6-sol").unwrap();
+    codex_model.base_url = codex_server.base_url.clone();
+    codex_model.input = vec![ModelInput::Text];
+    codex::stream(
+        &codex_model
+            .typed::<ds_ai::OpenAiCodexResponsesOptions>()
+            .unwrap(),
+        &context,
+        &OpenAiCodexResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some(codex_token("acc_images")),
+                cache_retention: CacheRetention::None,
+                transport: Some(Transport::Sse),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .result()
+    .await
+    .unwrap();
+    let codex = codex_request_json(&codex_server.request_bytes().await.pop().unwrap()).to_string();
+
+    for request in [&openai, &anthropic, &codex] {
+        assert_eq!(request.matches(USER_PLACEHOLDER).count(), 2);
+        assert_eq!(request.matches(TOOL_PLACEHOLDER).count(), 2);
+    }
+}
+
+#[tokio::test]
+async fn normalizes_anthropic_tool_ids_by_utf16_code_units() {
+    let server = serve([Reply::sse(anthropic_done())]).await;
+    let mut model = builtin_model("anthropic", "claude-sonnet-4-5").unwrap();
+    model.base_url = server.base_url.clone();
+    let source = AssistantSource {
+        api: Api::OpenAiResponses,
+        provider: ProviderId::new("openai"),
+        model: "gpt-5.6-sol".into(),
+    };
+    let foreign_id = format!("{}😀Z", "a".repeat(62));
+    let expected_id = format!("{}__", "a".repeat(62));
+    let context = Context::new([
+        Message::user("Run"),
+        Message::assistant(AssistantMessage {
+            content: vec![tool_call(&foreign_id, "lookup")],
+            stop_reason: StopReason::ToolUse,
+            ..assistant(&source)
+        }),
+        Message::tool_result(ToolResultMessage::new(
+            &foreign_id,
+            "lookup",
+            [InputContent::text("done")],
+        )),
+    ]);
+
+    anthropic::stream(
+        &model.typed::<ds_ai::AnthropicOptions>().unwrap(),
+        &context,
+        &AnthropicOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                cache_retention: CacheRetention::None,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .result()
+    .await
+    .unwrap();
+
+    let body = request_json(&server.requests().await.pop().unwrap());
+    assert_eq!(body["messages"][1]["content"][0]["id"], expected_id);
+    assert_eq!(
+        body["messages"][2]["content"][0]["tool_use_id"],
+        expected_id
+    );
+}
+
+#[tokio::test]
+async fn normalizes_tool_result_ids_before_dropping_failed_assistant_turns() {
+    const FOREIGN_ID: &str = "call/failed😀Z|foreign/item😀";
+    const ANTHROPIC_ID: &str = "call_failed__Z_foreign_item__";
+    const RESPONSES_ID: &str = "call_failed__Z";
+
+    let source = AssistantSource {
+        api: Api::Other("foreign".into()),
+        provider: ProviderId::new("foreign"),
+        model: "foreign-model".into(),
+    };
+    let context = |stop_reason| {
+        Context::new([
+            Message::user("Run"),
+            Message::assistant(AssistantMessage {
+                content: vec![tool_call(FOREIGN_ID, "lookup")],
+                stop_reason,
+                ..assistant(&source)
+            }),
+            Message::tool_result(ToolResultMessage::new(
+                FOREIGN_ID,
+                "lookup",
+                [InputContent::text("done")],
+            )),
+        ])
+    };
+
+    let openai_server = serve([Reply::sse(openai_done()), Reply::sse(openai_done())]).await;
+    let mut openai_model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    openai_model.base_url = openai_server.base_url.clone();
+    for stop_reason in [StopReason::Error, StopReason::Aborted] {
+        openai::stream(
+            &openai_model
+                .typed::<ds_ai::OpenAiResponsesOptions>()
+                .unwrap(),
+            &context(stop_reason),
+            &OpenAiResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .result()
+        .await
+        .unwrap();
+    }
+    for request in openai_server.requests().await {
+        let input = request_json(&request)["input"].as_array().unwrap().to_vec();
+        let result = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(result["call_id"], RESPONSES_ID);
+    }
+
+    let anthropic_server =
+        serve([Reply::sse(anthropic_done()), Reply::sse(anthropic_done())]).await;
+    let mut anthropic_model = builtin_model("anthropic", "claude-sonnet-4-5").unwrap();
+    anthropic_model.base_url = anthropic_server.base_url.clone();
+    for stop_reason in [StopReason::Error, StopReason::Aborted] {
+        anthropic::stream(
+            &anthropic_model.typed::<ds_ai::AnthropicOptions>().unwrap(),
+            &context(stop_reason),
+            &AnthropicOptions {
+                stream: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    cache_retention: CacheRetention::None,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .result()
+        .await
+        .unwrap();
+    }
+    for request in anthropic_server.requests().await {
+        let messages = request_json(&request)["messages"]
+            .as_array()
+            .unwrap()
+            .to_vec();
+        let result = messages
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .find(|content| content["type"] == "tool_result")
+            .unwrap();
+        assert_eq!(result["tool_use_id"], ANTHROPIC_ID);
+    }
+
+    let codex_server = serve([Reply::sse(codex_done()), Reply::sse(codex_done())]).await;
+    let mut codex_model = builtin_model("openai-codex", "gpt-5.6-sol").unwrap();
+    codex_model.base_url = codex_server.base_url.clone();
+    for stop_reason in [StopReason::Error, StopReason::Aborted] {
+        codex::stream(
+            &codex_model
+                .typed::<ds_ai::OpenAiCodexResponsesOptions>()
+                .unwrap(),
+            &context(stop_reason),
+            &OpenAiCodexResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some(codex_token("acc_failed")),
+                    cache_retention: CacheRetention::None,
+                    transport: Some(Transport::Sse),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .result()
+        .await
+        .unwrap();
+    }
+    for request in codex_server.request_bytes().await {
+        let input = codex_request_json(&request)["input"]
+            .as_array()
+            .unwrap()
+            .to_vec();
+        let result = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(result["call_id"], RESPONSES_ID);
+    }
 }
 
 #[tokio::test]

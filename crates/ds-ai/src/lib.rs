@@ -14,6 +14,7 @@ mod provider;
 mod provider_stream;
 mod retry;
 mod schema;
+mod session_resources;
 mod sse;
 mod text;
 mod transport;
@@ -45,12 +46,13 @@ pub use estimate::{
 };
 pub use event_stream::{AssistantMessageEventStream, AssistantMessageStreamError};
 pub use frame::{
-    AssistantMessageFrame, AssistantMessageFrameError, assistant_message_event_to_frame,
+    AssistantMessageFrame, AssistantMessageFrameEncoder, AssistantMessageFrameError,
     reduce_assistant_message_frames,
 };
 pub use message::{
     AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantMessageEvent,
-    AssistantToolCall, DiagnosticError, ImageContent, TextContent, ThinkingContent,
+    AssistantToolCall, DiagnosticError, DoneReason, ErrorReason, ImageContent, TextContent,
+    ThinkingContent,
 };
 pub use model::{
     AnthropicFallbackModel, AnthropicMessagesCompatibility, Api, ApiModel, ApiModelError, Model,
@@ -65,6 +67,10 @@ pub use provider::{
     SimpleStreamOptions, StreamOptions, ThinkingBudgets, ToolChoice, Transport,
 };
 pub use retry::{RetryCallbacks, RetryPolicy, is_retryable_assistant_error, retry_assistant_call};
+pub use session_resources::{
+    SessionResourceCleanupError, SessionResourceCleanupRegistration, cleanup_session_resources,
+    register_session_resource_cleanup,
+};
 pub use text::{ContentText, content_text, content_text_with_separator};
 pub use types::{
     CacheRetention, ConstrainedSampling, ConstrainedSamplingStrictness, Context, GrammarVariants,

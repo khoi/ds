@@ -2,9 +2,10 @@ use crate::support::{Reply, serve};
 use async_trait::async_trait;
 use ds_ai::{
     AnthropicMessagesCompatibility, AnthropicOptions, Api, AssistantContent, AssistantMessage,
-    AssistantMessageEvent, AssistantToolCall, AuthContext, CacheRetention, Context, InputContent,
-    Message, ModelCompatibility, Models, ResponseHook, SimpleStreamOptions, StopReason,
-    StreamOptions, TextContent, ThinkingContent, Tool, ToolResultMessage, anthropic, builtin_model,
+    AssistantMessageEvent, AssistantToolCall, AuthContext, CacheRetention, Context, ErrorReason,
+    InputContent, Message, ModelCompatibility, Models, ResponseHook, SimpleStreamOptions,
+    StopReason, StreamOptions, TextContent, ThinkingContent, ThinkingLevel, Tool,
+    ToolResultMessage, anthropic, builtin_model,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -260,7 +261,7 @@ async fn resolves_anthropic_environment_auth_and_request_header_precedence() {
 }
 
 #[tokio::test]
-async fn limits_anthropic_session_affinity_to_nonempty_api_key_sessions() {
+async fn limits_anthropic_session_affinity_to_cached_api_key_sessions() {
     let mut model = model("claude-opus-4-5", "");
     anthropic_compat(&mut model).send_session_affinity_headers = Some(true);
 
@@ -273,7 +274,18 @@ async fn limits_anthropic_session_affinity_to_nonempty_api_key_sessions() {
         }),
     )
     .await;
-    assert!(api_key_request.contains("x-session-affinity: session-1\r\n"));
+    assert!(!api_key_request.contains("x-session-affinity:"));
+
+    let (_, cached_request) = request_for_model(
+        model.clone(),
+        Context::new([Message::user("Hello")]),
+        options(|stream| {
+            stream.cache_retention = CacheRetention::Short;
+            stream.session_id = Some("session-1".into());
+        }),
+    )
+    .await;
+    assert!(cached_request.contains("x-session-affinity: session-1\r\n"));
 
     let (_, empty_session_request) = request_for_model(
         model.clone(),
@@ -341,6 +353,39 @@ async fn omits_empty_anthropic_user_content_but_keeps_images() {
             }]
         }])
     );
+}
+
+#[tokio::test]
+async fn omits_empty_anthropic_system_prompt() {
+    let body = request_body(Context::new([Message::user("Hello")]).with_system("")).await;
+
+    assert!(body.get("system").is_none());
+}
+
+#[tokio::test]
+async fn does_not_cache_an_earlier_user_message_before_assistant_prefill() {
+    let assistant = AssistantMessage {
+        content: vec![text("Continue")],
+        api: Api::AnthropicMessages,
+        provider: "anthropic".into(),
+        model: "claude-sonnet-4-5".into(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Default::default(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        raw_stop_reason: Some("end_turn".into()),
+        end_turn: None,
+        timestamp: 0,
+    };
+    let body = request_body(Context::new([
+        Message::user("Hello"),
+        Message::assistant(assistant),
+    ]))
+    .await;
+
+    assert_eq!(body["messages"][0]["content"], "Hello");
 }
 
 #[tokio::test]
@@ -511,6 +556,23 @@ async fn applies_anthropic_force_adaptive_overrides() {
 }
 
 #[tokio::test]
+async fn maps_simple_xhigh_to_high_for_anthropic_46_models() {
+    for model_id in ["claude-opus-4-6", "claude-sonnet-4-6"] {
+        let body = simple_request_body(model_id, |options| {
+            options.reasoning = Some(ThinkingLevel::XHigh);
+        })
+        .await;
+        assert_eq!(body["output_config"], json!({"effort": "high"}));
+    }
+}
+
+#[tokio::test]
+async fn omits_default_anthropic_simple_tool_choice() {
+    let body = simple_request_body("claude-sonnet-4-5", |_| {}).await;
+    assert!(body.get("tool_choice").is_none());
+}
+
+#[tokio::test]
 async fn applies_anthropic_temperature_compatibility() {
     let opus = request_body_for(
         "claude-opus-4-7",
@@ -545,6 +607,19 @@ async fn applies_anthropic_temperature_compatibility() {
     )
     .await;
     assert!(custom_body.get("temperature").is_none());
+}
+
+#[tokio::test]
+async fn omits_anthropic_temperature_when_thinking_is_enabled() {
+    let mut custom = model("claude-sonnet-4-5", "");
+    custom.reasoning = false;
+    let mut options = options(|stream| stream.temperature = Some(0.4));
+    options.thinking_enabled = Some(true);
+
+    let (body, _) =
+        request_for_model(custom, Context::new([Message::user("Hello")]), options).await;
+
+    assert!(body.get("temperature").is_none());
 }
 
 #[tokio::test]
@@ -853,6 +928,34 @@ async fn preserves_noncanonical_anthropic_oauth_tool_names() {
 }
 
 #[tokio::test]
+async fn maps_duplicate_anthropic_oauth_tool_names_to_the_first_original() {
+    let sse = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tool\",\"usage\":{}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Read\",\"input\":{}}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    );
+    let server = serve([Reply::sse(sse)]).await;
+    let model = model("claude-sonnet-4-6", &server.base_url);
+    let context = Context::new([Message::user("Read")]).with_tools([
+        Tool::new("read", "First", json!({"type": "object"})),
+        Tool::new("READ", "Second", json!({"type": "object"})),
+    ]);
+    let mut options = options(|_| {});
+    options.stream.api_key = Some("sk-ant-oat-test".into());
+
+    let streamed = events(&model, &context, &options).await;
+    let response = done(&streamed);
+
+    let AssistantContent::ToolCall(call) = &response.content[0] else {
+        panic!("expected a tool call");
+    };
+    assert_eq!(call.name, "read");
+    server.requests().await;
+}
+
+#[tokio::test]
 async fn batches_anthropic_deferred_tool_results_before_sibling_content() {
     let assistant = AssistantMessage {
         content: vec![
@@ -930,6 +1033,53 @@ async fn batches_anthropic_deferred_tool_results_before_sibling_content() {
             {"type": "text", "text": "second sibling"}
         ])
     );
+}
+
+#[tokio::test]
+async fn removes_failed_anthropic_history_before_deferred_tool_placement() {
+    let failed_assistant = AssistantMessage {
+        content: vec![AssistantContent::ToolCall(AssistantToolCall {
+            id: "call_failed".into(),
+            name: "late_tool".into(),
+            arguments: json!({}),
+            thought_signature: None,
+            namespace: None,
+        })],
+        api: Api::AnthropicMessages,
+        provider: "anthropic".into(),
+        model: "claude-opus-4-6".into(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Default::default(),
+        stop_reason: StopReason::Error,
+        error_message: Some("failed".into()),
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 0,
+    };
+    let mut result =
+        ToolResultMessage::new("call_failed", "late_tool", [InputContent::text("loaded")]);
+    result.added_tool_names = Some(vec!["late_tool".into()]);
+    let context = Context::new([
+        Message::assistant(failed_assistant),
+        Message::tool_result(result),
+    ])
+    .with_tools([
+        Tool::new("base_tool", "Base", json!({"type": "object"})),
+        Tool::new("late_tool", "Late", json!({"type": "object"})),
+    ]);
+
+    let body = request_body_for(
+        "claude-opus-4-6",
+        context,
+        options(|stream| stream.cache_retention = CacheRetention::None),
+    )
+    .await;
+
+    assert!(body["tools"][0].get("defer_loading").is_none());
+    assert_eq!(body["tools"][1]["name"], "late_tool");
+    assert_eq!(body["tools"][1]["defer_loading"], true);
 }
 
 #[tokio::test]
@@ -1111,7 +1261,8 @@ async fn prices_anthropic_standard_and_fallback_one_hour_cache_writes() {
         })),
     )
     .await;
-    assert_eq!(fallback.response_model.as_deref(), Some("claude-opus-4-8"));
+    assert_eq!(fallback.model, "claude-opus-4-8");
+    assert_eq!(fallback.response_model, None);
     assert_eq!(fallback.usage.cache_write_1h, Some(400_000));
     assert!((fallback.usage.cost.cache_write - 7.75).abs() < f64::EPSILON);
 
@@ -1207,6 +1358,58 @@ async fn does_not_expose_failed_anthropic_responses_to_the_response_hook() {
 }
 
 #[tokio::test]
+async fn uses_anthropic_fallback_model_as_replay_identity() {
+    let fallback_sse = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fallback\",\"model\":\"claude-opus-4-8\",\"usage\":{}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"Fallback thought\",\"signature\":\"fallback signature\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    );
+    let fallback_server = serve([Reply::sse(fallback_sse)]).await;
+    let requested = model("claude-fable-5", &fallback_server.base_url);
+
+    let response = done(
+        &events(
+            &requested,
+            &Context::new([Message::user("Think")]),
+            &options(|_| {}),
+        )
+        .await,
+    )
+    .clone();
+
+    assert_eq!(response.model, "claude-opus-4-8");
+    assert_eq!(response.response_model, None);
+    fallback_server.requests().await;
+
+    let completed = concat!(
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    );
+    let replay_server = serve([Reply::sse(completed)]).await;
+    let actual = model("claude-opus-4-8", &replay_server.base_url);
+    done(
+        &events(
+            &actual,
+            &Context::new([Message::assistant(response)]),
+            &options(|stream| stream.cache_retention = CacheRetention::None),
+        )
+        .await,
+    );
+    let request = replay_server.requests().await.pop().unwrap();
+    let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        body["messages"][0]["content"][0],
+        json!({
+            "type": "thinking",
+            "thinking": "Fallback thought",
+            "signature": "fallback signature"
+        })
+    );
+}
+
+#[tokio::test]
 async fn streams_and_replays_anthropic_thinking_and_tool_calls() {
     let first_sse = [
         "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_thinking\",\"usage\":{\"input_tokens\":4,\"output_tokens\":0}}}\n\n",
@@ -1254,8 +1457,13 @@ async fn streams_and_replays_anthropic_thinking_and_tool_calls() {
         AssistantMessageEvent::ToolCallDelta {
             content_index: 2,
             delta,
-            ..
+            partial,
         } if delta == "{\"path\":\"README.md\""
+            && matches!(
+                partial.content.get(2),
+                Some(AssistantContent::ToolCall(call))
+                    if call.arguments == json!({"path": "README.md"})
+            )
     )));
     let response = done(&first_events);
     assert_eq!(response.stop_reason, StopReason::ToolUse);
@@ -1369,6 +1577,34 @@ async fn defaults_anthropic_tool_input_to_an_object() {
 }
 
 #[tokio::test]
+async fn preserves_progressive_anthropic_tool_arguments_at_block_stop() {
+    let sse = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_partial_tool\",\"usage\":{}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_partial\",\"name\":\"weather\",\"input\":{}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"Lo\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    );
+    let server = serve([Reply::sse(sse)]).await;
+    let model = model("claude-sonnet-4-5", &server.base_url);
+
+    let streamed = events(
+        &model,
+        &Context::new([Message::user("Weather")]),
+        &options(|_| {}),
+    )
+    .await;
+    let response = done(&streamed);
+
+    let AssistantContent::ToolCall(call) = &response.content[0] else {
+        panic!("expected a tool call");
+    };
+    assert_eq!(call.arguments, json!({"city": "Lo"}));
+    server.requests().await;
+}
+
+#[tokio::test]
 async fn preserves_anthropic_start_content_and_refusal_details() {
     let sse = [
         "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_refusal\",\"usage\":{}}}\n\n",
@@ -1475,7 +1711,7 @@ async fn cancels_an_active_anthropic_stream_with_partial_content() {
 
     match response.next().await {
         Some(AssistantMessageEvent::Error { reason, error }) => {
-            assert_eq!(reason, StopReason::Aborted);
+            assert_eq!(reason, ErrorReason::Aborted);
             assert_eq!(error.stop_reason, StopReason::Aborted);
             assert_eq!(error.error_message.as_deref(), Some("Request was aborted"));
             assert_eq!(error.content, [text("Visible")]);
@@ -1552,7 +1788,7 @@ async fn accepts_an_anthropic_stream_body_after_the_header_timeout() {
 
     match response.next().await {
         Some(AssistantMessageEvent::Error { reason, error }) => {
-            assert_eq!(reason, StopReason::Aborted);
+            assert_eq!(reason, ErrorReason::Aborted, "{error:?}");
             assert_eq!(error.stop_reason, StopReason::Aborted);
             assert_eq!(error.raw_stop_reason.as_deref(), Some("cancelled"));
             assert_eq!(error.error_message.as_deref(), Some("Request was aborted"));
@@ -1968,6 +2204,26 @@ async fn reports_anthropic_sse_parse_diagnostics_with_raw_lines() {
 }
 
 #[tokio::test]
+async fn rejects_anthropic_sse_records_without_data() {
+    let server = serve([Reply::sse("event: message_delta\n\n")]).await;
+    let model = model("claude-sonnet-4-5", &server.base_url);
+
+    let streamed = events(
+        &model,
+        &Context::new([Message::user("Hello")]),
+        &options(|_| {}),
+    )
+    .await;
+
+    assert!(
+        failed(&streamed).error_message.as_deref().is_some_and(
+            |message| message.starts_with("Could not parse Anthropic SSE event message_delta:")
+        )
+    );
+    server.requests().await;
+}
+
+#[tokio::test]
 async fn repairs_malformed_anthropic_event_and_tool_json() {
     let malformed = r#"event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"A\H\",\"text\":\"col1	col2\",\"unicode\":\"\u12xz\"}"}}
@@ -2052,6 +2308,36 @@ fn options(configure: impl FnOnce(&mut StreamOptions)) -> AnthropicOptions {
         stream,
         ..Default::default()
     }
+}
+
+async fn simple_request_body(
+    model_id: &str,
+    configure: impl FnOnce(&mut SimpleStreamOptions),
+) -> Value {
+    let completed = concat!(
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    );
+    let server = serve([Reply::sse(completed)]).await;
+    let model = model(model_id, &server.base_url);
+    let mut models = Models::new();
+    models.set_provider(Arc::new(anthropic::Provider::new([model.clone()])));
+    let mut options = SimpleStreamOptions {
+        stream: StreamOptions {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    configure(&mut options);
+
+    models
+        .complete_simple(&model, &Context::new([Message::user("Hello")]), &options)
+        .await
+        .unwrap();
+
+    let request = server.requests().await.pop().unwrap();
+    serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
 }
 
 async fn auth_request(

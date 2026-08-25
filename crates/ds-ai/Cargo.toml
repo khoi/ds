@@ -13,6 +13,10 @@ workspace = true
 name = "providers"
 path = "tests/providers.rs"
 
+[[test]]
+name = "compression"
+path = "tests/compression.rs"
+
 [dependencies]
 async-stream.workspace = true
 async-trait.workspace = true
@@ -37,4 +41,6 @@ sha2.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+brotli.workspace = true
+flate2.workspace = true
 tokio.workspace = true

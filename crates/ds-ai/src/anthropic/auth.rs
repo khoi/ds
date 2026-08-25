@@ -291,6 +291,14 @@ fn parse_authorization(
     } else {
         (Some(input.into()), expected_state.into())
     };
+    validate_authorization(code, state, expected_state)
+}
+
+fn validate_authorization(
+    code: Option<String>,
+    state: String,
+    expected_state: &str,
+) -> Result<Authorization, crate::AuthError> {
     let code = code
         .filter(|code| !code.is_empty())
         .ok_or_else(|| crate::AuthError::OAuth("missing authorization code".into()))?;
@@ -313,9 +321,9 @@ async fn wait_for_callback(
                 accepted.map_err(|error| crate::AuthError::OAuth(error.to_string()))?
             }
         };
-        let authorization = read_callback(&mut socket)
+        let authorization = read_callback(&mut socket, &cancellation)
             .await
-            .and_then(|input| parse_authorization(&input, &expected_state));
+            .and_then(|input| parse_callback_authorization(&input, &expected_state));
         match authorization {
             Ok(authorization) => {
                 write_callback(&mut socket, 200, "Authentication complete").await;
@@ -326,14 +334,30 @@ async fn wait_for_callback(
     }
 }
 
-async fn read_callback(socket: &mut TcpStream) -> Result<String, crate::AuthError> {
+fn parse_callback_authorization(
+    input: &str,
+    expected_state: &str,
+) -> Result<Authorization, crate::AuthError> {
+    let url = url::Url::parse(input).map_err(|error| crate::AuthError::OAuth(error.to_string()))?;
+    let state = query(&url, "state")
+        .filter(|state| !state.is_empty())
+        .ok_or_else(|| crate::AuthError::OAuth("missing OAuth callback state".into()))?;
+    validate_authorization(query(&url, "code"), state, expected_state)
+}
+
+async fn read_callback(
+    socket: &mut TcpStream,
+    cancellation: &CancellationToken,
+) -> Result<String, crate::AuthError> {
     let mut request = Vec::new();
     loop {
         let mut bytes = [0; 1024];
-        let count = socket
-            .read(&mut bytes)
-            .await
-            .map_err(|error| crate::AuthError::OAuth(error.to_string()))?;
+        let count = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(crate::AuthError::Cancelled),
+            count = socket.read(&mut bytes) => count
+                .map_err(|error| crate::AuthError::OAuth(error.to_string()))?,
+        };
         if count == 0 || request.len() + count > 8192 {
             return Err(crate::AuthError::OAuth("invalid OAuth callback".into()));
         }
@@ -385,4 +409,35 @@ fn now_millis() -> u64 {
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancels_a_stalled_callback_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let mut client = client.unwrap();
+        let (mut socket, _) = accepted.unwrap();
+        client
+            .write_all(b"GET /callback?code=stalled HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let read_cancellation = cancellation.clone();
+        let read =
+            tokio::spawn(async move { read_callback(&mut socket, &read_cancellation).await });
+        tokio::task::yield_now().await;
+
+        cancellation.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), read)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(crate::AuthError::Cancelled)));
+    }
 }

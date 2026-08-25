@@ -1,10 +1,10 @@
 use crate::support::{Reply, serve};
 use ds_ai::{
     Api, AssistantContent, AssistantMessage, AssistantMessageEvent, AssistantToolCall,
-    CacheRetention, Context, InputContent, Message, ModelCompatibility,
-    OpenAiResponsesCompatibility, OpenAiResponsesOptions, ProviderId, ResponseHook, StopReason,
-    StreamOptions, TextContent, ThinkingContent, Tool, ToolResultMessage, Usage, builtin_model,
-    openai,
+    CacheRetention, Context, ErrorReason, InputContent, Message, ModelCompatibility,
+    OpenAiResponsesCompatibility, OpenAiResponsesOptions, ProviderId, ResponseHook,
+    SimpleStreamOptions, StopReason, StreamOptions, TextContent, ThinkingContent, Tool,
+    ToolResultMessage, Usage, builtin_model, openai,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -137,6 +137,577 @@ async fn preserves_openai_custom_tool_namespaces() {
     assert_eq!(call.arguments, json!({"input": "abc"}));
     assert_eq!(call.namespace.as_deref(), Some("custom"));
     server.request_bytes().await;
+}
+
+#[tokio::test]
+async fn preserves_function_arguments_from_the_added_item() {
+    let sse = [
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_prefix\",\"call_id\":\"call_prefix\",\"name\":\"lookup\",\"arguments\":\"{\\\"city\\\":\\\"\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"Paris\\\"}\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_prefix\",\"call_id\":\"call_prefix\",\"name\":\"lookup\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_prefix\",\"usage\":{}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+
+    let result_events = events(
+        &model(&server.base_url),
+        &Context::new([Message::user("Look up")]),
+        &options(|_| {}),
+    )
+    .await;
+
+    let arguments = result_events
+        .iter()
+        .filter_map(|event| match event {
+            AssistantMessageEvent::ToolCallStart { partial, .. }
+            | AssistantMessageEvent::ToolCallDelta { partial, .. } => {
+                let AssistantContent::ToolCall(call) = &partial.content[0] else {
+                    panic!("expected tool call partial");
+                };
+                Some(call.arguments.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(arguments, [json!({}), json!({"city": "Paris"})]);
+
+    let result = done(&result_events);
+    let [AssistantContent::ToolCall(call)] = result.content.as_slice() else {
+        panic!("expected one tool call");
+    };
+    assert_eq!(call.arguments, json!({"city": "Paris"}));
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn emits_custom_tool_input_from_the_added_item() {
+    let sse = [
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_prefix\",\"call_id\":\"call_prefix\",\"name\":\"query\",\"input\":\"ab\"}}\n\n",
+        "data: {\"type\":\"response.custom_tool_call_input.delta\",\"output_index\":0,\"delta\":\"c\"}\n\n",
+        "data: {\"type\":\"response.custom_tool_call_input.done\",\"output_index\":0,\"input\":\"abc\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_prefix\",\"call_id\":\"call_prefix\",\"name\":\"query\",\"input\":\"abc\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_prefix\",\"usage\":{}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+
+    let result_events = events(
+        &model(&server.base_url),
+        &Context::new([Message::user("Query")]),
+        &options(|_| {}),
+    )
+    .await;
+
+    let deltas = result_events
+        .iter()
+        .filter_map(|event| match event {
+            AssistantMessageEvent::ToolCallDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(deltas, ["{\"input\":\"ab", "c", "\"}"]);
+    let [AssistantContent::ToolCall(call)] = done(&result_events).content.as_slice() else {
+        panic!("expected one tool call");
+    };
+    assert_eq!(call.arguments, json!({"input": "abc"}));
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn keeps_streamed_reasoning_when_the_terminal_item_is_empty() {
+    let sse = [
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_empty\",\"summary\":[]}}\n\n",
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"Keep this\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_empty\",\"summary\":[],\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_reasoning\",\"usage\":{}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+
+    let result_events = events(
+        &model(&server.base_url),
+        &Context::new([Message::user("Think")]),
+        &options(|_| {}),
+    )
+    .await;
+    let result = done(&result_events);
+
+    let [AssistantContent::Thinking(thinking)] = result.content.as_slice() else {
+        panic!("expected one reasoning block");
+    };
+    assert_eq!(thinking.thinking, "Keep this");
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn keeps_streamed_function_arguments_when_the_terminal_item_is_empty() {
+    let sse = [
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_empty\",\"call_id\":\"call_empty\",\"name\":\"lookup\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"city\\\":\\\"Paris\\\"}\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_empty\",\"call_id\":\"call_empty\",\"name\":\"lookup\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_arguments\",\"usage\":{}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+
+    let result_events = events(
+        &model(&server.base_url),
+        &Context::new([Message::user("Look up")]),
+        &options(|_| {}),
+    )
+    .await;
+    let result = done(&result_events);
+
+    let [AssistantContent::ToolCall(call)] = result.content.as_slice() else {
+        panic!("expected one tool call");
+    };
+    assert_eq!(call.arguments, json!({"city": "Paris"}));
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn keeps_tool_namespaces_when_the_terminal_items_omit_them() {
+    let sse = [
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_namespace\",\"call_id\":\"call_function\",\"name\":\"lookup\",\"arguments\":\"{}\",\"namespace\":\"functions\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_namespace\",\"call_id\":\"call_function\",\"name\":\"lookup\",\"arguments\":\"{}\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_namespace\",\"call_id\":\"call_custom\",\"name\":\"query\",\"input\":\"value\",\"namespace\":\"custom\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_namespace\",\"call_id\":\"call_custom\",\"name\":\"query\",\"input\":\"value\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_namespaces\",\"usage\":{}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+
+    let result_events = events(
+        &model(&server.base_url),
+        &Context::new([Message::user("Use tools")]),
+        &options(|_| {}),
+    )
+    .await;
+    let result = done(&result_events);
+
+    let namespaces = result
+        .content
+        .iter()
+        .map(|content| match content {
+            AssistantContent::ToolCall(call) => call.namespace.as_deref(),
+            _ => panic!("expected tool calls"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(namespaces, [Some("functions"), Some("custom")]);
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn keeps_tool_identity_from_the_added_items() {
+    let sse = [
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_added\",\"call_id\":\"call_added\",\"name\":\"lookup\",\"arguments\":\"{}\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_terminal\",\"call_id\":\"call_terminal\",\"name\":\"replace\",\"arguments\":\"{}\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_added\",\"call_id\":\"custom_added\",\"name\":\"query\",\"input\":\"value\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_terminal\",\"call_id\":\"custom_terminal\",\"name\":\"replace\",\"input\":\"value\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_identity\",\"usage\":{}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+
+    let result_events = events(
+        &model(&server.base_url),
+        &Context::new([Message::user("Use tools")]),
+        &options(|_| {}),
+    )
+    .await;
+    let result = done(&result_events);
+
+    let calls = result
+        .content
+        .iter()
+        .map(|content| match content {
+            AssistantContent::ToolCall(call) => (call.id.as_str(), call.name.as_str()),
+            _ => panic!("expected tool calls"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls,
+        [
+            ("call_added|fc_added", "lookup"),
+            ("custom_added|ctc_added", "query"),
+        ]
+    );
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn leaves_reasoning_usage_absent_when_terminal_usage_is_missing() {
+    let server = serve([Reply::sse(
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_without_usage\"}}\n\n",
+    )])
+    .await;
+
+    let result_events = events(
+        &model(&server.base_url),
+        &Context::new([Message::user("Hello")]),
+        &options(|_| {}),
+    )
+    .await;
+    let result = done(&result_events);
+
+    assert_eq!(result.usage, Usage::default());
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn retains_an_empty_created_response_id() {
+    let sse = [
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"\",\"usage\":{}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+
+    let result_events = events(
+        &model(&server.base_url),
+        &Context::new([Message::user("Hello")]),
+        &options(|_| {}),
+    )
+    .await;
+    let result = done(&result_events);
+
+    assert_eq!(result.response_id.as_deref(), Some(""));
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn validates_openai_text_signatures_for_replay() {
+    let server = serve([Reply::sse(
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_signatures\",\"usage\":{}}}\n\n",
+    )])
+    .await;
+    let replay = AssistantMessage {
+        content: vec![
+            text("Fallback", Some(("", Some("final_answer")))),
+            text("No phase", Some(("msg_unknown", Some("unknown")))),
+        ],
+        api: Api::OpenAiResponses,
+        provider: ProviderId::new("openai"),
+        model: "gpt-5.6".into(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 2,
+    };
+
+    done(
+        &events(
+            &model(&server.base_url),
+            &Context::new([
+                Message::user("Hello"),
+                Message::assistant(replay),
+                Message::user("Continue"),
+            ]),
+            &options(|_| {}),
+        )
+        .await,
+    );
+
+    let request = server.requests().await.pop().unwrap();
+    let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        body["input"][1],
+        json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Fallback", "annotations": []}],
+            "status": "completed",
+            "id": "msg_pi_1",
+            "phase": "final_answer"
+        })
+    );
+    assert_eq!(
+        body["input"][2],
+        json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "No phase", "annotations": []}],
+            "status": "completed",
+            "id": "msg_unknown"
+        })
+    );
+}
+
+#[tokio::test]
+async fn uses_utf16_units_for_openai_message_signature_ids() {
+    let server = serve([Reply::sse(
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_utf16\",\"usage\":{}}}\n\n",
+    )])
+    .await;
+    let retained_id = format!("{}é", "a".repeat(63));
+    let hashed_id = format!("{}😀Z", "a".repeat(62));
+    let replay = AssistantMessage {
+        content: vec![
+            text("Retained", Some((&retained_id, None))),
+            text("Hashed", Some((&hashed_id, None))),
+        ],
+        api: Api::OpenAiResponses,
+        provider: ProviderId::new("openai"),
+        model: "gpt-5.6".into(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 2,
+    };
+
+    done(
+        &events(
+            &model(&server.base_url),
+            &Context::new([Message::user("Hello"), Message::assistant(replay)]),
+            &options(|_| {}),
+        )
+        .await,
+    );
+
+    let request = server.requests().await.pop().unwrap();
+    let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["input"][1]["id"], retained_id);
+    assert_eq!(body["input"][2]["id"], "msg_s9g3b1spa9oz");
+}
+
+#[tokio::test]
+async fn rejects_malformed_same_model_reasoning_signatures() {
+    let replay = AssistantMessage {
+        content: vec![AssistantContent::Thinking(ThinkingContent {
+            thinking: "Reasoning".into(),
+            thinking_signature: Some("{".into()),
+            redacted: None,
+        })],
+        api: Api::OpenAiResponses,
+        provider: ProviderId::new("openai"),
+        model: "gpt-5.6".into(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 2,
+    };
+
+    let result_events = events(
+        &model("http://127.0.0.1:9"),
+        &Context::new([Message::assistant(replay)]),
+        &options(|_| {}),
+    )
+    .await;
+
+    assert!(
+        failed(&result_events)
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.starts_with("invalid request: EOF while parsing"))
+    );
+}
+
+#[tokio::test]
+async fn indexes_fallback_message_ids_after_failed_turns_are_removed() {
+    let server = serve([Reply::sse(
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_index\",\"usage\":{}}}\n\n",
+    )])
+    .await;
+    let assistant = |value: &str, stop_reason| AssistantMessage {
+        content: vec![text(value, None)],
+        api: Api::OpenAiResponses,
+        provider: ProviderId::new("openai"),
+        model: "gpt-5.6".into(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 2,
+    };
+    let context = Context::new([
+        Message::user("Hello"),
+        Message::assistant(assistant("Discard", StopReason::Error)),
+        Message::assistant(assistant("Keep", StopReason::Stop)),
+        Message::user("Continue"),
+    ]);
+
+    done(&events(&model(&server.base_url), &context, &options(|_| {})).await);
+
+    let request = server.requests().await.pop().unwrap();
+    let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let kept = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "message" && item["role"] == "assistant")
+        .unwrap();
+    assert_eq!(kept["id"], "msg_pi_1");
+}
+
+#[test]
+fn serializes_the_full_openai_tool_choice_union() {
+    for (choice, expected) in [
+        (openai::ToolChoice::Auto, json!("auto")),
+        (openai::ToolChoice::None, json!("none")),
+        (openai::ToolChoice::Required, json!("required")),
+        (
+            openai::ToolChoice::Function("lookup".into()),
+            json!({"type": "function", "name": "lookup"}),
+        ),
+        (
+            openai::ToolChoice::Custom("query".into()),
+            json!({"type": "custom", "name": "query"}),
+        ),
+        (
+            openai::ToolChoice::AllowedTools {
+                mode: openai::AllowedToolsMode::Required,
+                tools: vec![
+                    json!({"type": "function", "name": "lookup"}),
+                    json!({"type": "mcp", "server_label": "docs"}),
+                ],
+            },
+            json!({
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [
+                    {"type": "function", "name": "lookup"},
+                    {"type": "mcp", "server_label": "docs"}
+                ]
+            }),
+        ),
+        (
+            openai::ToolChoice::Hosted(openai::HostedTool::FileSearch),
+            json!({"type": "file_search"}),
+        ),
+        (
+            openai::ToolChoice::Hosted(openai::HostedTool::WebSearchPreview),
+            json!({"type": "web_search_preview"}),
+        ),
+        (
+            openai::ToolChoice::Hosted(openai::HostedTool::Computer),
+            json!({"type": "computer"}),
+        ),
+        (
+            openai::ToolChoice::Hosted(openai::HostedTool::ComputerUsePreview),
+            json!({"type": "computer_use_preview"}),
+        ),
+        (
+            openai::ToolChoice::Hosted(openai::HostedTool::ComputerUse),
+            json!({"type": "computer_use"}),
+        ),
+        (
+            openai::ToolChoice::Hosted(openai::HostedTool::WebSearchPreview20250311),
+            json!({"type": "web_search_preview_2025_03_11"}),
+        ),
+        (
+            openai::ToolChoice::Hosted(openai::HostedTool::ImageGeneration),
+            json!({"type": "image_generation"}),
+        ),
+        (
+            openai::ToolChoice::Hosted(openai::HostedTool::CodeInterpreter),
+            json!({"type": "code_interpreter"}),
+        ),
+        (
+            openai::ToolChoice::Hosted(openai::HostedTool::Mcp),
+            json!({"type": "mcp"}),
+        ),
+        (
+            openai::ToolChoice::Mcp {
+                server_label: "docs".into(),
+                name: None,
+            },
+            json!({"type": "mcp", "server_label": "docs"}),
+        ),
+        (
+            openai::ToolChoice::Mcp {
+                server_label: "docs".into(),
+                name: Some(Some("search".into())),
+            },
+            json!({"type": "mcp", "server_label": "docs", "name": "search"}),
+        ),
+        (
+            openai::ToolChoice::Mcp {
+                server_label: "docs".into(),
+                name: Some(None),
+            },
+            json!({"type": "mcp", "server_label": "docs", "name": null}),
+        ),
+        (
+            openai::ToolChoice::ApplyPatch,
+            json!({"type": "apply_patch"}),
+        ),
+        (openai::ToolChoice::Shell, json!({"type": "shell"})),
+    ] {
+        assert_eq!(serde_json::to_value(choice).unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn serializes_scale_and_explicit_null_openai_service_tiers() {
+    let completed = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tier\",\"usage\":{}}}\n\n";
+    let server = serve([Reply::sse(completed), Reply::sse(completed)]).await;
+
+    for tier in [openai::ServiceTier::Scale, openai::ServiceTier::Null] {
+        done(
+            &events(
+                &model(&server.base_url),
+                &Context::new([Message::user("Hello")]),
+                &options(|options| options.service_tier = Some(tier)),
+            )
+            .await,
+        );
+    }
+
+    let requests = server.requests().await;
+    let bodies = requests
+        .iter()
+        .map(|request| {
+            serde_json::from_str::<Value>(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(bodies[0]["service_tier"], "scale");
+    assert_eq!(bodies[1]["service_tier"], Value::Null);
+}
+
+#[tokio::test]
+async fn omits_the_default_simple_openai_tool_choice() {
+    let server = serve([Reply::sse(
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_simple\",\"usage\":{}}}\n\n",
+    )])
+    .await;
+    let stream = openai::provider().stream_simple(
+        &model(&server.base_url),
+        &Context::new([Message::user("Hello")]),
+        &SimpleStreamOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    let result_events = stream.collect::<Vec<_>>().await;
+    done(&result_events);
+
+    let request = server.requests().await.pop().unwrap();
+    let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert!(body.get("tool_choice").is_none());
 }
 
 #[tokio::test]
@@ -1266,12 +1837,36 @@ async fn rejects_invalid_strict_tool_schemas_before_connecting() {
     )
     .with_strict()]);
 
-    let events = events(&model, &context, &options(|_| {})).await;
+    let result_events = events(&model, &context, &options(|_| {})).await;
 
     assert_eq!(
-        failed(&events).error_message.as_deref(),
+        failed(&result_events).error_message.as_deref(),
         Some(
-            "invalid request: tool \"lookup\" requires JSON-schema constrained sampling, but $defs schemas are unsupported"
+            "invalid request: Tool \"lookup\" requires JSON-schema constrained sampling, but $defs schemas are unsupported."
+        )
+    );
+
+    let context = Context::new([Message::user("Look up")]).with_tools([Tool::new(
+        "lookup",
+        "Look up a value",
+        json!({
+            "type": "object",
+            "properties": {
+                "metadata": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"}
+                }
+            }
+        }),
+    )
+    .with_strict()]);
+    let additional_properties_events = events(&model, &context, &options(|_| {})).await;
+    assert_eq!(
+        failed(&additional_properties_events)
+            .error_message
+            .as_deref(),
+        Some(
+            "invalid request: Tool \"lookup\" requires JSON-schema constrained sampling, but schema-valued or true additionalProperties is unsupported."
         )
     );
 }
@@ -1524,7 +2119,7 @@ async fn matches_empty_openai_terminal_and_event_fields() {
 
     let first_events = events(&model, &context, &options(|_| {})).await;
     let first = failed(&first_events);
-    assert_eq!(first.response_id, None);
+    assert_eq!(first.response_id.as_deref(), Some(""));
     assert_eq!(first.raw_stop_reason, None);
     assert_eq!(first.error_message.as_deref(), Some("unknown: no message"));
 
@@ -1764,7 +2359,7 @@ async fn cancels_an_active_openai_stream_with_partial_content() {
 
     match response.next().await {
         Some(AssistantMessageEvent::Error { reason, error }) => {
-            assert_eq!(reason, StopReason::Aborted);
+            assert_eq!(reason, ErrorReason::Aborted);
             assert_eq!(error.stop_reason, StopReason::Aborted);
             assert_eq!(error.raw_stop_reason.as_deref(), Some("cancelled"));
             assert_eq!(
@@ -1851,7 +2446,7 @@ async fn accepts_an_openai_stream_body_after_the_header_timeout() {
 
     match response.next().await {
         Some(AssistantMessageEvent::Error { reason, error }) => {
-            assert_eq!(reason, StopReason::Aborted);
+            assert_eq!(reason, ErrorReason::Aborted);
             assert_eq!(error.stop_reason, StopReason::Aborted);
             assert_eq!(error.raw_stop_reason.as_deref(), Some("cancelled"));
             assert_eq!(

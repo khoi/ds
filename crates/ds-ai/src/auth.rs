@@ -192,7 +192,9 @@ pub struct SystemAuthContext;
 #[async_trait]
 impl AuthContext for SystemAuthContext {
     async fn env(&self, name: &str) -> Option<String> {
-        std::env::var(name).ok().filter(|value| !value.is_empty())
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
     }
 
     async fn file_exists(&self, path: &str) -> bool {
@@ -416,7 +418,7 @@ impl ApiKeyAuth for EnvApiKeyAuth {
             }));
         }
         for name in &self.env_names {
-            if let Some(key) = context.env(name).await.filter(|key| !key.is_empty()) {
+            if let Some(key) = context.env(name).await.filter(|key| !key.trim().is_empty()) {
                 cancelled(cancellation)?;
                 return Ok(Some(AuthResult {
                     auth: ModelAuth {

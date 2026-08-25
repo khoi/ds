@@ -1,6 +1,7 @@
 use crate::{
-    AssistantContent, AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream,
-    AssistantToolCall, Error, Model, Response, StopReason, TextContent, ThinkingContent, json,
+    AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantMessageEvent,
+    AssistantMessageEventStream, AssistantToolCall, Error, Model, Response, StopReason,
+    TextContent, ThinkingContent, json,
 };
 use async_stream::stream;
 use futures_util::StreamExt;
@@ -9,10 +10,11 @@ use std::{
     future::Future,
     pin::Pin,
 };
+use tokio_util::sync::CancellationToken;
 
 pub(crate) enum ProviderEvent {
     ResponseId(String),
-    ResponseModel(String),
+    ModelOverride(String),
     TextStart {
         content_index: usize,
         content: TextContent,
@@ -51,32 +53,73 @@ pub(crate) enum ProviderEvent {
         content_index: usize,
         delta: String,
     },
+    ToolCallArgumentsPrefix {
+        content_index: usize,
+        prefix: String,
+    },
     Done(Box<Response>),
 }
 
 pub(crate) type ProviderEventStream =
     Pin<Box<dyn futures_core::Stream<Item = Result<ProviderEvent, Error>> + Send>>;
 
-pub(crate) fn failure(model: Model, error: Error) -> AssistantMessageEventStream {
-    adapt(model, async { Err(error) })
+pub(crate) struct ProviderStreamSetup {
+    source: ProviderEventStream,
+    initial_diagnostics: Vec<AssistantMessageDiagnostic>,
 }
 
-pub(crate) fn adapt(
+impl ProviderStreamSetup {
+    pub(crate) fn new(source: ProviderEventStream) -> Self {
+        Self {
+            source,
+            initial_diagnostics: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_diagnostic(mut self, diagnostic: AssistantMessageDiagnostic) -> Self {
+        self.initial_diagnostics.push(diagnostic);
+        self
+    }
+}
+
+impl From<ProviderEventStream> for ProviderStreamSetup {
+    fn from(source: ProviderEventStream) -> Self {
+        Self::new(source)
+    }
+}
+
+pub(crate) fn failure(model: Model, error: Error) -> AssistantMessageEventStream {
+    adapt(model, CancellationToken::new(), async {
+        Err::<ProviderEventStream, _>(error)
+    })
+}
+
+pub(crate) fn adapt<S>(
     model: Model,
-    setup: impl Future<Output = Result<ProviderEventStream, Error>> + Send + 'static,
-) -> AssistantMessageEventStream {
+    cancellation: CancellationToken,
+    setup: impl Future<Output = Result<S, Error>> + Send + 'static,
+) -> AssistantMessageEventStream
+where
+    S: Into<ProviderStreamSetup> + Send + 'static,
+{
     let output = stream! {
-        let mut source = match setup.await {
-            Ok(source) => source,
+        let ProviderStreamSetup {
+            mut source,
+            initial_diagnostics,
+        } = match setup.await {
+            Ok(setup) => setup.into(),
             Err(error) => {
-                yield error_event(&model, error, None);
+                let response = error.partial().cloned();
+                yield error_event(&model, error, response, None);
                 return;
             }
         };
         let mut partial = empty_message(&model);
         let mut started = BTreeSet::new();
-        let mut ended = BTreeSet::new();
         let mut tool_json = BTreeMap::<usize, String>::new();
+        for diagnostic in initial_diagnostics {
+            add_diagnostic(&mut partial, diagnostic);
+        }
         yield AssistantMessageEvent::Start {
             partial: partial.clone(),
         };
@@ -85,8 +128,9 @@ pub(crate) fn adapt(
                 Ok(ProviderEvent::ResponseId(response_id)) => {
                     partial.response_id = Some(response_id);
                 }
-                Ok(ProviderEvent::ResponseModel(response_model)) => {
-                    partial.response_model = Some(response_model);
+                Ok(ProviderEvent::ModelOverride(model)) => {
+                    partial.model = model;
+                    partial.response_model = None;
                 }
                 Ok(ProviderEvent::TextStart {
                     content_index,
@@ -127,7 +171,6 @@ pub(crate) fn adapt(
                     if let Some(slot) = partial.content.get_mut(content_index) {
                         *slot = AssistantContent::Text(content.clone());
                     }
-                    ended.insert(content_index);
                     yield AssistantMessageEvent::TextEnd {
                         content_index,
                         content: content.text,
@@ -187,7 +230,6 @@ pub(crate) fn adapt(
                     if let Some(slot) = partial.content.get_mut(content_index) {
                         *slot = AssistantContent::Thinking(content.clone());
                     }
-                    ended.insert(content_index);
                     yield AssistantMessageEvent::ThinkingEnd {
                         content_index,
                         content: content.thinking,
@@ -244,7 +286,6 @@ pub(crate) fn adapt(
                     if let Some(slot) = partial.content.get_mut(content_index) {
                         *slot = AssistantContent::ToolCall(tool_call.clone());
                     }
-                    ended.insert(content_index);
                     yield AssistantMessageEvent::ToolCallEnd {
                         content_index,
                         tool_call,
@@ -269,7 +310,7 @@ pub(crate) fn adapt(
                     let buffer = tool_json.entry(content_index).or_default();
                     buffer.push_str(&delta);
                     if let Some(AssistantContent::ToolCall(content)) = partial.content.get_mut(content_index) {
-                        content.arguments = json::value(buffer);
+                        content.arguments = json::streaming_value(buffer);
                     }
                     yield AssistantMessageEvent::ToolCallDelta {
                         content_index,
@@ -277,28 +318,55 @@ pub(crate) fn adapt(
                         partial: partial.clone(),
                     };
                 }
+                Ok(ProviderEvent::ToolCallArgumentsPrefix {
+                    content_index,
+                    prefix,
+                }) => {
+                    tool_json.insert(content_index, prefix);
+                }
                 Ok(ProviderEvent::Done(response)) => {
-                    let message = final_message(&model, *response);
-                    for event in end_events(&mut partial, &message, &mut started, &ended) {
-                        yield event;
+                    if cancellation.is_cancelled() {
+                        let response = *response;
+                        yield error_event(
+                            &model,
+                            Error::Cancelled { partial: None },
+                            Some(response),
+                            Some(&partial),
+                        );
+                        return;
                     }
-                    yield AssistantMessageEvent::Done {
-                        reason: message.stop_reason,
-                        message,
-                    };
+                    let mut message = final_message(&model, *response, partial.timestamp);
+                    sync_stream_state(&mut message, &partial);
+                    match crate::DoneReason::try_from(message.stop_reason) {
+                        Ok(reason) => yield AssistantMessageEvent::Done { reason, message },
+                        Err(reason) => {
+                            message.stop_reason = StopReason::Error;
+                            message.error_message = Some(format!(
+                                "provider returned invalid terminal reason: {reason:?}"
+                            ));
+                            yield AssistantMessageEvent::Error {
+                                reason: crate::ErrorReason::Error,
+                                error: message,
+                            };
+                        }
+                    }
                     return;
                 }
                 Err(error) => {
                     let response = error.partial().cloned();
-                    yield error_event(&model, error, response);
+                    yield error_event(&model, error, response, Some(&partial));
                     return;
                 }
             }
         }
-        let error = Error::IncompleteStream {
-            partial: Response::default(),
+        let error = if cancellation.is_cancelled() {
+            Error::Cancelled { partial: None }
+        } else {
+            Error::IncompleteStream {
+                partial: Response::default(),
+            }
         };
-        yield error_event(&model, error, None);
+        yield error_event(&model, error, None, Some(&partial));
     };
     AssistantMessageEventStream::new(output)
 }
@@ -328,36 +396,6 @@ fn start_content(
     Some(start_event(content_index, kind, partial.clone()))
 }
 
-fn end_events(
-    partial: &mut AssistantMessage,
-    message: &AssistantMessage,
-    started: &mut BTreeSet<usize>,
-    ended: &BTreeSet<usize>,
-) -> Vec<AssistantMessageEvent> {
-    let mut events = Vec::new();
-    for (content_index, content) in message.content.iter().enumerate() {
-        if ended.contains(&content_index) {
-            continue;
-        }
-        if started.insert(content_index) {
-            if partial.content.len() == content_index {
-                partial.content.push(content.clone());
-            }
-            let kind = match content {
-                AssistantContent::Text(_) => ContentKind::Text,
-                AssistantContent::Thinking(_) => ContentKind::Thinking,
-                AssistantContent::ToolCall(_) => ContentKind::ToolCall,
-            };
-            events.push(start_event(content_index, kind, partial.clone()));
-        }
-        if let Some(slot) = partial.content.get_mut(content_index) {
-            *slot = content.clone();
-        }
-        events.push(end_event(content_index, content, partial.clone()));
-    }
-    events
-}
-
 fn start_event(
     content_index: usize,
     kind: ContentKind,
@@ -379,33 +417,9 @@ fn start_event(
     }
 }
 
-fn end_event(
-    content_index: usize,
-    content: &AssistantContent,
-    partial: AssistantMessage,
-) -> AssistantMessageEvent {
-    match content {
-        AssistantContent::Text(content) => AssistantMessageEvent::TextEnd {
-            content_index,
-            content: content.text.clone(),
-            partial,
-        },
-        AssistantContent::Thinking(content) => AssistantMessageEvent::ThinkingEnd {
-            content_index,
-            content: content.thinking.clone(),
-            partial,
-        },
-        AssistantContent::ToolCall(tool_call) => AssistantMessageEvent::ToolCallEnd {
-            content_index,
-            tool_call: tool_call.clone(),
-            partial,
-        },
-    }
-}
-
-fn final_message(model: &Model, response: Response) -> AssistantMessage {
+fn final_message(model: &Model, response: Response, timestamp: u64) -> AssistantMessage {
     let service_tier = response.service_tier.clone();
-    let mut message = response.into_assistant_message(model, timestamp());
+    let mut message = response.into_assistant_message(model, timestamp);
     match model.api {
         crate::Api::AnthropicMessages => crate::anthropic::calculate_cost(
             model,
@@ -420,19 +434,26 @@ fn final_message(model: &Model, response: Response) -> AssistantMessage {
                 service_tier.as_deref(),
             );
         }
-        crate::Api::Other(_) => model.calculate_cost(&mut message.usage),
+        crate::Api::Other(_) => {
+            model.calculate_cost(&mut message.usage);
+        }
     }
     message
 }
 
-fn error_event(model: &Model, error: Error, response: Option<Response>) -> AssistantMessageEvent {
+fn error_event(
+    model: &Model,
+    error: Error,
+    response: Option<Response>,
+    stream_partial: Option<&AssistantMessage>,
+) -> AssistantMessageEvent {
     let reason = if matches!(
         error,
         Error::Cancelled { .. } | Error::Hook { aborted: true, .. }
     ) {
-        StopReason::Aborted
+        crate::ErrorReason::Aborted
     } else {
-        StopReason::Error
+        crate::ErrorReason::Error
     };
     let error_message = match (&error, &model.api) {
         (Error::Cancelled { partial: None }, crate::Api::OpenAiResponses) => {
@@ -467,14 +488,51 @@ fn error_event(model: &Model, error: Error, response: Option<Response>) -> Assis
         _ => error.to_string(),
     };
     let mut message = response.map_or_else(
-        || empty_message(model),
-        |response| final_message(model, response),
+        || {
+            stream_partial
+                .cloned()
+                .unwrap_or_else(|| empty_message(model))
+        },
+        |response| {
+            final_message(
+                model,
+                response,
+                stream_partial.map_or_else(timestamp, |partial| partial.timestamp),
+            )
+        },
     );
-    message.stop_reason = reason;
+    if let Some(stream_partial) = stream_partial {
+        message.timestamp = stream_partial.timestamp;
+        sync_stream_state(&mut message, stream_partial);
+    }
+    message.stop_reason = reason.into();
     message.error_message = Some(error_message);
     AssistantMessageEvent::Error {
         reason,
         error: message,
+    }
+}
+
+fn add_diagnostic(message: &mut AssistantMessage, diagnostic: AssistantMessageDiagnostic) {
+    let diagnostics = message.diagnostics.get_or_insert_with(Vec::new);
+    if !diagnostics.contains(&diagnostic) {
+        diagnostics.push(diagnostic);
+    }
+}
+
+fn sync_stream_state(message: &mut AssistantMessage, partial: &AssistantMessage) {
+    message.model.clone_from(&partial.model);
+    if message.response_model.as_deref() == Some(partial.model.as_str()) {
+        message.response_model = None;
+    }
+    let diagnostics = message.diagnostics.get_or_insert_with(Vec::new);
+    for diagnostic in partial.diagnostics.iter().flatten() {
+        if !diagnostics.contains(diagnostic) {
+            diagnostics.push(diagnostic.clone());
+        }
+    }
+    if diagnostics.is_empty() {
+        message.diagnostics = None;
     }
 }
 

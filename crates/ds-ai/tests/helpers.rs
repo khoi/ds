@@ -333,7 +333,7 @@ async fn preserves_nested_provider_codes_and_metadata_once() {
     };
     assert_eq!(
         error.error_message.as_deref(),
-        Some("OpenAI API error (403): 403 {}")
+        Some("OpenAI API error (403): 403 status code (no body)")
     );
 
     let top_level = openai::stream(
@@ -350,7 +350,7 @@ async fn preserves_nested_provider_codes_and_metadata_once() {
     };
     assert_eq!(
         error.error_message.as_deref(),
-        Some("OpenAI API error (429): 429 status code (no body)")
+        Some("OpenAI API error (429): {\"message\":\"Too many requests\"}")
     );
     server.requests().await;
 }

@@ -176,7 +176,8 @@ async fn emits_anthropic_content_events_at_block_boundaries() {
             ds_ai::AssistantMessageEvent::TextStart { partial, .. } => {
                 events.push("text_start");
                 assert_eq!(partial.response_id.as_deref(), Some("msg_blocks"));
-                assert_eq!(partial.response_model.as_deref(), Some("claude-fallback"));
+                assert_eq!(partial.model, "claude-fallback");
+                assert_eq!(partial.response_model, None);
                 let AssistantContent::Text(content) = &partial.content[0] else {
                     panic!("expected text content");
                 };
@@ -1384,8 +1385,8 @@ async fn uses_anthropic_fallback_models_and_pricing() {
         .await
         .unwrap();
 
-    assert_eq!(result.model, model.id);
-    assert_eq!(result.response_model.as_deref(), Some("claude-fallback"));
+    assert_eq!(result.model, "claude-fallback");
+    assert_eq!(result.response_model, None);
     assert_eq!(result.response_id.as_deref(), Some("msg_fallback"));
     assert_eq!(result.usage.total_tokens, 1_000_000);
     assert_eq!(result.usage.cache_write_1h, Some(250_000));

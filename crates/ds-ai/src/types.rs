@@ -282,11 +282,7 @@ impl Context {
                 ),
                 Message::Assistant(_) => continue,
             };
-            for item in content {
-                if matches!(item, InputContent::Image(_)) {
-                    *item = InputContent::text(placeholder);
-                }
-            }
+            replace_images_with_placeholder(content, placeholder);
         }
         context
     }
@@ -294,6 +290,22 @@ impl Context {
     pub(crate) fn tools(&self) -> &[Tool] {
         &self.tools
     }
+}
+
+fn replace_images_with_placeholder(content: &mut Vec<InputContent>, placeholder: &str) {
+    let mut previous_was_placeholder = false;
+    content.retain_mut(|item| match item {
+        InputContent::Image(_) if previous_was_placeholder => false,
+        InputContent::Image(_) => {
+            *item = InputContent::text(placeholder);
+            previous_was_placeholder = true;
+            true
+        }
+        InputContent::Text(text) => {
+            previous_was_placeholder = text.text == placeholder;
+            true
+        }
+    });
 }
 
 fn normalize_assistant_for_model(message: &mut Message, model: &crate::Model) {
@@ -615,13 +627,12 @@ pub enum CacheRetention {
 
 pub(crate) fn normalize_id(id: &str) -> String {
     let id = id
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
-                character
-            } else {
-                '_'
+        .encode_utf16()
+        .map(|code_unit| match u8::try_from(code_unit) {
+            Ok(byte) if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') => {
+                char::from(byte)
             }
+            _ => '_',
         })
         .take(64)
         .collect::<String>();

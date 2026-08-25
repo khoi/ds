@@ -171,6 +171,68 @@ impl<'de> Deserialize<'de> for AssistantMessage {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DoneReason {
+    Stop,
+    Length,
+    ToolUse,
+    Deferred,
+}
+
+impl TryFrom<StopReason> for DoneReason {
+    type Error = StopReason;
+
+    fn try_from(reason: StopReason) -> Result<Self, StopReason> {
+        match reason {
+            StopReason::Stop => Ok(Self::Stop),
+            StopReason::Length => Ok(Self::Length),
+            StopReason::ToolUse => Ok(Self::ToolUse),
+            StopReason::Deferred => Ok(Self::Deferred),
+            reason => Err(reason),
+        }
+    }
+}
+
+impl From<DoneReason> for StopReason {
+    fn from(reason: DoneReason) -> Self {
+        match reason {
+            DoneReason::Stop => Self::Stop,
+            DoneReason::Length => Self::Length,
+            DoneReason::ToolUse => Self::ToolUse,
+            DoneReason::Deferred => Self::Deferred,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ErrorReason {
+    Error,
+    Aborted,
+}
+
+impl TryFrom<StopReason> for ErrorReason {
+    type Error = StopReason;
+
+    fn try_from(reason: StopReason) -> Result<Self, StopReason> {
+        match reason {
+            StopReason::Error => Ok(Self::Error),
+            StopReason::Aborted => Ok(Self::Aborted),
+            reason => Err(reason),
+        }
+    }
+}
+
+impl From<ErrorReason> for StopReason {
+    fn from(reason: ErrorReason) -> Self {
+        match reason {
+            ErrorReason::Error => Self::Error,
+            ErrorReason::Aborted => Self::Aborted,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum AssistantMessageEvent {
     Start {
@@ -219,11 +281,11 @@ pub enum AssistantMessageEvent {
         partial: AssistantMessage,
     },
     Done {
-        reason: StopReason,
+        reason: DoneReason,
         message: AssistantMessage,
     },
     Error {
-        reason: StopReason,
+        reason: ErrorReason,
         error: AssistantMessage,
     },
 }

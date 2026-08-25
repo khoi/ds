@@ -11,54 +11,173 @@ pub(crate) fn value(input: &str) -> serde_json::Value {
 }
 
 pub(crate) fn streaming_value(input: &str) -> serde_json::Value {
-    parse(input)
-        .or_else(|_| parse(&complete(&repair(input))))
-        .unwrap_or_else(|_| serde_json::json!({}))
+    if let Ok(value) = parse(input) {
+        return value;
+    }
+    if let Ok(value) = partial_value(input) {
+        return value;
+    }
+    let repaired = repair(input);
+    partial_value(&repaired).unwrap_or_else(|_| serde_json::json!({}))
 }
 
-fn complete(input: &str) -> String {
-    let mut output = String::with_capacity(input.len() + 8);
-    let mut closers = Vec::new();
-    let mut in_string = false;
-    let mut escaped = false;
-    for character in input.chars() {
-        output.push(character);
-        if in_string {
-            if escaped {
+fn partial_value(input: &str) -> Result<serde_json::Value, ()> {
+    let input = input.trim();
+    PartialParser {
+        input: input.as_bytes(),
+        index: 0,
+    }
+    .value()
+}
+
+struct PartialParser<'a> {
+    input: &'a [u8],
+    index: usize,
+}
+
+impl PartialParser<'_> {
+    fn value(&mut self) -> Result<serde_json::Value, ()> {
+        self.skip_whitespace();
+        match self.current().ok_or(())? {
+            b'"' => self.string().map(serde_json::Value::String),
+            b'{' => self.object(),
+            b'[' => self.array(),
+            _ if self.literal("null") => Ok(serde_json::Value::Null),
+            _ if self.literal("true") => Ok(serde_json::Value::Bool(true)),
+            _ if self.literal("false") => Ok(serde_json::Value::Bool(false)),
+            _ => self.number(),
+        }
+    }
+
+    fn object(&mut self) -> Result<serde_json::Value, ()> {
+        self.index += 1;
+        let mut object = serde_json::Map::new();
+        loop {
+            self.skip_whitespace();
+            match self.current() {
+                Some(b'}') => {
+                    self.index += 1;
+                    return Ok(serde_json::Value::Object(object));
+                }
+                None => return Ok(serde_json::Value::Object(object)),
+                _ => {}
+            }
+            let Ok(key) = self.string() else {
+                return Ok(serde_json::Value::Object(object));
+            };
+            self.skip_whitespace();
+            if self.current() != Some(b':') {
+                return Ok(serde_json::Value::Object(object));
+            }
+            self.index += 1;
+            let Ok(value) = self.value() else {
+                return Ok(serde_json::Value::Object(object));
+            };
+            object.insert(key, value);
+            self.skip_whitespace();
+            if self.current() == Some(b',') {
+                self.index += 1;
+            }
+        }
+    }
+
+    fn array(&mut self) -> Result<serde_json::Value, ()> {
+        self.index += 1;
+        let mut array = Vec::new();
+        loop {
+            self.skip_whitespace();
+            match self.current() {
+                Some(b']') => {
+                    self.index += 1;
+                    return Ok(serde_json::Value::Array(array));
+                }
+                None => return Ok(serde_json::Value::Array(array)),
+                _ => {}
+            }
+            let Ok(value) = self.value() else {
+                return Ok(serde_json::Value::Array(array));
+            };
+            array.push(value);
+            self.skip_whitespace();
+            if self.current() == Some(b',') {
+                self.index += 1;
+            }
+        }
+    }
+
+    fn string(&mut self) -> Result<String, ()> {
+        if self.current() != Some(b'"') {
+            return Err(());
+        }
+        let start = self.index;
+        self.index += 1;
+        let mut escaped = false;
+        while let Some(character) = self.current() {
+            if character == b'"' && !escaped {
+                self.index += 1;
+                return serde_json::from_slice(&self.input[start..self.index]).map_err(|_| ());
+            }
+            escaped = character == b'\\' && !escaped;
+            if character != b'\\' {
                 escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
             }
-            continue;
+            self.index += 1;
         }
-        match character {
-            '"' => in_string = true,
-            '{' => closers.push('}'),
-            '[' => closers.push(']'),
-            '}' | ']' if closers.last() == Some(&character) => {
-                closers.pop();
-            }
-            _ => {}
+        let end = self.index.saturating_sub(usize::from(escaped));
+        let mut candidate = self.input[start..end].to_vec();
+        candidate.push(b'"');
+        serde_json::from_slice(&candidate).or_else(|_| {
+            let slash = self.input[start..end]
+                .iter()
+                .rposition(|character| *character == b'\\')
+                .ok_or(())?;
+            let mut candidate = self.input[start..start + slash].to_vec();
+            candidate.push(b'"');
+            serde_json::from_slice(&candidate).map_err(|_| ())
+        })
+    }
+
+    fn number(&mut self) -> Result<serde_json::Value, ()> {
+        let start = self.index;
+        while self
+            .current()
+            .is_some_and(|character| !matches!(character, b',' | b']' | b'}'))
+        {
+            self.index += 1;
+        }
+        let token = std::str::from_utf8(&self.input[start..self.index]).map_err(|_| ())?;
+        serde_json::from_str(token).or_else(|_| {
+            let exponent = token.rfind('e').ok_or(())?;
+            serde_json::from_str(&token[..exponent]).map_err(|_| ())
+        })
+    }
+
+    fn literal(&mut self, literal: &str) -> bool {
+        let remaining = &self.input[self.index..];
+        let literal = literal.as_bytes();
+        if remaining.starts_with(literal) {
+            self.index += literal.len();
+            return true;
+        }
+        if literal.starts_with(remaining) {
+            self.index = self.input.len();
+            return true;
+        }
+        false
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .current()
+            .is_some_and(|character| character.is_ascii_whitespace())
+        {
+            self.index += 1;
         }
     }
-    if escaped {
-        output.push('\\');
+
+    fn current(&self) -> Option<u8> {
+        self.input.get(self.index).copied()
     }
-    if in_string {
-        output.push('"');
-    }
-    while output.chars().last().is_some_and(char::is_whitespace) {
-        output.pop();
-    }
-    if output.ends_with(':') {
-        output.push_str("null");
-    } else if output.ends_with(',') {
-        output.pop();
-    }
-    output.extend(closers.into_iter().rev());
-    output
 }
 
 fn repair(input: &str) -> String {

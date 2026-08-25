@@ -10,8 +10,12 @@ use async_stream::stream;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
-use std::{collections::BTreeMap, sync::Arc};
-use std::{collections::HashMap, pin::Pin, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -56,7 +60,8 @@ fn stream_model(
     let requested_model = model.clone();
     let context = context.for_model(&requested_model);
     let options = options.clone();
-    crate::provider_stream::adapt(requested_model.clone(), async move {
+    let cancellation = options.stream.cancellation.clone();
+    crate::provider_stream::adapt(requested_model.clone(), cancellation, async move {
         let mut stream_options = options.stream;
         let request_hooks = stream_options.request_hooks(&requested_model);
         let caller_headers = stream_options.headers.clone();
@@ -206,7 +211,7 @@ impl crate::Provider for Provider {
                     .reasoning
                     .map(|level| model.clamp_thinking_level(level))
                     .and_then(reasoning_effort),
-                tool_choice: Some(match options.tool_choice {
+                tool_choice: options.tool_choice.map(|tool_choice| match tool_choice {
                     crate::ToolChoice::Auto => ToolChoice::Auto,
                     crate::ToolChoice::None => ToolChoice::None,
                 }),
@@ -321,6 +326,53 @@ pub enum ToolChoice {
     Required,
     Function(String),
     Custom(String),
+    AllowedTools {
+        mode: AllowedToolsMode,
+        tools: Vec<serde_json::Value>,
+    },
+    Hosted(HostedTool),
+    Mcp {
+        server_label: String,
+        name: Option<Option<String>>,
+    },
+    ApplyPatch,
+    Shell,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AllowedToolsMode {
+    Auto,
+    Required,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedTool {
+    FileSearch,
+    WebSearchPreview,
+    Computer,
+    ComputerUsePreview,
+    ComputerUse,
+    WebSearchPreview20250311,
+    ImageGeneration,
+    CodeInterpreter,
+    Mcp,
+}
+
+impl HostedTool {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FileSearch => "file_search",
+            Self::WebSearchPreview => "web_search_preview",
+            Self::Computer => "computer",
+            Self::ComputerUsePreview => "computer_use_preview",
+            Self::ComputerUse => "computer_use",
+            Self::WebSearchPreview20250311 => "web_search_preview_2025_03_11",
+            Self::ImageGeneration => "image_generation",
+            Self::CodeInterpreter => "code_interpreter",
+            Self::Mcp => "mcp",
+        }
+    }
 }
 
 impl Serialize for ToolChoice {
@@ -343,27 +395,72 @@ impl Serialize for ToolChoice {
                 map.serialize_entry("name", name)?;
                 map.end()
             }
+            Self::AllowedTools { mode, tools } => {
+                let mut map = serializer.serialize_map(Some(3))?;
+                map.serialize_entry("type", "allowed_tools")?;
+                map.serialize_entry("mode", mode)?;
+                map.serialize_entry("tools", tools)?;
+                map.end()
+            }
+            Self::Hosted(tool) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("type", tool.as_str())?;
+                map.end()
+            }
+            Self::Mcp { server_label, name } => {
+                let mut map = serializer.serialize_map(Some(2 + usize::from(name.is_some())))?;
+                map.serialize_entry("type", "mcp")?;
+                map.serialize_entry("server_label", server_label)?;
+                if let Some(name) = name {
+                    map.serialize_entry("name", name)?;
+                }
+                map.end()
+            }
+            Self::ApplyPatch | Self::Shell => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(
+                    "type",
+                    if matches!(self, Self::ApplyPatch) {
+                        "apply_patch"
+                    } else {
+                        "shell"
+                    },
+                )?;
+                map.end()
+            }
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceTier {
     Auto,
     Default,
     Flex,
+    Scale,
     Priority,
+    Null,
 }
 
 impl ServiceTier {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> Option<&'static str> {
         match self {
-            Self::Auto => "auto",
-            Self::Default => "default",
-            Self::Flex => "flex",
-            Self::Priority => "priority",
+            Self::Auto => Some("auto"),
+            Self::Default => Some("default"),
+            Self::Flex => Some("flex"),
+            Self::Scale => Some("scale"),
+            Self::Priority => Some("priority"),
+            Self::Null => None,
         }
+    }
+}
+
+impl Serialize for ServiceTier {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.as_str().serialize(serializer)
     }
 }
 
@@ -782,7 +879,7 @@ fn output_slot(
             let call = AssistantToolCall {
                 id: call_id,
                 name,
-                arguments: parse_arguments(&arguments),
+                arguments: serde_json::json!({}),
                 thought_signature: None,
                 namespace: None,
             };
@@ -806,11 +903,10 @@ fn output_slot(
                 .get(&name)
                 .cloned()
                 .unwrap_or_else(|| "input".into());
-            let input = item.input.clone().unwrap_or_default();
             let call = AssistantToolCall {
                 id: call_id,
                 name,
-                arguments: serde_json::json!({&property: input}),
+                arguments: serde_json::json!({}),
                 thought_signature: None,
                 namespace: None,
             };
@@ -886,8 +982,7 @@ struct TerminalResponse {
     id: Option<String>,
     service_tier: Option<String>,
     end_turn: Option<bool>,
-    #[serde(default)]
-    usage: CompletedUsage,
+    usage: Option<CompletedUsage>,
     #[serde(default)]
     output: Vec<OutputItem>,
 }
@@ -1135,7 +1230,7 @@ async fn response_events(
             grammar_input_properties,
             requested_service_tier: options
                 .service_tier
-                .map(|service_tier| service_tier.as_str().into()),
+                .and_then(|service_tier| service_tier.as_str().map(str::to_owned)),
             use_requested_for_default: false,
             mode: ResponseMode::OpenAi,
         },
@@ -1155,13 +1250,12 @@ fn openai_call_id(id: &str) -> String {
 }
 
 fn normalize_response_id(id: &str) -> String {
-    id.chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
-                character
-            } else {
-                '_'
+    id.encode_utf16()
+        .map(|code_unit| match u8::try_from(code_unit) {
+            Ok(byte) if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') => {
+                char::from(byte)
             }
+            _ => '_',
         })
         .take(64)
         .collect::<String>()
@@ -1191,17 +1285,20 @@ fn response_message(
     text_index: usize,
     signature: Option<(String, Option<String>)>,
 ) -> serde_json::Value {
-    let (id, phase) = signature.map_or_else(
-        || (fallback_message_id(message_index, text_index), None),
-        |(id, phase)| {
-            let id = if id.len() > 64 {
+    let fallback_id = fallback_message_id(message_index, text_index);
+    let (id, phase) = match signature {
+        None => (fallback_id, None),
+        Some((id, phase)) => {
+            let id = if id.is_empty() {
+                fallback_id
+            } else if id.encode_utf16().count() > 64 {
                 format!("msg_{}", short_hash(&id))
             } else {
                 id
             };
             (id, phase)
-        },
-    );
+        }
+    };
     let mut item = serde_json::json!({
         "type": "message",
         "role": "assistant",
@@ -1229,7 +1326,8 @@ fn finish_response_tool_calls(
     pending: &mut Vec<PendingResponseToolCall>,
     results: &mut std::collections::BTreeSet<String>,
     grammar_input_properties: &BTreeMap<String, String>,
-) {
+) -> usize {
+    let mut inserted = 0;
     for call in pending.drain(..) {
         if results.contains(&call.id) {
             continue;
@@ -1244,8 +1342,10 @@ fn finish_response_tool_calls(
             "call_id": openai_call_id(&call.id),
             "output": "No result provided"
         }));
+        inserted += 1;
     }
     results.clear();
+    inserted
 }
 
 pub(crate) struct ResponseInputTarget<'a> {
@@ -1285,6 +1385,7 @@ pub(crate) fn response_input(
     let mut tool_call_ids = BTreeMap::new();
     let mut pending_tool_calls = Vec::new();
     let mut tool_results = std::collections::BTreeSet::new();
+    let mut message_index = 0;
     if let Some(role) = system_role
         && let Some(system) = context.system().filter(|system| !system.is_empty())
     {
@@ -1293,10 +1394,10 @@ pub(crate) fn response_input(
             "content": system
         }));
     }
-    for (message_index, message) in context.messages().iter().enumerate() {
+    for message in context.messages() {
         match message {
             Message::User(message) => {
-                finish_response_tool_calls(
+                message_index += finish_response_tool_calls(
                     &mut input,
                     &mut pending_tool_calls,
                     &mut tool_results,
@@ -1313,22 +1414,35 @@ pub(crate) fn response_input(
                 };
                 if !content.is_empty() {
                     input.push(serde_json::json!({"role": "user", "content": content}));
+                    message_index += 1;
                 }
             }
             Message::Assistant(message) => {
-                finish_response_tool_calls(
+                message_index += finish_response_tool_calls(
                     &mut input,
                     &mut pending_tool_calls,
                     &mut tool_results,
                     grammar_input_properties,
                 );
-                if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
-                    continue;
-                }
                 let same_api_provider =
                     message.api == target.api && message.provider.as_str() == target.provider;
                 let same_model = same_api_provider && message.model == target.model;
-                let different_model = same_api_provider && message.model != target.model;
+                let different_model = same_api_provider && !same_model;
+                if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+                    for content in &message.content {
+                        let AssistantContent::ToolCall(call) = content else {
+                            continue;
+                        };
+                        let normalized_id = if same_model {
+                            call.id.clone()
+                        } else {
+                            response_tool_call_id(&call.id, !same_api_provider)
+                        };
+                        tool_call_ids.insert(call.id.clone(), normalized_id);
+                    }
+                    continue;
+                }
+                let input_start = input.len();
                 let mut text_index = 0;
                 for content in &message.content {
                     match content {
@@ -1345,20 +1459,17 @@ pub(crate) fn response_input(
                                     ));
                                     text_index += 1;
                                 }
-                            } else if let Some(signature) = &thinking.thinking_signature
-                                && let Ok(item) = serde_json::from_str(signature)
-                            {
+                            } else if let Some(signature) = &thinking.thinking_signature {
+                                let item = serde_json::from_str(signature)
+                                    .map_err(|error| error.to_string())?;
                                 input.push(item);
                             }
                         }
                         AssistantContent::Text(text) => {
                             let signature = same_model
-                                .then(|| {
-                                    text.text_signature
-                                        .as_deref()
-                                        .and_then(parse_text_signature)
-                                })
+                                .then_some(text.text_signature.as_deref())
                                 .flatten();
+                            let signature = signature.and_then(parse_text_signature);
                             input.push(response_message(
                                 &text.text,
                                 message_index,
@@ -1421,6 +1532,9 @@ pub(crate) fn response_input(
                         }
                     }
                 }
+                if input.len() > input_start {
+                    message_index += 1;
+                }
             }
             Message::ToolResult(result) => {
                 let normalized_id = tool_call_ids
@@ -1438,6 +1552,7 @@ pub(crate) fn response_input(
                     "call_id": openai_call_id(&normalized_id),
                     "output": tool_result_output(result)
                 }));
+                message_index += 1;
                 let Some((placement, mode)) = deferred_tools else {
                     continue;
                 };
@@ -1646,6 +1761,7 @@ fn parse_text_signature(signature: &str) -> Option<(String, Option<String>)> {
     let phase = value
         .get("phase")
         .and_then(serde_json::Value::as_str)
+        .filter(|phase| matches!(*phase, "commentary" | "final_answer"))
         .map(str::to_owned);
     Some((id, phase))
 }
@@ -1815,7 +1931,7 @@ pub(crate) fn decode_events(
                 }
             };
             match event {
-                    StreamEvent::Created { response } if !response.id.is_empty() => {
+                    StreamEvent::Created { response } => {
                         result.id = Some(response.id.clone());
                         yield Ok(crate::provider_stream::ProviderEvent::ResponseId(response.id));
                     }
@@ -1823,6 +1939,14 @@ pub(crate) fn decode_events(
                         if let Some(item_id) = &item.id {
                             item_slots.insert(item_id.clone(), output_index);
                         }
+                        let initial_custom_input = (item.r#type == "custom_tool_call")
+                            .then(|| item.input.clone())
+                            .flatten()
+                            .filter(|input| !input.is_empty());
+                        let initial_function_arguments = (item.r#type == "function_call")
+                            .then(|| item.arguments.clone())
+                            .flatten()
+                            .filter(|arguments| !arguments.is_empty());
                         let content_index = result.content.len();
                         if let Some((content, slot, start)) =
                             output_slot(&item, content_index, &grammar_input_properties)
@@ -1839,6 +1963,44 @@ pub(crate) fn decode_events(
                             result.content.push(content);
                             slots.insert(output_index, slot);
                             yield Ok(start);
+                            if let Some(prefix) = initial_function_arguments {
+                                yield Ok(crate::provider_stream::ProviderEvent::ToolCallArgumentsPrefix {
+                                    content_index,
+                                    prefix,
+                                });
+                            }
+                            if let Some(input) = initial_custom_input {
+                                let Some(Slot::ToolCall {
+                                    content_index,
+                                    arguments: ToolArguments::Grammar { property, buffer },
+                                }) = slots.get_mut(&output_index) else {
+                                    continue;
+                                };
+                                let delta = match constrained_sampling::append_grammar_input_delta(
+                                    buffer,
+                                    property,
+                                    &input,
+                                    false,
+                                ) {
+                                    Ok(delta) => delta,
+                                    Err(message) => {
+                                        yield Err(Error::Stream { message, partial: result });
+                                        return;
+                                    }
+                                };
+                                if let AssistantContent::ToolCall(call) =
+                                    &mut result.content[*content_index]
+                                {
+                                    call.arguments =
+                                        serde_json::json!({property.as_str(): buffer.input});
+                                }
+                                if let Some(delta) = delta {
+                                    yield Ok(crate::provider_stream::ProviderEvent::ToolCallDelta {
+                                        content_index: *content_index,
+                                        delta,
+                                    });
+                                }
+                            }
                         }
                     }
                     StreamEvent::OutputTextDelta { output_index, delta }
@@ -2090,6 +2252,16 @@ pub(crate) fn decode_events(
                                         .collect::<Vec<_>>()
                                         .join("\n\n")
                                 };
+                                let reasoning = if reasoning.is_empty() {
+                                    match &result.content[content_index] {
+                                        AssistantContent::Thinking(content) => {
+                                            content.thinking.clone()
+                                        }
+                                        _ => String::new(),
+                                    }
+                                } else {
+                                    reasoning
+                                };
                                 let content =
                                     thinking_content(&item, raw_item.as_ref(), reasoning);
                                 result.content[content_index] = AssistantContent::Thinking(content.clone());
@@ -2103,25 +2275,19 @@ pub(crate) fn decode_events(
                                     continue;
                                 };
                                 let content_index = *content_index;
-                                let arguments = item.arguments.as_deref().unwrap_or(arguments);
+                                let arguments = item
+                                    .arguments
+                                    .as_deref()
+                                    .filter(|arguments| !arguments.is_empty())
+                                    .unwrap_or(arguments);
                                 let AssistantContent::ToolCall(call) = &mut result.content[content_index] else {
                                     continue;
                                 };
-                                if let Some(id) = item.call_id {
-                                    call.id = id;
-                                }
-                                if let Some(name) = item.name {
-                                    call.name = name;
-                                }
                                 call.arguments = parse_arguments(arguments);
-                                let item_id = item.id;
-                                let namespace = item.namespace;
-                                let tool_call = assistant_tool_call(
-                                    call,
-                                    item_id.as_deref(),
-                                    namespace,
-                                );
-                                *call = tool_call.clone();
+                                if let Some(namespace) = item.namespace {
+                                    call.namespace = Some(namespace);
+                                }
+                                let tool_call = call.clone();
                                 yield Ok(crate::provider_stream::ProviderEvent::ToolCallEnd {
                                     content_index,
                                     tool_call,
@@ -2149,12 +2315,6 @@ pub(crate) fn decode_events(
                                 let AssistantContent::ToolCall(call) = &mut result.content[content_index] else {
                                     continue;
                                 };
-                                if let Some(id) = item.call_id {
-                                    call.id = id;
-                                }
-                                if let Some(name) = item.name {
-                                    call.name = name;
-                                }
                                 call.arguments = serde_json::json!({property: input});
                                 if let Some(delta) = delta {
                                     yield Ok(crate::provider_stream::ProviderEvent::ToolCallDelta {
@@ -2162,14 +2322,10 @@ pub(crate) fn decode_events(
                                         delta,
                                     });
                                 }
-                                let item_id = item.id;
-                                let namespace = item.namespace;
-                                let tool_call = assistant_tool_call(
-                                    call,
-                                    item_id.as_deref(),
-                                    namespace,
-                                );
-                                *call = tool_call.clone();
+                                if let Some(namespace) = item.namespace {
+                                    call.namespace = Some(namespace);
+                                }
+                                let tool_call = call.clone();
                                 yield Ok(crate::provider_stream::ProviderEvent::ToolCallEnd {
                                     content_index,
                                     tool_call,
@@ -2418,7 +2574,9 @@ fn apply_terminal_response(
     if codex {
         result.end_turn = response.end_turn;
     }
-    result.usage = usage(response.usage);
+    if let Some(terminal_usage) = response.usage {
+        result.usage = usage(terminal_usage);
+    }
 }
 
 fn resolve_service_tier(

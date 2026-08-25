@@ -75,9 +75,11 @@ fn stream_model(
     let requested_model = model.clone();
     let context = context.for_model(&requested_model);
     let options = options.clone();
-    crate::provider_stream::adapt(requested_model.clone(), async move {
+    let cancellation = options.stream.cancellation.clone();
+    crate::provider_stream::adapt(requested_model.clone(), cancellation, async move {
         let thinking = resolve_thinking(&requested_model, &options);
         let tool_choice = options.tool_choice;
+        let thinking_enabled = options.thinking_enabled == Some(true);
         let mut stream_options = options.stream;
         let request_hooks = stream_options.request_hooks(&requested_model);
         let api_key = stream_options.api_key.clone();
@@ -100,7 +102,7 @@ fn stream_model(
                 .with_interleaved_thinking(options.interleaved_thinking.unwrap_or(true))
                 .with_session_id(stream_options.session_id)
                 .with_request_options(headers, request_hooks);
-        if let Some(temperature) = stream_options.temperature {
+        if let Some(temperature) = stream_options.temperature.filter(|_| !thinking_enabled) {
             provider_options = provider_options.with_temperature(temperature);
         }
         provider_options =
@@ -215,8 +217,10 @@ impl crate::Provider for Provider {
                 stream: stream_options,
                 thinking_enabled: Some(!matches!(thinking, None | Some(crate::ThinkingLevel::Off))),
                 thinking_budget_tokens,
-                effort: thinking.and_then(|level| anthropic_effort(model, level)),
-                tool_choice: Some(match options.tool_choice {
+                effort: options
+                    .reasoning
+                    .and_then(|level| anthropic_effort(model, level)),
+                tool_choice: options.tool_choice.map(|choice| match choice {
                     crate::ToolChoice::Auto => ToolChoice::Auto,
                     crate::ToolChoice::None => ToolChoice::None,
                 }),
@@ -265,8 +269,7 @@ fn default_anthropic_effort(level: crate::ThinkingLevel) -> Option<Effort> {
         crate::ThinkingLevel::Minimal | crate::ThinkingLevel::Low => Some(Effort::Low),
         crate::ThinkingLevel::Medium => Some(Effort::Medium),
         crate::ThinkingLevel::High => Some(Effort::High),
-        crate::ThinkingLevel::XHigh => Some(Effort::XHigh),
-        crate::ThinkingLevel::Max => Some(Effort::Max),
+        crate::ThinkingLevel::XHigh | crate::ThinkingLevel::Max => Some(Effort::High),
     }
 }
 
@@ -410,11 +413,7 @@ impl crate::ApiKeyAuth for AnthropicApiKeyAuth {
                 source: Some("stored credential".into()),
             }));
         }
-        let token = context.env("ANTHROPIC_AUTH_TOKEN").await;
-        if cancellation.is_cancelled() {
-            return Err(crate::AuthError::Cancelled);
-        }
-        if let Some(token) = token.filter(|token| !token.is_empty()) {
+        if let Some(token) = auth_env(context, "ANTHROPIC_AUTH_TOKEN", cancellation).await? {
             return Ok(Some(crate::AuthResult {
                 auth: crate::ModelAuth {
                     headers: BTreeMap::from([(
@@ -428,11 +427,7 @@ impl crate::ApiKeyAuth for AnthropicApiKeyAuth {
             }));
         }
         for name in ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"] {
-            let key = context.env(name).await;
-            if cancellation.is_cancelled() {
-                return Err(crate::AuthError::Cancelled);
-            }
-            if let Some(key) = key.filter(|key| !key.is_empty()) {
+            if let Some(key) = auth_env(context, name, cancellation).await? {
                 return Ok(Some(crate::AuthResult {
                     auth: crate::ModelAuth {
                         api_key: Some(key),
@@ -445,6 +440,18 @@ impl crate::ApiKeyAuth for AnthropicApiKeyAuth {
         }
         Ok(None)
     }
+}
+
+async fn auth_env(
+    context: &dyn crate::AuthContext,
+    name: &str,
+    cancellation: &CancellationToken,
+) -> Result<Option<String>, crate::AuthError> {
+    let value = context.env(name).await;
+    if cancellation.is_cancelled() {
+        return Err(crate::AuthError::Cancelled);
+    }
+    Ok(value.filter(|value| !value.trim().is_empty()))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -832,13 +839,18 @@ async fn response_events(
     let oauth = is_oauth_token(options.api_key.as_deref());
     let cache_control = cache_control(options.cache_retention, model.long_cache_retention);
     let (thinking, output_config) = thinking(&options.thinking);
-    let mut placement = crate::deferred_tools::split(context, model.tool_references, |name| {
-        if oauth {
-            oauth_tool_name(name)
-        } else {
-            name.to_owned()
-        }
-    });
+    let mut placement_context = context.clone();
+    placement_context.messages.retain(
+        |message| !matches!(message, Message::Assistant(response) if is_failed_assistant(response)),
+    );
+    let mut placement =
+        crate::deferred_tools::split(&placement_context, model.tool_references, |name| {
+            if oauth {
+                oauth_tool_name(name)
+            } else {
+                name.to_owned()
+            }
+        });
     if placement.immediate.is_empty() && !placement.deferred.is_empty() {
         placement.immediate = placement.deferred.drain(..).map(|(_, tool)| tool).collect();
     }
@@ -941,13 +953,11 @@ async fn response_events(
     }
     if !oauth
         && model.session_affinity_headers
-        && options
-            .session_id
-            .as_deref()
-            .is_some_and(|session_id| !session_id.is_empty())
-        && let Some(session_id) = &options.session_id
+        && options.cache_retention != CacheRetention::None
+        && let Some(session_id) = options.session_id.as_deref()
+        && !session_id.is_empty()
     {
-        default_headers.insert("x-session-affinity".into(), session_id.clone());
+        default_headers.insert("x-session-affinity".into(), session_id.into());
     }
     let headers =
         http::request_headers(default_headers, &options.headers).map_err(Error::InvalidRequest)?;
@@ -988,11 +998,12 @@ async fn response_events(
     }
 
     let response_model = model.id.clone();
-    let response_tool_names = context
-        .tools()
-        .iter()
-        .map(|tool| (tool.name.to_ascii_lowercase(), tool.name.clone()))
-        .collect::<HashMap<_, _>>();
+    let mut response_tool_names = HashMap::new();
+    for tool in context.tools() {
+        response_tool_names
+            .entry(tool.name.to_ascii_lowercase())
+            .or_insert_with(|| tool.name.clone());
+    }
     let stream_cancellation = options.cancellation.clone();
     let output = stream! {
         let mut events = transport::EventStream::new(
@@ -1085,7 +1096,7 @@ async fn response_events(
                         yield Ok(crate::provider_stream::ProviderEvent::ResponseId(message.id));
                         if let Some(model) = message.model {
                             if model != response_model {
-                                yield Ok(crate::provider_stream::ProviderEvent::ResponseModel(model.clone()));
+                                yield Ok(crate::provider_stream::ProviderEvent::ModelOverride(model.clone()));
                             }
                             result.response_model = model;
                         }
@@ -1390,7 +1401,7 @@ fn system(
             "text": "You are Claude Code, Anthropic's official CLI for Claude."
         }));
     }
-    if let Some(text) = context.system() {
+    if let Some(text) = context.system().filter(|text| !text.is_empty()) {
         system.push(serde_json::json!({"type": "text", "text": text}));
     }
     for block in &mut system {
@@ -1445,27 +1456,27 @@ fn messages(
             }
             Message::Assistant(response) => {
                 finish_tool_calls(&mut messages, &mut pending_tool_calls, &mut tool_results);
-                if matches!(
-                    response.stop_reason,
-                    StopReason::Error | StopReason::Aborted
-                ) {
+                let failed = is_failed_assistant(response);
+                let same_model = same_model(model, provider_id, response);
+                for content in &response.content {
+                    let AssistantContent::ToolCall(call) = content else {
+                        continue;
+                    };
+                    let id = if same_model {
+                        call.id.clone()
+                    } else {
+                        normalize_id(&call.id)
+                    };
+                    tool_id_map.insert(call.id.clone(), id.clone());
+                    if !failed {
+                        pending_tool_calls.push(id);
+                    }
+                }
+                if failed {
                     index += 1;
                     continue;
                 }
                 let content = assistant_content(model, provider_id, response, oauth);
-                pending_tool_calls.extend(response.content.iter().filter_map(|content| {
-                    if let AssistantContent::ToolCall(call) = content {
-                        let id = if same_model(model, provider_id, response) {
-                            call.id.clone()
-                        } else {
-                            normalize_id(&call.id)
-                        };
-                        tool_id_map.insert(call.id.clone(), id.clone());
-                        Some(id)
-                    } else {
-                        None
-                    }
-                }));
                 push_message(
                     &mut messages,
                     "assistant",
@@ -1504,10 +1515,7 @@ fn messages(
         index += 1;
     }
     finish_tool_calls(&mut messages, &mut pending_tool_calls, &mut tool_results);
-    if let Some(message) = messages
-        .iter_mut()
-        .rev()
-        .find(|message| message.role == "user")
+    if let Some(message) = messages.last_mut().filter(|message| message.role == "user")
         && let Some(cache_control) = cache_control
     {
         match &mut message.content {
@@ -1684,8 +1692,12 @@ fn same_model(
         && message.model == model.id
 }
 
+fn is_failed_assistant(message: &crate::AssistantMessage) -> bool {
+    matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+}
+
 fn parse_arguments(arguments: &str) -> serde_json::Value {
-    json::value(arguments)
+    json::streaming_value(arguments)
 }
 
 fn input_content(content: &InputContent) -> serde_json::Value {

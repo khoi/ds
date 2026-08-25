@@ -226,13 +226,14 @@ fn openai_body_message(
     let Some(parsed) = parsed else {
         return Some(format!("{status} {body}"));
     };
-    let error = parsed.get("error")?;
+    let error = parsed.get("error").unwrap_or(parsed);
     if !json_truthy(error) {
         return None;
     }
     let serialized = serde_json::to_string(error).ok()?;
     match error {
-        serde_json::Value::Object(object) if !object.is_empty() => Some(serialized),
+        serde_json::Value::Object(object) if object.is_empty() => None,
+        serde_json::Value::Object(_) => Some(serialized),
         _ => Some(format!("{status} {serialized}")),
     }
 }
@@ -501,11 +502,11 @@ mod tests {
         );
         assert_eq!(
             openai_body_message(429, &top_level.to_string(), Some(&top_level)),
-            None
+            Some(r#"{"message":"Too many requests"}"#.into())
         );
         assert_eq!(
             openai_body_message(429, &empty.to_string(), Some(&empty)),
-            Some("429 {}".into())
+            None
         );
         assert_eq!(
             openai_body_message(429, "failed", None),

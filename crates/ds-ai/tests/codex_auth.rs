@@ -10,6 +10,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    process::Command,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -90,6 +91,25 @@ async fn preserves_codex_refresh_failure_details() {
     assert!(error.contains("invalid_grant"));
     assert!(error.contains("expired"));
     server.requests().await;
+}
+
+#[test]
+fn codex_refresh_failure_writes_nothing_to_stderr() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "codex_auth::preserves_codex_refresh_failure_details",
+            "--exact",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stderr, b"");
 }
 
 #[tokio::test]
@@ -199,6 +219,50 @@ async fn logs_in_through_the_codex_browser_callback() {
 }
 
 #[tokio::test]
+async fn keeps_waiting_after_malformed_codex_browser_callbacks() {
+    let server = serve([Reply::json(
+        200,
+        json!({
+            "access_token": token("acc_callback_recovery"),
+            "refresh_token": "refresh_callback_recovery",
+            "expires_in": 3600
+        }),
+    )])
+    .await;
+    let interaction = NoisyCallbackInteraction::default();
+    let oauth = OAuth::new()
+        .with_base_url(&server.base_url)
+        .with_callback_address(local_address());
+
+    let credentials = oauth.login(&interaction).await.unwrap();
+    let task = {
+        let mut task = interaction.task.lock().unwrap();
+        task.take().unwrap()
+    };
+    let responses = task.await.unwrap();
+
+    assert!(matches!(
+        credentials,
+        Credential::OAuth { access, .. } if access == token("acc_callback_recovery")
+    ));
+    assert_eq!(responses, [400, 400, 200]);
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn cancels_while_reading_a_codex_browser_callback() {
+    let (interaction, connected) = StalledCallbackInteraction::new();
+    let cancellation = interaction.cancellation.clone();
+    let oauth = OAuth::new().with_callback_address(local_address());
+    let login = tokio::spawn(async move { oauth.login(&interaction).await });
+    connected.await.unwrap();
+
+    cancellation.cancel();
+
+    assert!(matches!(login.await.unwrap(), Err(AuthError::Cancelled)));
+}
+
+#[tokio::test]
 async fn logs_in_with_the_codex_device_flow() {
     let server = serve([
         Reply::json(
@@ -210,6 +274,7 @@ async fn logs_in_with_the_codex_device_flow() {
             }),
         ),
         Reply::json(403, json!({"error": "authorization_pending"})),
+        Reply::json(404, json!({"error": "authorization_pending"})),
         Reply::json(
             200,
             json!({
@@ -248,16 +313,34 @@ async fn logs_in_with_the_codex_device_flow() {
     );
     let device_redirect = format!("{}/deviceauth/callback", server.base_url);
     let requests = server.requests().await;
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
     assert!(requests[0].starts_with("POST /api/accounts/deviceauth/usercode HTTP/1.1\r\n"));
     assert!(requests[1].starts_with("POST /api/accounts/deviceauth/token HTTP/1.1\r\n"));
-    assert!(requests[3].starts_with("POST /oauth/token HTTP/1.1\r\n"));
-    let exchange = requests[3].split("\r\n\r\n").nth(1).unwrap();
+    assert!(requests[2].starts_with("POST /api/accounts/deviceauth/token HTTP/1.1\r\n"));
+    assert!(requests[4].starts_with("POST /oauth/token HTTP/1.1\r\n"));
+    let exchange = requests[4].split("\r\n\r\n").nth(1).unwrap();
     assert!(exchange.contains("code=device_code"));
     assert!(exchange.contains("code_verifier=device_verifier"));
     assert!(exchange.contains(
         &url::form_urlencoded::byte_serialize(device_redirect.as_bytes()).collect::<String>()
     ));
+}
+
+#[tokio::test]
+async fn guides_device_login_users_to_browser_login_when_device_auth_is_disabled() {
+    let server = serve([Reply::json(404, json!({"error": "not_found"}))]).await;
+    let oauth = OAuth::new().with_base_url(&server.base_url);
+
+    let error = oauth
+        .login(&DeviceInteraction::default())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "OAuth failed: OpenAI Codex device code login is not enabled for this server. Use browser login or verify the server URL."
+    );
+    server.requests().await;
 }
 
 #[tokio::test]
@@ -395,6 +478,22 @@ async fn times_out_the_codex_device_flow() {
 
     assert!(matches!(result, Err(AuthError::OAuth(message)) if message.contains("timed out")));
     assert_eq!(server.requests().await.len(), 2);
+}
+
+#[tokio::test]
+async fn starts_the_codex_device_deadline_after_receiving_the_device_code() {
+    let (base_url, server) = serve_delayed_device_start(Duration::from_millis(200)).await;
+    let oauth = OAuth::new()
+        .with_base_url(base_url)
+        .with_device_timeout(Duration::from_millis(100));
+
+    let credentials = oauth.login(&DeviceInteraction::default()).await.unwrap();
+
+    assert!(matches!(
+        credentials,
+        Credential::OAuth { access, .. } if access == token("acc_delayed_device")
+    ));
+    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -608,6 +707,127 @@ struct CallbackInteraction {
     cancellation: CancellationToken,
 }
 
+#[derive(Default)]
+struct NoisyCallbackInteraction {
+    cancellation: CancellationToken,
+    task: Mutex<Option<tokio::task::JoinHandle<Vec<u16>>>>,
+}
+
+struct StalledCallbackInteraction {
+    cancellation: CancellationToken,
+    connected: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl StalledCallbackInteraction {
+    fn new() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (connected, receiver) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                cancellation: CancellationToken::new(),
+                connected: Mutex::new(Some(connected)),
+            },
+            receiver,
+        )
+    }
+}
+
+#[async_trait]
+impl AuthInteraction for StalledCallbackInteraction {
+    fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    async fn prompt(&self, prompt: AuthPrompt) -> Result<String, AuthError> {
+        match prompt {
+            AuthPrompt::Select { .. } => Ok("browser".into()),
+            AuthPrompt::ManualCode { cancellation, .. } => {
+                cancellation.cancelled().await;
+                Err(AuthError::Cancelled)
+            }
+            _ => Err(AuthError::Authentication("unexpected prompt".into())),
+        }
+    }
+
+    fn notify(&self, event: AuthEvent) {
+        let AuthEvent::AuthUrl { url, .. } = event else {
+            return;
+        };
+        let authorization_url = url::Url::parse(&url).unwrap();
+        let redirect = url::Url::parse(&query(&authorization_url, "redirect_uri")).unwrap();
+        let address = format!(
+            "{}:{}",
+            redirect.host_str().unwrap(),
+            redirect.port().unwrap()
+        );
+        let connected = self.connected.lock().unwrap().take().unwrap();
+        tokio::spawn(async move {
+            let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+            connected.send(()).unwrap();
+            let mut byte = [0];
+            tokio::io::AsyncReadExt::read(&mut socket, &mut byte)
+                .await
+                .unwrap();
+        });
+    }
+}
+
+#[async_trait]
+impl AuthInteraction for NoisyCallbackInteraction {
+    fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    async fn prompt(&self, prompt: AuthPrompt) -> Result<String, AuthError> {
+        match prompt {
+            AuthPrompt::Select { .. } => Ok("browser".into()),
+            AuthPrompt::ManualCode { cancellation, .. } => {
+                cancellation.cancelled().await;
+                Err(AuthError::Cancelled)
+            }
+            _ => Err(AuthError::Authentication("unexpected prompt".into())),
+        }
+    }
+
+    fn notify(&self, event: AuthEvent) {
+        let AuthEvent::AuthUrl { url, .. } = event else {
+            return;
+        };
+        let authorization_url = url::Url::parse(&url).unwrap();
+        let redirect = url::Url::parse(&query(&authorization_url, "redirect_uri")).unwrap();
+        let state = query(&authorization_url, "state");
+        let task = tokio::spawn(async move {
+            let address = format!(
+                "{}:{}",
+                redirect.host_str().unwrap(),
+                redirect.port().unwrap()
+            );
+            let mut socket = tokio::net::TcpStream::connect(&address).await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut socket, b"BROKEN\r\n\r\n")
+                .await
+                .unwrap();
+            let mut malformed = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut socket, &mut malformed)
+                .await
+                .unwrap();
+            let malformed = response_status(&malformed);
+            let wrong_path = reqwest::get(format!("http://{address}/wrong-path"))
+                .await
+                .unwrap()
+                .status()
+                .as_u16();
+            let callback = reqwest::get(format!(
+                "http://{address}/auth/callback?code=callback_code&state={state}"
+            ))
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+            vec![malformed, wrong_path, callback]
+        });
+        *self.task.lock().unwrap() = Some(task);
+    }
+}
+
 #[async_trait]
 impl AuthInteraction for CallbackInteraction {
     fn cancellation(&self) -> &CancellationToken {
@@ -722,6 +942,102 @@ fn query(url: &url::Url, key: &str) -> String {
         .find(|(name, _)| name == key)
         .map(|(_, value)| value.into_owned())
         .unwrap()
+}
+
+fn response_status(response: &[u8]) -> u16 {
+    String::from_utf8_lossy(response)
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+async fn serve_delayed_device_start(delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut start, _) = listener.accept().await.unwrap();
+        read_http_request(&mut start).await;
+        tokio::time::sleep(delay).await;
+        write_json_response(
+            &mut start,
+            json!({
+                "device_auth_id": "device_delayed",
+                "user_code": "DELAYED",
+                "interval": 0
+            }),
+        )
+        .await;
+
+        let (mut poll, _) = listener.accept().await.unwrap();
+        read_http_request(&mut poll).await;
+        write_json_response(
+            &mut poll,
+            json!({
+                "authorization_code": "device_code",
+                "code_verifier": "device_verifier"
+            }),
+        )
+        .await;
+
+        let (mut exchange, _) = listener.accept().await.unwrap();
+        read_http_request(&mut exchange).await;
+        write_json_response(
+            &mut exchange,
+            json!({
+                "access_token": token("acc_delayed_device"),
+                "refresh_token": "refresh_delayed_device",
+                "expires_in": 3600
+            }),
+        )
+        .await;
+    });
+    (format!("http://{address}"), task)
+}
+
+async fn read_http_request(socket: &mut tokio::net::TcpStream) {
+    let mut request = Vec::new();
+    let header_end = loop {
+        let mut bytes = [0; 1024];
+        let count = tokio::io::AsyncReadExt::read(socket, &mut bytes)
+            .await
+            .unwrap();
+        request.extend_from_slice(&bytes[..count]);
+        if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length: ")
+                .and_then(|value| value.parse::<usize>().ok())
+        })
+        .unwrap_or_default();
+    while request.len() < header_end + content_length {
+        let mut bytes = [0; 1024];
+        let count = tokio::io::AsyncReadExt::read(socket, &mut bytes)
+            .await
+            .unwrap();
+        request.extend_from_slice(&bytes[..count]);
+    }
+}
+
+async fn write_json_response(socket: &mut tokio::net::TcpStream, body: serde_json::Value) {
+    let body = serde_json::to_vec(&body).unwrap();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    tokio::io::AsyncWriteExt::write_all(socket, response.as_bytes())
+        .await
+        .unwrap();
+    tokio::io::AsyncWriteExt::write_all(socket, &body)
+        .await
+        .unwrap();
 }
 
 fn form_value(

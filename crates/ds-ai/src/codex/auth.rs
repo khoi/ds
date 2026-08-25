@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
+    future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -144,17 +145,19 @@ impl Client {
         interaction: &dyn Interaction,
         cancellation: &CancellationToken,
     ) -> Result<Credentials, Error> {
-        let deadline = Instant::now() + self.device_timeout;
         let response = self
             .device_request(
                 "/api/accounts/deviceauth/usercode",
                 serde_json::json!({"client_id": CLIENT_ID}),
                 cancellation,
-                deadline,
+                None,
             )
             .await?;
         let status = response.status();
-        let body = read_body(response, cancellation, deadline).await?;
+        let body = read_body(response, cancellation, None).await?;
+        if status.as_u16() == 404 {
+            return Err(Error::DeviceLoginDisabled);
+        }
         if !status.is_success() {
             return Err(Error::Server {
                 operation: "device start",
@@ -163,6 +166,7 @@ impl Client {
             });
         }
         let device = parse_device(&body)?;
+        let deadline = Instant::now() + self.device_timeout;
         interaction.notify(Notification::DeviceCode {
             user_code: device.user_code.clone(),
             verification_uri: format!("{}/codex/device", self.base_url),
@@ -180,12 +184,12 @@ impl Client {
                         "user_code": device.user_code,
                     }),
                     cancellation,
-                    deadline,
+                    Some(deadline),
                 )
                 .await
                 .map_err(|error| device_poll_error(error, slowed_down))?;
             let status = response.status();
-            let body = read_body(response, cancellation, deadline)
+            let body = read_body(response, cancellation, Some(deadline))
                 .await
                 .map_err(|error| device_poll_error(error, slowed_down))?;
             match parse_device_poll(status.as_u16(), &body)? {
@@ -219,17 +223,7 @@ impl Client {
             .append_pair("refresh_token", refresh_token)
             .append_pair("client_id", CLIENT_ID)
             .finish();
-        let response = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(Error::Cancelled),
-            response = self
-                .http
-                .post(format!("{}/oauth/token", self.base_url))
-                .header("content-type", "application/x-www-form-urlencoded")
-                .body(body)
-                .send() => response.map_err(|error| Error::Http(error.to_string()))?,
-        };
-        read_credentials(response, "refresh", cancellation).await
+        self.send_token_request(body, "refresh", cancellation).await
     }
 
     async fn exchange(
@@ -246,17 +240,27 @@ impl Client {
             .append_pair("code_verifier", verifier)
             .append_pair("redirect_uri", redirect_uri)
             .finish();
-        let response = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(Error::Cancelled),
-            response = self
-                .http
+        self.send_token_request(body, "exchange", cancellation)
+            .await
+    }
+
+    async fn send_token_request(
+        &self,
+        body: String,
+        operation: &'static str,
+        cancellation: &CancellationToken,
+    ) -> Result<Credentials, Error> {
+        let response = await_http(
+            self.http
                 .post(format!("{}/oauth/token", self.base_url))
                 .header("content-type", "application/x-www-form-urlencoded")
                 .body(body)
-                .send() => response.map_err(|error| Error::Http(error.to_string()))?,
-        };
-        read_credentials(response, "exchange", cancellation).await
+                .send(),
+            cancellation,
+            None,
+        )
+        .await?;
+        read_credentials(response, operation, cancellation).await
     }
 
     fn authorization_url(
@@ -286,18 +290,17 @@ impl Client {
         path: &str,
         body: serde_json::Value,
         cancellation: &CancellationToken,
-        deadline: Instant,
+        deadline: Option<Instant>,
     ) -> Result<reqwest::Response, Error> {
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => Err(Error::Cancelled),
-            _ = tokio::time::sleep_until(deadline) => Err(Error::Timeout),
-            response = self
-                .http
+        await_http(
+            self.http
                 .post(format!("{}{path}", self.base_url))
                 .json(&body)
-                .send() => response.map_err(|error| Error::Http(error.to_string())),
-        }
+                .send(),
+            cancellation,
+            deadline,
+        )
+        .await
     }
 }
 
@@ -501,6 +504,10 @@ pub(crate) enum Error {
     #[error("OAuth device login timed out")]
     Timeout,
     #[error(
+        "OpenAI Codex device code login is not enabled for this server. Use browser login or verify the server URL."
+    )]
+    DeviceLoginDisabled,
+    #[error(
         "Device flow timed out after one or more slow_down responses. This is often caused by clock drift in WSL or VM environments. Please sync or restart the VM clock and try again."
     )]
     SlowDownTimeout,
@@ -541,11 +548,7 @@ async fn read_credentials(
     cancellation: &CancellationToken,
 ) -> Result<Credentials, Error> {
     let status = response.status();
-    let body = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => return Err(Error::Cancelled),
-        body = response.text() => body.map_err(|error| Error::Http(error.to_string()))?,
-    };
+    let body = await_http(response.text(), cancellation, None).await?;
     if !status.is_success() {
         return Err(Error::Server {
             operation,
@@ -578,13 +581,28 @@ async fn read_credentials(
 async fn read_body(
     response: reqwest::Response,
     cancellation: &CancellationToken,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<String, Error> {
+    await_http(response.text(), cancellation, deadline).await
+}
+
+async fn await_http<T>(
+    request: impl Future<Output = Result<T, reqwest::Error>>,
+    cancellation: &CancellationToken,
+    deadline: Option<Instant>,
+) -> Result<T, Error> {
     tokio::select! {
         biased;
         _ = cancellation.cancelled() => Err(Error::Cancelled),
-        _ = tokio::time::sleep_until(deadline) => Err(Error::Timeout),
-        body = response.text() => body.map_err(|error| Error::Http(error.to_string())),
+        _ = wait_until(deadline) => Err(Error::Timeout),
+        response = request => response.map_err(|error| Error::Http(error.to_string())),
+    }
+}
+
+async fn wait_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -776,17 +794,18 @@ async fn wait_for_callback(
             _ = cancellation.cancelled() => return Err(Error::Cancelled),
             accepted = listener.accept() => accepted.map_err(|error| Error::Callback(error.to_string()))?,
         };
-        let authorization = match read_callback(&mut socket).await {
+        let authorization = match tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(Error::Cancelled),
+            authorization = read_callback(&mut socket) => authorization,
+        } {
             Ok(authorization) => authorization,
-            Err(error) => {
+            Err(_) => {
                 write_callback(&mut socket, 400, "Invalid OAuth callback").await;
                 if cancellation.is_cancelled() {
                     return Err(Error::Cancelled);
                 }
-                if matches!(error, Error::StateMismatch | Error::MissingCode) {
-                    continue;
-                }
-                return Err(error);
+                continue;
             }
         };
         if authorization.state.as_deref() != Some(&state) {

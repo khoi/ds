@@ -2,10 +2,11 @@ use crate::support::{Reply, serve};
 use base64::prelude::*;
 use ds_ai::{
     Api, ApiStreamOptions, AssistantContent, AssistantMessage, AssistantMessageEvent,
-    AssistantToolCall, CacheRetention, ConstrainedSampling, Context, GrammarVariants, InputContent,
-    Message, OpenAiCodexResponsesOptions, PayloadHook, Provider as _, ProviderId, ResponseHook,
-    SimpleStreamOptions, StopReason, StreamOptions, ThinkingLevel, Tool, ToolResultMessage,
-    Transport as ProviderTransport, Usage, builtin_model, codex,
+    AssistantToolCall, CacheRetention, ConstrainedSampling, Context, ErrorReason, GrammarVariants,
+    InputContent, Message, OpenAiCodexResponsesOptions, PayloadHook, Provider as _, ProviderId,
+    ResponseHook, SimpleStreamOptions, StopReason, StreamOptions, TextContent, ThinkingContent,
+    ThinkingLevel, Tool, ToolResultMessage, Transport as ProviderTransport, Usage, builtin_model,
+    cleanup_session_resources, codex,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -108,6 +109,216 @@ async fn retries_and_compresses_a_codex_sse_request() {
             })
         );
     }
+}
+
+#[tokio::test]
+async fn uses_the_default_codex_instruction_for_an_empty_system_prompt() {
+    let server = serve([Reply::sse(sse_text_events(
+        "resp_empty_system",
+        "msg_empty_system",
+        "Done",
+    ))])
+    .await;
+    let model = model(&server.base_url);
+    let options = options(token("acc_empty_system"), |options| {
+        options.stream.transport = Some(ProviderTransport::Sse);
+    });
+
+    done(
+        &events(
+            &model,
+            &Context::new([Message::user("Hello")]).with_system(""),
+            &options,
+        )
+        .await,
+    );
+
+    assert_eq!(
+        codex_body(&server.request_bytes().await[0])["instructions"],
+        "You are a helpful assistant."
+    );
+}
+
+#[tokio::test]
+async fn preserves_codex_response_state_across_sse_and_websocket_transports() {
+    let provider_events = vec![
+        json!({"type": "response.created", "response": {"id": ""}}),
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "reasoning", "id": "rs_empty", "summary": []}
+        }),
+        json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "delta": "Keep this"
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {"type": "reasoning", "id": "rs_empty", "summary": [], "content": []}
+        }),
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "type": "function_call",
+                "id": "fc_added",
+                "call_id": "call_added",
+                "name": "lookup",
+                "arguments": "",
+                "namespace": "functions"
+            }
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "delta": "{\"city\":\"Paris\"}"
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "type": "function_call",
+                "id": "fc_terminal",
+                "call_id": "call_terminal",
+                "name": "replace",
+                "arguments": ""
+            }
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {"id": "", "status": "completed"}
+        }),
+    ];
+
+    for transport in [ProviderTransport::Sse, ProviderTransport::WebSocket] {
+        let result = done(
+            &codex_events_for_transport(
+                provider_events.clone(),
+                transport,
+                Context::new([Message::user("Use tools")]),
+            )
+            .await,
+        )
+        .clone();
+
+        let [
+            AssistantContent::Thinking(thinking),
+            AssistantContent::ToolCall(call),
+        ] = result.content.as_slice()
+        else {
+            panic!("expected reasoning and tool call")
+        };
+        assert_eq!(thinking.thinking, "Keep this");
+        assert_eq!(call.arguments, json!({"city": "Paris"}));
+        assert_eq!(call.namespace.as_deref(), Some("functions"));
+        assert_eq!(call.id, "call_added|fc_added");
+        assert_eq!(call.name, "lookup");
+        assert_eq!(result.response_id.as_deref(), Some(""));
+        assert_eq!(result.usage.reasoning, None);
+    }
+}
+
+#[tokio::test]
+async fn validates_codex_replay_signatures_and_emitted_message_indexes() {
+    let model = model("http://127.0.0.1:9");
+    let assistant = |content, stop_reason| AssistantMessage {
+        content,
+        api: Api::OpenAiCodexResponses,
+        provider: ProviderId::new("openai-codex"),
+        model: model.id.clone(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 1,
+    };
+    let context = Context::new([
+        Message::user("Hello"),
+        Message::assistant(assistant(
+            vec![AssistantContent::Text(TextContent {
+                text: "Discard".into(),
+                text_signature: None,
+            })],
+            StopReason::Error,
+        )),
+        Message::assistant(assistant(
+            vec![
+                AssistantContent::Text(TextContent {
+                    text: "Fallback".into(),
+                    text_signature: Some(
+                        json!({"v": 1, "id": "", "phase": "final_answer"}).to_string(),
+                    ),
+                }),
+                AssistantContent::Text(TextContent {
+                    text: "No phase".into(),
+                    text_signature: Some(
+                        json!({"v": 1, "id": "msg_unknown", "phase": "unknown"}).to_string(),
+                    ),
+                }),
+            ],
+            StopReason::Stop,
+        )),
+        Message::user("Continue"),
+    ]);
+    let terminal = vec![json!({
+        "type": "response.completed",
+        "response": {"id": "resp_replay", "usage": {}}
+    })];
+
+    for transport in [ProviderTransport::Sse, ProviderTransport::WebSocket] {
+        let body = codex_request_for_transport(terminal.clone(), transport, context.clone()).await;
+        assert_eq!(body["input"][1]["id"], "msg_pi_1");
+        assert_eq!(body["input"][1]["phase"], "final_answer");
+        assert_eq!(body["input"][2]["id"], "msg_unknown");
+        assert!(body["input"][2].get("phase").is_none());
+    }
+}
+
+#[tokio::test]
+async fn rejects_malformed_same_model_codex_reasoning_signatures() {
+    let model = model("http://127.0.0.1:9");
+    let replay = AssistantMessage {
+        content: vec![AssistantContent::Thinking(ThinkingContent {
+            thinking: "Reasoning".into(),
+            thinking_signature: Some("{".into()),
+            redacted: None,
+        })],
+        api: Api::OpenAiCodexResponses,
+        provider: ProviderId::new("openai-codex"),
+        model: model.id.clone(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 1,
+    };
+    let options = options(token("acc_bad_signature"), |options| {
+        options.stream.transport = Some(ProviderTransport::Sse);
+    });
+
+    let result = events(
+        &model,
+        &Context::new([Message::assistant(replay)]),
+        &options,
+    )
+    .await;
+
+    assert!(
+        failed(&result)
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.starts_with("invalid request: EOF while parsing"))
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -869,7 +1080,7 @@ async fn cancels_an_active_codex_sse_body_with_partial_content() {
 
     match stream.next().await {
         Some(AssistantMessageEvent::Error { reason, error }) => {
-            assert_eq!(reason, StopReason::Aborted);
+            assert_eq!(reason, ErrorReason::Aborted);
             assert_eq!(error.response_id.as_deref(), Some("resp_cancel"));
             assert_text(&error, "Visible");
         }
@@ -982,6 +1193,7 @@ async fn routes_simple_codex_options_to_cached_websocket_transport() {
     assert_eq!(capture.headers["session-id"], "session_simple");
     assert_eq!(capture.headers["x-client-request-id"], "session_simple");
     assert_eq!(capture.bodies[0]["reasoning"]["effort"], "xhigh");
+    assert_eq!(capture.bodies[0]["tool_choice"], "auto");
     assert_eq!(
         codex::websocket_debug_stats("session_simple"),
         Some(codex::WebSocketDebugStats {
@@ -1166,6 +1378,65 @@ async fn streams_a_codex_websocket_request() {
 }
 
 #[tokio::test]
+async fn routes_codex_websockets_through_the_request_proxy_environment() {
+    let (proxy_url, connect_request) = serve_websocket_proxy().await;
+    let model = model("http://codex.invalid/backend-api");
+    let options = options(token("acc_proxy"), |options| {
+        options.stream.env.insert("HTTP_PROXY".into(), proxy_url);
+        options.stream.cache_retention = CacheRetention::None;
+        options.stream.transport = Some(ProviderTransport::WebSocket);
+    });
+
+    let message =
+        done(&events(&model, &Context::new([Message::user("Connect")]), &options).await).clone();
+
+    assert_text(&message, "Proxied");
+    assert!(
+        connect_request
+            .await
+            .unwrap()
+            .starts_with("CONNECT codex.invalid:80 HTTP/1.1\r\n")
+    );
+}
+
+#[tokio::test]
+async fn starts_a_codex_websocket_stream_after_the_first_provider_event() {
+    let (base_url, request_received, release) = serve_gated_websocket().await;
+    let model = model(base_url);
+    let options = options(token("acc_first_event"), |options| {
+        options.stream.cache_retention = CacheRetention::None;
+        options.stream.transport = Some(ProviderTransport::WebSocket);
+    });
+    let mut stream = codex::stream(
+        &model.typed::<OpenAiCodexResponsesOptions>().unwrap(),
+        &Context::new([Message::user("Wait")]),
+        &options,
+    );
+    let (probe_sender, probe_receiver) = oneshot::channel();
+    let (probed_sender, probed_receiver) = oneshot::channel();
+    let stream = tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            event = stream.next() => panic!("stream started before its first provider event: {event:?}"),
+            probe = probe_receiver => probe.unwrap(),
+        }
+        probed_sender.send(()).unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(AssistantMessageEvent::Start { .. })
+        ));
+        stream.collect::<Vec<_>>().await
+    });
+
+    request_received.await.unwrap();
+    probe_sender.send(()).unwrap();
+    probed_receiver.await.unwrap();
+    release.send(()).unwrap();
+
+    assert_text(done(&stream.await.unwrap()), "First provider event");
+}
+
+#[tokio::test]
 async fn uses_uuid_v7_for_a_sessionless_codex_websocket_request() {
     let (base_url, capture) = serve_websocket([text_events("resp_uuid", "msg_uuid", "Done")]).await;
     let model = model(base_url);
@@ -1315,6 +1586,29 @@ async fn encodes_codex_generation_options() {
     assert_eq!(body["service_tier"], "priority");
     assert_eq!(body["text"], json!({"verbosity": "high"}));
     assert_eq!(body["tool_choice"], "required");
+}
+
+#[tokio::test]
+async fn encodes_codex_scale_and_null_service_tiers() {
+    for (service_tier, expected) in [
+        (codex::ServiceTier::Scale, json!("scale")),
+        (codex::ServiceTier::Null, Value::Null),
+    ] {
+        let (base_url, capture) =
+            serve_websocket([text_events("resp_tier", "msg_tier", "Tier")]).await;
+        let model = model(base_url);
+        let options = options(token("acc_tier"), |options| {
+            options.stream.cache_retention = CacheRetention::None;
+            options.stream.transport = Some(ProviderTransport::WebSocket);
+            options.service_tier = Some(service_tier);
+        });
+
+        assert_text(
+            done(&events(&model, &Context::new([Message::user("Tier")]), &options).await),
+            "Tier",
+        );
+        assert_eq!(capture.await.unwrap().bodies[0]["service_tier"], expected);
+    }
 }
 
 #[tokio::test]
@@ -1567,6 +1861,120 @@ async fn reuses_a_codex_websocket_with_an_input_delta() {
     );
     codex::close_websocket_sessions(Some("session_reuse"));
     codex::reset_websocket_debug_stats(Some("session_reuse"));
+}
+
+#[tokio::test]
+async fn uses_normalized_codex_output_as_the_continuation_baseline() {
+    let session = "session_normalized_baseline";
+    let first_events = vec![
+        json!({"type": "response.created", "response": {"id": "resp_normalized_first"}}),
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "msg_normalized_first", "type": "message", "content": []}
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "msg_normalized_first",
+                "type": "message",
+                "content": [{"type": "output_text", "text": "First"}]
+            }
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {"id": "resp_normalized_first", "status": "completed", "usage": {}}
+        }),
+    ];
+    let (base_url, capture) = serve_websocket([
+        first_events,
+        text_events("resp_normalized_second", "msg_normalized_second", "Second"),
+    ])
+    .await;
+    let model = model(base_url);
+    let options = options(token("acc_normalized_baseline"), |options| {
+        options.stream.session_id = Some(session.into());
+        options.stream.transport = Some(ProviderTransport::WebSocketCached);
+    });
+    let first_context = Context::new([Message::user("First")]);
+    let first = done(&events(&model, &first_context, &options).await).clone();
+    let second_context = Context::new([
+        Message::user("First"),
+        Message::assistant(first),
+        Message::user("Continue"),
+    ]);
+
+    done(&events(&model, &second_context, &options).await);
+
+    let capture = capture.await.unwrap();
+    assert_eq!(
+        capture.bodies[1]["previous_response_id"],
+        "resp_normalized_first"
+    );
+    assert_eq!(
+        capture.bodies[1]["input"],
+        json!([{
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Continue"}]
+        }])
+    );
+    codex::close_websocket_sessions(Some(session));
+}
+
+#[tokio::test]
+async fn does_not_cache_an_empty_codex_response_id() {
+    let session = "session_empty_response_id";
+    let first_events = vec![
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "msg_empty_response", "type": "message", "content": []}
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "msg_empty_response",
+                "type": "message",
+                "content": [{"type": "output_text", "text": "First"}]
+            }
+        }),
+        json!({
+            "type": "response.done",
+            "response": {"id": "", "status": "completed", "usage": {}}
+        }),
+    ];
+    let (base_url, capture) = serve_websocket([
+        first_events,
+        text_events("resp_after_empty", "msg_after_empty", "Second"),
+    ])
+    .await;
+    let model = model(base_url);
+    let options = options(token("acc_empty_response_id"), |options| {
+        options.stream.session_id = Some(session.into());
+        options.stream.transport = Some(ProviderTransport::WebSocketCached);
+    });
+    let first =
+        done(&events(&model, &Context::new([Message::user("First")]), &options).await).clone();
+
+    done(
+        &events(
+            &model,
+            &Context::new([
+                Message::user("First"),
+                Message::assistant(first),
+                Message::user("Continue"),
+            ]),
+            &options,
+        )
+        .await,
+    );
+
+    let capture = capture.await.unwrap();
+    assert!(capture.bodies[1].get("previous_response_id").is_none());
+    assert_eq!(capture.bodies[1]["input"].as_array().unwrap().len(), 3);
+    codex::close_websocket_sessions(Some(session));
 }
 
 #[tokio::test]
@@ -2331,6 +2739,48 @@ async fn reports_a_codex_websocket_fallback_on_the_assistant_message() {
 }
 
 #[tokio::test]
+async fn reports_codex_websocket_fallback_on_start_and_stream_partials() {
+    let server = serve([
+        Reply::json(400, json!({"error": "websocket unavailable"})),
+        Reply::sse(sse_text_events(
+            "resp_partial_diagnostic",
+            "msg_partial_diagnostic",
+            "Fallback",
+        )),
+    ])
+    .await;
+    let model = model(&server.base_url);
+    let options = options(token("acc_partial_diagnostic"), |options| {
+        options.stream.transport = Some(ProviderTransport::Auto);
+    });
+
+    let events = events(&model, &Context::new([Message::user("Connect")]), &options).await;
+
+    let start = match &events[0] {
+        AssistantMessageEvent::Start { partial } => partial,
+        event => panic!("expected start, got {event:?}"),
+    };
+    let delta = events
+        .iter()
+        .find_map(|event| match event {
+            AssistantMessageEvent::TextDelta { partial, .. } => Some(partial),
+            _ => None,
+        })
+        .unwrap();
+    for message in [start, delta, done(&events)] {
+        assert_eq!(
+            message
+                .diagnostics
+                .iter()
+                .flatten()
+                .filter(|diagnostic| diagnostic.r#type == "provider_transport_failure")
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
 async fn applies_the_provider_timeout_to_codex_sse_response_headers() {
     let server = serve([Reply::pending()]).await;
     let mut model = builtin_model("openai-codex", "gpt-5.6-sol").unwrap();
@@ -2479,6 +2929,95 @@ async fn closes_cached_codex_websockets_by_session() {
     assert_text(done(&events), "Done");
     codex::close_websocket_sessions(Some("session_close"));
     assert!(closed.await.unwrap());
+}
+
+#[tokio::test]
+async fn closes_cached_codex_websockets_through_provider_neutral_cleanup() {
+    let session = "session_resource_cleanup";
+    let (base_url, closed) = serve_one_shot_websocket(
+        text_events("resp_resource", "msg_resource", "Done"),
+        Duration::from_secs(1),
+    )
+    .await;
+    let model = model(base_url);
+    let options = options(token("acc_resource"), |options| {
+        options.stream.session_id = Some(session.into());
+        options.stream.transport = Some(ProviderTransport::WebSocketCached);
+    });
+
+    assert_text(
+        done(&events(&model, &Context::new([Message::user("Connect")]), &options).await),
+        "Done",
+    );
+    cleanup_session_resources(Some(session)).unwrap();
+    assert!(closed.await.unwrap());
+}
+
+#[tokio::test]
+async fn closes_a_busy_cached_codex_websocket_by_session() {
+    let session = "session_busy_cleanup";
+    let (base_url, request_received, closed) = serve_busy_websocket().await;
+    let model = model(base_url);
+    let options = options(token("acc_busy_cleanup"), |options| {
+        options.stream.session_id = Some(session.into());
+        options.stream.transport = Some(ProviderTransport::WebSocketCached);
+    });
+    let stream = tokio::spawn(async move {
+        events(&model, &Context::new([Message::user("Wait")]), &options).await
+    });
+    request_received.await.unwrap();
+
+    codex::close_websocket_sessions(Some(session));
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), closed)
+            .await
+            .unwrap()
+            .unwrap()
+    );
+    assert_eq!(
+        failed(&stream.await.unwrap()).stop_reason,
+        StopReason::Aborted
+    );
+}
+
+#[test]
+fn closes_a_cached_codex_websocket_outside_a_tokio_runtime() {
+    let session = "session_no_runtime_cleanup";
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let connections = ["a", "b"].map(|suffix| {
+        let (base_url, closed) = runtime.block_on(serve_one_shot_websocket(
+            text_events(
+                &format!("resp_no_runtime_{suffix}"),
+                &format!("msg_no_runtime_{suffix}"),
+                "Done",
+            ),
+            Duration::from_secs(1),
+        ));
+        let model = model(base_url);
+        let options = options(
+            token(&format!("acc_no_runtime_cleanup_{suffix}")),
+            |options| {
+                options.stream.session_id = Some(session.into());
+                options.stream.transport = Some(ProviderTransport::WebSocketCached);
+            },
+        );
+        (model, options, closed)
+    });
+    runtime.block_on(async {
+        for (model, options, _) in &connections {
+            done(&events(model, &Context::new([Message::user("Connect")]), options).await);
+        }
+    });
+
+    codex::close_websocket_sessions(Some(session));
+
+    for (_, _, closed) in connections {
+        assert!(runtime.block_on(closed).unwrap());
+    }
 }
 
 #[tokio::test]
@@ -2694,6 +3233,74 @@ async fn events(
     .await
 }
 
+async fn codex_events_for_transport(
+    provider_events: Vec<Value>,
+    transport: ProviderTransport,
+    context: Context,
+) -> Vec<AssistantMessageEvent> {
+    match transport {
+        ProviderTransport::Sse => {
+            let sse = provider_events
+                .into_iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            let server = serve([Reply::sse(sse)]).await;
+            let model = model(&server.base_url);
+            let options = options(token("acc_transport_sse"), |options| {
+                options.stream.transport = Some(ProviderTransport::Sse);
+            });
+            let result = events(&model, &context, &options).await;
+            server.request_bytes().await;
+            result
+        }
+        ProviderTransport::WebSocket => {
+            let (base_url, capture) = serve_websocket([provider_events]).await;
+            let model = model(base_url);
+            let options = options(token("acc_transport_ws"), |options| {
+                options.stream.cache_retention = CacheRetention::None;
+                options.stream.transport = Some(ProviderTransport::WebSocket);
+            });
+            let result = events(&model, &context, &options).await;
+            capture.await.unwrap();
+            result
+        }
+        transport => panic!("unsupported test transport: {transport:?}"),
+    }
+}
+
+async fn codex_request_for_transport(
+    provider_events: Vec<Value>,
+    transport: ProviderTransport,
+    context: Context,
+) -> Value {
+    match transport {
+        ProviderTransport::Sse => {
+            let sse = provider_events
+                .into_iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            let server = serve([Reply::sse(sse)]).await;
+            let model = model(&server.base_url);
+            let options = options(token("acc_replay_sse"), |options| {
+                options.stream.transport = Some(ProviderTransport::Sse);
+            });
+            done(&events(&model, &context, &options).await);
+            codex_body(&server.request_bytes().await[0])
+        }
+        ProviderTransport::WebSocket => {
+            let (base_url, capture) = serve_websocket([provider_events]).await;
+            let model = model(base_url);
+            let options = options(token("acc_replay_ws"), |options| {
+                options.stream.cache_retention = CacheRetention::None;
+                options.stream.transport = Some(ProviderTransport::WebSocket);
+            });
+            done(&events(&model, &context, &options).await);
+            capture.await.unwrap().bodies.remove(0)
+        }
+        transport => panic!("unsupported test transport: {transport:?}"),
+    }
+}
+
 fn assert_text(message: &AssistantMessage, expected: &str) {
     assert!(matches!(
         message.content.as_slice(),
@@ -2764,6 +3371,99 @@ async fn serve_websocket(
                 bodies,
             })
             .ok();
+    });
+    (format!("http://{address}"), receiver)
+}
+
+async fn serve_gated_websocket() -> (String, oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_sender, request_receiver) = oneshot::channel();
+    let (release_sender, release_receiver) = oneshot::channel();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        assert!(matches!(
+            socket.next().await,
+            Some(Ok(WebSocketMessage::Text(_)))
+        ));
+        request_sender.send(()).unwrap();
+        release_receiver.await.unwrap();
+        for event in text_events(
+            "resp_first_event",
+            "msg_first_event",
+            "First provider event",
+        ) {
+            socket
+                .send(WebSocketMessage::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            socket.next().await,
+            Some(Ok(WebSocketMessage::Close(_)))
+        ));
+    });
+    (
+        format!("http://{address}"),
+        request_receiver,
+        release_sender,
+    )
+}
+
+async fn serve_busy_websocket() -> (String, oneshot::Receiver<()>, oneshot::Receiver<bool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_sender, request_receiver) = oneshot::channel();
+    let (closed_sender, closed_receiver) = oneshot::channel();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        assert!(matches!(
+            socket.next().await,
+            Some(Ok(WebSocketMessage::Text(_)))
+        ));
+        request_sender.send(()).unwrap();
+        let closed = matches!(
+            tokio::time::timeout(Duration::from_secs(1), socket.next()).await,
+            Ok(Some(Ok(WebSocketMessage::Close(_)))) | Ok(None)
+        );
+        closed_sender.send(closed).unwrap();
+    });
+    (
+        format!("http://{address}"),
+        request_receiver,
+        closed_receiver,
+    )
+}
+
+async fn serve_websocket_proxy() -> (String, oneshot::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sender, receiver) = oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = String::from_utf8(read_http_request(&mut socket).await).unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        assert!(matches!(
+            socket.next().await,
+            Some(Ok(WebSocketMessage::Text(_)))
+        ));
+        for event in text_events("resp_proxy", "msg_proxy", "Proxied") {
+            socket
+                .send(WebSocketMessage::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            socket.next().await,
+            Some(Ok(WebSocketMessage::Close(_)))
+        ));
+        sender.send(request).unwrap();
     });
     (format!("http://{address}"), receiver)
 }

@@ -1,7 +1,5 @@
-use ds_ai::{
-    AnthropicOptions, AssistantMessageEventStream, Context, Message, OpenAiCodexResponsesOptions,
-    OpenAiResponsesOptions, StreamOptions, Transport, builtin_model,
-};
+include!("live/support.rs");
+include!("live/probes.rs");
 
 #[tokio::test]
 #[ignore = "requires OPENAI_API_KEY and DS_AI_OPENAI_MODEL"]
@@ -11,7 +9,7 @@ async fn openai_live_smoke() {
         model.base_url = base_url;
     }
     let stream = ds_ai::openai::stream(
-        &model.typed::<ds_ai::OpenAiResponsesOptions>().unwrap(),
+        &model.typed::<OpenAiResponsesOptions>().unwrap(),
         &Context::new([Message::user("Reply with OK")]),
         &OpenAiResponsesOptions {
             stream: StreamOptions {
@@ -32,7 +30,7 @@ async fn anthropic_live_smoke() {
         model.base_url = base_url;
     }
     let stream = ds_ai::anthropic::stream(
-        &model.typed::<ds_ai::AnthropicOptions>().unwrap(),
+        &model.typed::<AnthropicOptions>().unwrap(),
         &Context::new([Message::user("Reply with OK")]),
         &AnthropicOptions {
             stream: StreamOptions {
@@ -53,7 +51,7 @@ async fn codex_live_smoke() {
         model.base_url = base_url;
     }
     let stream = ds_ai::codex::stream(
-        &model.typed::<ds_ai::OpenAiCodexResponsesOptions>().unwrap(),
+        &model.typed::<OpenAiCodexResponsesOptions>().unwrap(),
         &Context::new([Message::user("Reply with OK")]),
         &OpenAiCodexResponsesOptions {
             stream: StreamOptions {
@@ -71,11 +69,7 @@ async fn assert_completed(mut stream: AssistantMessageEventStream) {
     assert!(!stream.result().await.unwrap().content.is_empty());
 }
 
-fn live_model(provider: &str, name: &str) -> ds_ai::Model {
+fn live_model(provider: &str, name: &str) -> Model {
     let id = required(name);
     builtin_model(provider, &id).unwrap_or_else(|| panic!("unknown {provider} model {id}"))
-}
-
-fn required(name: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| panic!("missing {name}"))
 }

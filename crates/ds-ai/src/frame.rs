@@ -1,6 +1,6 @@
 use crate::{AssistantContent, AssistantMessage, AssistantMessageEvent, AssistantToolCall};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -51,6 +51,7 @@ pub enum AssistantMessageFrame {
         #[serde(skip_serializing_if = "Option::is_none")]
         redacted: Option<bool>,
     },
+    #[serde(rename = "toolcall_start")]
     ToolCallStart {
         content_index: usize,
         #[serde(
@@ -59,10 +60,17 @@ pub enum AssistantMessageFrame {
         )]
         tool_call: AssistantToolCall,
     },
+    #[serde(rename = "toolcall_checkpoint")]
+    ToolCallCheckpoint {
+        content_index: usize,
+        json: String,
+    },
+    #[serde(rename = "toolcall_delta")]
     ToolCallDelta {
         content_index: usize,
         delta: String,
     },
+    #[serde(rename = "toolcall_end")]
     ToolCallEnd {
         content_index: usize,
         id: String,
@@ -136,102 +144,344 @@ impl AssistantMessageFrameError {
     }
 }
 
-pub fn assistant_message_event_to_frame(
-    event: &AssistantMessageEvent,
-) -> Result<Option<AssistantMessageFrame>, AssistantMessageFrameError> {
-    let frame = match event {
-        AssistantMessageEvent::Start { partial } => AssistantMessageFrame::Start {
-            partial: Box::new(partial.clone()),
-        },
-        AssistantMessageEvent::TextStart {
-            content_index,
-            partial,
-        } => AssistantMessageFrame::TextStart {
-            content_index: *content_index,
-            content: text(partial, *content_index, "text_start")?.clone(),
-        },
-        AssistantMessageEvent::TextDelta {
-            content_index,
-            delta,
-            ..
-        } => AssistantMessageFrame::TextDelta {
-            content_index: *content_index,
-            delta: delta.clone(),
-        },
-        AssistantMessageEvent::TextEnd {
-            content_index,
-            content,
-            partial,
-        } => AssistantMessageFrame::TextEnd {
-            content_index: *content_index,
-            content: content.clone(),
-            text_signature: text(partial, *content_index, "text_end")?
-                .text_signature
-                .clone(),
-        },
-        AssistantMessageEvent::ThinkingStart {
-            content_index,
-            partial,
-        } => AssistantMessageFrame::ThinkingStart {
-            content_index: *content_index,
-            content: thinking(partial, *content_index, "thinking_start")?.clone(),
-        },
-        AssistantMessageEvent::ThinkingDelta {
-            content_index,
-            delta,
-            ..
-        } => AssistantMessageFrame::ThinkingDelta {
-            content_index: *content_index,
-            delta: delta.clone(),
-        },
-        AssistantMessageEvent::ThinkingEnd {
-            content_index,
-            content,
-            partial,
-        } => {
-            let final_content = thinking(partial, *content_index, "thinking_end")?;
-            AssistantMessageFrame::ThinkingEnd {
-                content_index: *content_index,
-                content: content.clone(),
-                thinking_signature: final_content.thinking_signature.clone(),
-                redacted: final_content.redacted,
+#[derive(Debug)]
+enum EncoderBlockState {
+    Text {
+        kind: Kind,
+        covered_chars: usize,
+        delta_chars: usize,
+    },
+    ToolCall {
+        caught_up: bool,
+        catchup_json: String,
+        snapshot_arguments: String,
+    },
+}
+
+impl EncoderBlockState {
+    fn kind(&self) -> Kind {
+        match self {
+            Self::Text { kind, .. } => *kind,
+            Self::ToolCall { .. } => Kind::ToolCall,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct AssistantMessageFrameEncoder {
+    started: bool,
+    terminal: bool,
+    blocks: BTreeMap<usize, EncoderBlockState>,
+}
+
+impl AssistantMessageFrameEncoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn encode(
+        &mut self,
+        event: &AssistantMessageEvent,
+    ) -> Result<Option<AssistantMessageFrame>, AssistantMessageFrameError> {
+        if self.terminal {
+            return Err(AssistantMessageFrameError::new(format!(
+                "Assistant message event {} follows a terminal event",
+                event_kind(event)
+            )));
+        }
+        match event {
+            AssistantMessageEvent::Start { partial } => {
+                if self.started {
+                    return Err(AssistantMessageFrameError::new(
+                        "Assistant message stream contains more than one start event",
+                    ));
+                }
+                self.started = true;
+                Ok(Some(AssistantMessageFrame::Start {
+                    partial: Box::new(normalized_start(partial)),
+                }))
+            }
+            AssistantMessageEvent::Done { .. } => {
+                if !self.started {
+                    return Err(AssistantMessageFrameError::new(
+                        "Assistant message done event appears before start",
+                    ));
+                }
+                self.terminal = true;
+                Ok(None)
+            }
+            AssistantMessageEvent::Error { .. } => {
+                self.terminal = true;
+                Ok(None)
+            }
+            _ if !self.started => Err(AssistantMessageFrameError::new(format!(
+                "Assistant message {} event appears before start",
+                event_kind(event)
+            ))),
+            AssistantMessageEvent::TextStart {
+                content_index,
+                partial,
+            } => {
+                let content = text(partial, *content_index, "text_start")?.clone();
+                self.start_block(
+                    *content_index,
+                    EncoderBlockState::Text {
+                        kind: Kind::Text,
+                        covered_chars: content.text.chars().count(),
+                        delta_chars: 0,
+                    },
+                )?;
+                Ok(Some(AssistantMessageFrame::TextStart {
+                    content_index: *content_index,
+                    content,
+                }))
+            }
+            AssistantMessageEvent::TextDelta {
+                content_index,
+                delta,
+                ..
+            } => self.encode_text_delta(*content_index, delta, Kind::Text),
+            AssistantMessageEvent::TextEnd {
+                content_index,
+                content,
+                partial,
+            } => {
+                let text_signature = text(partial, *content_index, "text_end")?
+                    .text_signature
+                    .clone();
+                self.end_block(*content_index, Kind::Text)?;
+                Ok(Some(AssistantMessageFrame::TextEnd {
+                    content_index: *content_index,
+                    content: content.clone(),
+                    text_signature,
+                }))
+            }
+            AssistantMessageEvent::ThinkingStart {
+                content_index,
+                partial,
+            } => {
+                let content = thinking(partial, *content_index, "thinking_start")?.clone();
+                self.start_block(
+                    *content_index,
+                    EncoderBlockState::Text {
+                        kind: Kind::Thinking,
+                        covered_chars: content.thinking.chars().count(),
+                        delta_chars: 0,
+                    },
+                )?;
+                Ok(Some(AssistantMessageFrame::ThinkingStart {
+                    content_index: *content_index,
+                    content,
+                }))
+            }
+            AssistantMessageEvent::ThinkingDelta {
+                content_index,
+                delta,
+                ..
+            } => self.encode_text_delta(*content_index, delta, Kind::Thinking),
+            AssistantMessageEvent::ThinkingEnd {
+                content_index,
+                content,
+                partial,
+            } => {
+                let final_content = thinking(partial, *content_index, "thinking_end")?;
+                let thinking_signature = final_content.thinking_signature.clone();
+                let redacted = final_content.redacted;
+                self.end_block(*content_index, Kind::Thinking)?;
+                Ok(Some(AssistantMessageFrame::ThinkingEnd {
+                    content_index: *content_index,
+                    content: content.clone(),
+                    thinking_signature,
+                    redacted,
+                }))
+            }
+            AssistantMessageEvent::ToolCallStart {
+                content_index,
+                partial,
+            } => {
+                let tool_call = tool_call(partial, *content_index, "toolcall_start")?.clone();
+                let snapshot_arguments = tool_call.arguments.to_string();
+                let caught_up = snapshot_arguments == "{}";
+                self.start_block(
+                    *content_index,
+                    EncoderBlockState::ToolCall {
+                        caught_up,
+                        catchup_json: String::new(),
+                        snapshot_arguments: if caught_up {
+                            String::new()
+                        } else {
+                            snapshot_arguments
+                        },
+                    },
+                )?;
+                Ok(Some(AssistantMessageFrame::ToolCallStart {
+                    content_index: *content_index,
+                    tool_call,
+                }))
+            }
+            AssistantMessageEvent::ToolCallDelta {
+                content_index,
+                delta,
+                ..
+            } => self.encode_tool_call_delta(*content_index, delta),
+            AssistantMessageEvent::ToolCallEnd {
+                content_index,
+                tool_call: final_tool_call,
+                partial,
+            } => {
+                tool_call(partial, *content_index, "toolcall_end")?;
+                self.end_block(*content_index, Kind::ToolCall)?;
+                Ok(Some(AssistantMessageFrame::ToolCallEnd {
+                    content_index: *content_index,
+                    id: final_tool_call.id.clone(),
+                    name: final_tool_call.name.clone(),
+                    arguments: final_tool_call.arguments.clone(),
+                    thought_signature: final_tool_call.thought_signature.clone(),
+                    namespace: final_tool_call.namespace.clone(),
+                }))
             }
         }
-        AssistantMessageEvent::ToolCallStart {
-            content_index,
-            partial,
-        } => AssistantMessageFrame::ToolCallStart {
-            content_index: *content_index,
-            tool_call: tool_call(partial, *content_index, "toolcall_start")?.clone(),
-        },
-        AssistantMessageEvent::ToolCallDelta {
-            content_index,
-            delta,
-            ..
-        } => AssistantMessageFrame::ToolCallDelta {
-            content_index: *content_index,
-            delta: delta.clone(),
-        },
-        AssistantMessageEvent::ToolCallEnd {
-            content_index,
-            tool_call,
-            partial,
-        } => {
-            tool_call_at(partial, *content_index, "toolcall_end")?;
-            AssistantMessageFrame::ToolCallEnd {
-                content_index: *content_index,
-                id: tool_call.id.clone(),
-                name: tool_call.name.clone(),
-                arguments: tool_call.arguments.clone(),
-                thought_signature: tool_call.thought_signature.clone(),
-                namespace: tool_call.namespace.clone(),
+    }
+
+    fn start_block(
+        &mut self,
+        content_index: usize,
+        state: EncoderBlockState,
+    ) -> Result<(), AssistantMessageFrameError> {
+        match self.blocks.entry(content_index) {
+            Entry::Vacant(entry) => {
+                entry.insert(state);
+                Ok(())
             }
+            Entry::Occupied(_) => Err(AssistantMessageFrameError::new(format!(
+                "Assistant message block {content_index} starts more than once"
+            ))),
         }
-        AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => {
+    }
+
+    fn block(
+        &mut self,
+        content_index: usize,
+        expected: Kind,
+    ) -> Result<&mut EncoderBlockState, AssistantMessageFrameError> {
+        let state = self.blocks.get_mut(&content_index).ok_or_else(|| {
+            AssistantMessageFrameError::new(format!(
+                "Assistant message {} block {content_index} has not started",
+                kind_name(expected)
+            ))
+        })?;
+        if state.kind() != expected {
+            return Err(AssistantMessageFrameError::new(format!(
+                "Assistant message block {content_index} is {}, not {}",
+                kind_name(state.kind()),
+                kind_name(expected)
+            )));
+        }
+        Ok(state)
+    }
+
+    fn end_block(
+        &mut self,
+        content_index: usize,
+        expected: Kind,
+    ) -> Result<(), AssistantMessageFrameError> {
+        self.block(content_index, expected)?;
+        self.blocks.remove(&content_index);
+        Ok(())
+    }
+
+    fn encode_text_delta(
+        &mut self,
+        content_index: usize,
+        delta: &str,
+        expected: Kind,
+    ) -> Result<Option<AssistantMessageFrame>, AssistantMessageFrameError> {
+        let EncoderBlockState::Text {
+            covered_chars,
+            delta_chars,
+            ..
+        } = self.block(content_index, expected)?
+        else {
+            return Err(AssistantMessageFrameError::new(
+                "Unreachable text encoder state",
+            ));
+        };
+        let delta_start = *delta_chars;
+        let delta_len = delta.chars().count();
+        *delta_chars += delta_len;
+        let covered = covered_chars.saturating_sub(delta_start);
+        if covered >= delta_len {
             return Ok(None);
         }
-    };
-    Ok(Some(frame))
+        let delta = delta.chars().skip(covered).collect();
+        let frame = match expected {
+            Kind::Text => AssistantMessageFrame::TextDelta {
+                content_index,
+                delta,
+            },
+            Kind::Thinking => AssistantMessageFrame::ThinkingDelta {
+                content_index,
+                delta,
+            },
+            Kind::ToolCall => {
+                return Err(AssistantMessageFrameError::new(
+                    "Unreachable text encoder state",
+                ));
+            }
+        };
+        Ok(Some(frame))
+    }
+
+    fn encode_tool_call_delta(
+        &mut self,
+        content_index: usize,
+        delta: &str,
+    ) -> Result<Option<AssistantMessageFrame>, AssistantMessageFrameError> {
+        let EncoderBlockState::ToolCall {
+            caught_up,
+            catchup_json,
+            snapshot_arguments,
+        } = self.block(content_index, Kind::ToolCall)?
+        else {
+            return Err(AssistantMessageFrameError::new(
+                "Unreachable tool-call encoder state",
+            ));
+        };
+        if *caught_up {
+            return if delta.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(AssistantMessageFrame::ToolCallDelta {
+                    content_index,
+                    delta: delta.into(),
+                }))
+            };
+        }
+        catchup_json.push_str(delta);
+        let streamed_arguments = crate::json::streaming_value(catchup_json).to_string();
+        if streamed_arguments != *snapshot_arguments {
+            return Ok(None);
+        }
+        *caught_up = true;
+        snapshot_arguments.clear();
+        let json = std::mem::take(catchup_json);
+        Ok(
+            (!json.is_empty()).then(|| AssistantMessageFrame::ToolCallCheckpoint {
+                content_index,
+                json,
+            }),
+        )
+    }
+}
+
+fn normalized_start(message: &AssistantMessage) -> AssistantMessage {
+    let mut message = message.clone();
+    message.content.clear();
+    message.stop_reason = crate::StopReason::Pending;
+    message.error_message = None;
+    message.raw_stop_reason = None;
+    message.end_turn = None;
+    message
 }
 
 fn content<'a>(
@@ -279,14 +529,6 @@ fn tool_call<'a>(
     }
 }
 
-fn tool_call_at(
-    message: &AssistantMessage,
-    content_index: usize,
-    event: &str,
-) -> Result<(), AssistantMessageFrameError> {
-    tool_call(message, content_index, event).map(|_| ())
-}
-
 fn wrong_event_block(
     event: &str,
     block: &AssistantContent,
@@ -322,15 +564,8 @@ struct BlockState {
 pub fn reduce_assistant_message_frames(
     frames: impl IntoIterator<Item = AssistantMessageFrame>,
 ) -> Result<Option<AssistantMessage>, AssistantMessageFrameError> {
-    let frames = frames.into_iter().collect::<Vec<_>>();
-    if !frames
-        .iter()
-        .any(|frame| matches!(frame, AssistantMessageFrame::Start { .. }))
-    {
-        return Ok(None);
-    }
-
     let mut message = None;
+    let mut frame_before_start = None;
     let mut states = BTreeMap::new();
     for frame in frames {
         if let AssistantMessageFrame::Start { partial } = frame {
@@ -339,15 +574,18 @@ pub fn reduce_assistant_message_frames(
                     "Assistant message frame sequence contains more than one start frame",
                 ));
             }
+            if let Some(kind) = frame_before_start {
+                return Err(AssistantMessageFrameError::new(format!(
+                    "{kind} frame appears before the start frame"
+                )));
+            }
             message = Some(*partial);
             continue;
         }
-        let output = message.as_mut().ok_or_else(|| {
-            AssistantMessageFrameError::new(format!(
-                "{} frame appears before the start frame",
-                frame_kind(&frame)
-            ))
-        })?;
+        let Some(output) = message.as_mut() else {
+            frame_before_start.get_or_insert_with(|| frame_kind(&frame));
+            continue;
+        };
         apply_frame(output, &mut states, frame)?;
     }
 
@@ -478,6 +716,26 @@ fn apply_frame(
             AssistantContent::ToolCall(tool_call),
             Kind::ToolCall,
         ),
+        AssistantMessageFrame::ToolCallCheckpoint {
+            content_index,
+            json,
+        } => {
+            let block = active(
+                message,
+                states,
+                content_index,
+                Kind::ToolCall,
+                "toolcall_checkpoint",
+            )?;
+            let AssistantContent::ToolCall(tool_call) = block else {
+                return Err(AssistantMessageFrameError::new(
+                    "Unreachable tool-call checkpoint state",
+                ));
+            };
+            tool_call.arguments = crate::json::streaming_value(&json);
+            state(states, content_index)?.json = json;
+            Ok(())
+        }
         AssistantMessageFrame::ToolCallDelta {
             content_index,
             delta,
@@ -621,7 +879,25 @@ fn frame_kind(frame: &AssistantMessageFrame) -> &'static str {
         AssistantMessageFrame::ThinkingDelta { .. } => "thinking_delta",
         AssistantMessageFrame::ThinkingEnd { .. } => "thinking_end",
         AssistantMessageFrame::ToolCallStart { .. } => "toolcall_start",
+        AssistantMessageFrame::ToolCallCheckpoint { .. } => "toolcall_checkpoint",
         AssistantMessageFrame::ToolCallDelta { .. } => "toolcall_delta",
         AssistantMessageFrame::ToolCallEnd { .. } => "toolcall_end",
+    }
+}
+
+fn event_kind(event: &AssistantMessageEvent) -> &'static str {
+    match event {
+        AssistantMessageEvent::Start { .. } => "start",
+        AssistantMessageEvent::TextStart { .. } => "text_start",
+        AssistantMessageEvent::TextDelta { .. } => "text_delta",
+        AssistantMessageEvent::TextEnd { .. } => "text_end",
+        AssistantMessageEvent::ThinkingStart { .. } => "thinking_start",
+        AssistantMessageEvent::ThinkingDelta { .. } => "thinking_delta",
+        AssistantMessageEvent::ThinkingEnd { .. } => "thinking_end",
+        AssistantMessageEvent::ToolCallStart { .. } => "toolcall_start",
+        AssistantMessageEvent::ToolCallDelta { .. } => "toolcall_delta",
+        AssistantMessageEvent::ToolCallEnd { .. } => "toolcall_end",
+        AssistantMessageEvent::Done { .. } => "done",
+        AssistantMessageEvent::Error { .. } => "error",
     }
 }

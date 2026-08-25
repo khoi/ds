@@ -1,6 +1,6 @@
 use ds_ai::{
     Api, AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream,
-    AssistantMessageStreamError, ProviderId, StopReason,
+    AssistantMessageStreamError, DoneReason, ErrorReason, ProviderId, StopReason,
 };
 use futures_util::{StreamExt, stream};
 
@@ -29,7 +29,7 @@ async fn settles_done_and_stops_after_the_terminal_event() {
     let events = [
         AssistantMessageEvent::Start { partial: pending },
         AssistantMessageEvent::Done {
-            reason: StopReason::Stop,
+            reason: DoneReason::Stop,
             message: done.clone(),
         },
         AssistantMessageEvent::Start {
@@ -56,7 +56,7 @@ async fn settles_error_as_the_stream_result() {
     failed.error_message = Some("failed".into());
     let mut events =
         AssistantMessageEventStream::new(stream::iter([AssistantMessageEvent::Error {
-            reason: StopReason::Error,
+            reason: ErrorReason::Error,
             error: failed.clone(),
         }]));
 
@@ -74,5 +74,36 @@ async fn rejects_a_stream_without_a_terminal_event() {
     assert_eq!(
         events.result().await,
         Err(AssistantMessageStreamError::MissingTerminalEvent)
+    );
+}
+
+#[test]
+fn terminal_event_reasons_accept_only_their_valid_stop_reasons() {
+    assert_eq!(
+        [
+            StopReason::Stop,
+            StopReason::Length,
+            StopReason::ToolUse,
+            StopReason::Deferred,
+        ]
+        .map(DoneReason::try_from),
+        [
+            Ok(DoneReason::Stop),
+            Ok(DoneReason::Length),
+            Ok(DoneReason::ToolUse),
+            Ok(DoneReason::Deferred),
+        ]
+    );
+    assert_eq!(
+        [StopReason::Error, StopReason::Aborted].map(ErrorReason::try_from),
+        [Ok(ErrorReason::Error), Ok(ErrorReason::Aborted)]
+    );
+    assert_eq!(
+        DoneReason::try_from(StopReason::Error),
+        Err(StopReason::Error)
+    );
+    assert_eq!(
+        ErrorReason::try_from(StopReason::Stop),
+        Err(StopReason::Stop)
     );
 }

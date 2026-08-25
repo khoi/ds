@@ -64,7 +64,7 @@ fn normalize(schema: &mut Value) -> Result<(), String> {
         .get("additionalProperties")
         .is_some_and(|value| value != &Value::Bool(false))
     {
-        return Err("additionalProperties must be false".into());
+        return Err("schema-valued or true additionalProperties is unsupported".into());
     }
     let required = required_names(object)?;
     let mut names = Vec::new();
