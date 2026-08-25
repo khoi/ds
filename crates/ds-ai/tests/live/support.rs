@@ -219,12 +219,15 @@ struct LiveTarget {
 
 const OPENAI_4O: LiveTarget = LiveTarget::new(LiveProvider::OpenAi, "gpt-4o");
 const OPENAI_54: LiveTarget = LiveTarget::new(LiveProvider::OpenAi, "gpt-5.4");
+const OPENAI_54_MINI: LiveTarget = LiveTarget::new(LiveProvider::OpenAi, "gpt-5.4-mini");
 const OPENAI_55: LiveTarget = LiveTarget::new(LiveProvider::OpenAi, "gpt-5.5");
 const OPENAI_MINI: LiveTarget = LiveTarget::new(LiveProvider::OpenAi, "gpt-5-mini");
 const ANTHROPIC_HAIKU: LiveTarget =
     LiveTarget::new(LiveProvider::AnthropicApiKey, "claude-haiku-4-5");
 const ANTHROPIC_SONNET: LiveTarget =
     LiveTarget::new(LiveProvider::AnthropicApiKey, "claude-sonnet-4-5");
+const ANTHROPIC_SONNET_46: LiveTarget =
+    LiveTarget::new(LiveProvider::AnthropicApiKey, "claude-sonnet-4-6");
 const ANTHROPIC_OAUTH_SONNET: LiveTarget =
     LiveTarget::new(LiveProvider::AnthropicOAuth, "claude-sonnet-4-6");
 const ANTHROPIC_OPUS_45: LiveTarget =
@@ -455,6 +458,15 @@ async fn live_tool_call(
     name: &str,
     reasoning: LiveReasoning,
 ) -> (Context, AssistantMessage, AssistantToolCall) {
+    live_tool_call_with_capture(target, name, reasoning, None).await
+}
+
+async fn live_tool_call_with_capture(
+    target: LiveTarget,
+    name: &str,
+    reasoning: LiveReasoning,
+    capture: Option<Arc<Mutex<Option<serde_json::Value>>>>,
+) -> (Context, AssistantMessage, AssistantToolCall) {
     let context = Context::new([Message::user(format!(
         "Call {name} with value set to live-probe"
     ))])
@@ -466,6 +478,7 @@ async fn live_tool_call(
         LiveCall {
             reasoning,
             force_tool: Some(name.into()),
+            capture,
             ..Default::default()
         },
     )
