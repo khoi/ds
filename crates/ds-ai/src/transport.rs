@@ -39,6 +39,7 @@ pub(crate) struct EventStream {
     overall_deadline: Option<Instant>,
     event_deadline: Option<Instant>,
     saw_event: bool,
+    flush_at_eof: bool,
 }
 
 impl EventStream {
@@ -57,16 +58,26 @@ impl EventStream {
             overall_deadline,
             event_deadline: first_event_timeout.map(|timeout| Instant::now() + timeout),
             saw_event: false,
+            flush_at_eof: false,
         }
     }
 
+    pub(crate) fn with_eof_flush(mut self) -> Self {
+        self.flush_at_eof = true;
+        self
+    }
+
     pub(crate) async fn next(&mut self) -> Result<Option<String>, ReadError> {
+        Ok(self.next_event().await?.map(|event| event.data))
+    }
+
+    pub(crate) async fn next_event(&mut self) -> Result<Option<sse::Event>, ReadError> {
         loop {
-            match self.decoder.next_data() {
-                Ok(Some(data)) => {
+            match self.decoder.next_event() {
+                Ok(Some(event)) => {
                     self.saw_event = true;
                     self.event_deadline = self.idle_timeout.map(|timeout| Instant::now() + timeout);
-                    return Ok(Some(data));
+                    return Ok(Some(event));
                 }
                 Ok(None) => {}
                 Err(error) => return Err(ReadError::Stream(error)),
@@ -88,7 +99,11 @@ impl EventStream {
                 chunk = self.chunks.next() => chunk,
             };
             let Some(chunk) = chunk else {
-                return Ok(None);
+                return if self.flush_at_eof {
+                    self.decoder.finish_event().map_err(ReadError::Stream)
+                } else {
+                    Ok(None)
+                };
             };
             self.decoder
                 .push(&chunk.map_err(|error| ReadError::Stream(error.to_string()))?);

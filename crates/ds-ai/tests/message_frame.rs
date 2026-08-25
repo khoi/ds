@@ -1,9 +1,9 @@
 use crate::support::{Reply, serve};
 use ds_ai::{
-    Api, AssistantContent, AssistantMessage, AssistantMessageEvent, AssistantMessageFrame,
-    AssistantToolCall, Context, Message, OpenAiResponsesOptions, ProviderId, StopReason,
-    StreamOptions, TextContent, ThinkingContent, assistant_message_event_to_frame, builtin_model,
-    reduce_assistant_message_frames,
+    Api, AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantMessageEvent,
+    AssistantMessageFrame, AssistantToolCall, Context, Message, OpenAiResponsesOptions, ProviderId,
+    StopReason, StreamOptions, TextContent, ThinkingContent, assistant_message_event_to_frame,
+    builtin_model, reduce_assistant_message_frames,
 };
 use futures_util::StreamExt;
 
@@ -189,6 +189,39 @@ fn parses_unfinished_tool_json_and_uses_final_arguments() {
     );
 }
 
+#[test]
+fn stores_authoritative_tool_call_end_fields_in_the_frame() {
+    let mut partial = seed();
+    partial.content.push(AssistantContent::ToolCall(tool(
+        "stale-id",
+        "stale-name",
+        serde_json::json!({"stale": true}),
+    )));
+    let event = AssistantMessageEvent::ToolCallEnd {
+        content_index: 0,
+        tool_call: AssistantToolCall {
+            id: "final-id".into(),
+            name: "final-name".into(),
+            arguments: serde_json::json!({"value": 1}),
+            thought_signature: Some("thought".into()),
+            namespace: Some("files".into()),
+        },
+        partial,
+    };
+
+    assert_eq!(
+        frame(event),
+        AssistantMessageFrame::ToolCallEnd {
+            content_index: 0,
+            id: "final-id".into(),
+            name: "final-name".into(),
+            arguments: serde_json::json!({"value": 1}),
+            thought_signature: Some("thought".into()),
+            namespace: Some("files".into()),
+        }
+    );
+}
+
 #[tokio::test]
 async fn round_trips_provider_content_from_authoritative_end_events() {
     let server = serve([Reply::sse(
@@ -367,9 +400,23 @@ fn supports_interleaved_content_indexes() {
 #[test]
 fn snapshots_events_and_reduces_without_mutating_frames() {
     let mut partial = seed();
+    partial.diagnostics = Some(vec![AssistantMessageDiagnostic {
+        r#type: "test".into(),
+        timestamp: 2,
+        error: None,
+        details: Some(std::collections::BTreeMap::from([(
+            "value".into(),
+            serde_json::json!("original"),
+        )])),
+    }]);
     let start = frame(AssistantMessageEvent::Start {
         partial: partial.clone(),
     });
+    partial.diagnostics.as_mut().unwrap()[0]
+        .details
+        .as_mut()
+        .unwrap()
+        .insert("value".into(), serde_json::json!("mutated"));
     partial.usage.cost.total = 99.0;
     partial.content.push(AssistantContent::ToolCall(tool(
         "call",
@@ -383,6 +430,13 @@ fn snapshots_events_and_reduces_without_mutating_frames() {
     let mut reduced = reduce_assistant_message_frames([start, tool_start.clone()])
         .unwrap()
         .unwrap();
+    assert_eq!(
+        reduced.diagnostics.as_ref().unwrap()[0]
+            .details
+            .as_ref()
+            .unwrap()["value"],
+        serde_json::json!("original")
+    );
     assert_eq!(reduced.usage.cost.total, 0.0);
     reduced.content[0] = text("changed");
 
@@ -519,7 +573,7 @@ fn rejects_event_indexes_with_the_wrong_block_kind() {
 }
 
 #[test]
-fn serializes_frames_with_pi_field_names_and_public_content() {
+fn serializes_frames_with_wire_field_names_and_public_content() {
     let start = AssistantMessageFrame::Start {
         partial: Box::new(seed()),
     };
@@ -545,4 +599,23 @@ fn serializes_frames_with_pi_field_names_and_public_content() {
         serde_json::from_value::<AssistantMessageFrame>(value).unwrap(),
         text_start
     );
+}
+
+#[test]
+fn serializes_diagnostics_with_wire_field_names() {
+    let mut message = seed();
+    message.diagnostics = Some(vec![AssistantMessageDiagnostic {
+        r#type: "transport".into(),
+        timestamp: 2,
+        error: None,
+        details: Some(std::collections::BTreeMap::from([(
+            "retry".into(),
+            serde_json::json!(1),
+        )])),
+    }]);
+
+    let value = serde_json::to_value(message).unwrap();
+    assert_eq!(value["diagnostics"][0]["type"], "transport");
+    assert_eq!(value["diagnostics"][0]["timestamp"], 2);
+    assert_eq!(value["diagnostics"][0]["details"]["retry"], 1);
 }

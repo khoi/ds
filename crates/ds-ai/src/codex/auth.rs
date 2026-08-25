@@ -19,6 +19,7 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_BASE_URL: &str = "https://auth.openai.com";
 const SCOPE: &str = "openid profile email offline_access";
 const DEVICE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const MIN_DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Notification {
@@ -169,6 +170,7 @@ impl Client {
             expires_in: self.device_timeout,
         });
         let mut interval = device.interval;
+        let mut slowed_down = false;
         let authorization = loop {
             let response = self
                 .device_request(
@@ -180,18 +182,23 @@ impl Client {
                     cancellation,
                     deadline,
                 )
-                .await?;
+                .await
+                .map_err(|error| device_poll_error(error, slowed_down))?;
             let status = response.status();
-            let body = read_body(response, cancellation, deadline).await?;
+            let body = read_body(response, cancellation, deadline)
+                .await
+                .map_err(|error| device_poll_error(error, slowed_down))?;
             match parse_device_poll(status.as_u16(), &body)? {
                 DevicePoll::Complete(authorization) => break authorization,
                 DevicePoll::Pending => {}
-                DevicePoll::SlowDown(server_interval) => {
-                    interval = server_interval
-                        .unwrap_or_else(|| interval.saturating_add(Duration::from_secs(5)));
+                DevicePoll::SlowDown => {
+                    slowed_down = true;
+                    interval = next_device_interval(interval);
                 }
             }
-            wait_for_device_poll(interval, cancellation, deadline).await?;
+            wait_for_device_poll(interval, cancellation, deadline)
+                .await
+                .map_err(|error| device_poll_error(error, slowed_down))?;
         };
         self.exchange(
             &authorization.code,
@@ -378,7 +385,7 @@ impl crate::OAuthAuth for OAuth {
             }
         }
         .map_err(auth_error)?;
-        Ok(oauth_credential(credentials))
+        oauth_credential(credentials).map_err(auth_error)
     }
 
     async fn refresh(
@@ -389,11 +396,12 @@ impl crate::OAuthAuth for OAuth {
         let crate::Credential::OAuth { refresh, .. } = credential else {
             return Err(crate::AuthError::OAuth("expected OAuth credential".into()));
         };
-        self.client
+        let credentials = self
+            .client
             .refresh(refresh, cancellation)
             .await
-            .map(oauth_credential)
-            .map_err(auth_error)
+            .map_err(auth_error)?;
+        oauth_credential(credentials).map_err(auth_error)
     }
 
     async fn to_auth(
@@ -446,17 +454,21 @@ impl Interaction for InteractionAdapter<'_> {
                 cancellation,
             })
             .await
-            .map_err(|error| Error::InvalidResponse(error.to_string()))
+            .map_err(|error| match error {
+                crate::AuthError::Cancelled => Error::Cancelled,
+                error => Error::InvalidResponse(error.to_string()),
+            })
     }
 }
 
-fn oauth_credential(credentials: Credentials) -> crate::Credential {
-    crate::Credential::OAuth {
+fn oauth_credential(credentials: Credentials) -> Result<crate::Credential, Error> {
+    let account_id = credentials.account_id()?;
+    Ok(crate::Credential::OAuth {
         refresh: credentials.refresh_token,
         access: credentials.access_token,
         expires: credentials.expires_at,
-        extra: BTreeMap::new(),
-    }
+        extra: BTreeMap::from([(String::from("accountId"), serde_json::json!(account_id))]),
+    })
 }
 
 fn auth_error(error: Error) -> crate::AuthError {
@@ -488,6 +500,10 @@ pub(crate) enum Error {
     Callback(String),
     #[error("OAuth device login timed out")]
     Timeout,
+    #[error(
+        "Device flow timed out after one or more slow_down responses. This is often caused by clock drift in WSL or VM environments. Please sync or restart the VM clock and try again."
+    )]
+    SlowDownTimeout,
 }
 
 struct Authorization {
@@ -516,7 +532,7 @@ struct DeviceAuthorization {
 enum DevicePoll {
     Complete(DeviceAuthorization),
     Pending,
-    SlowDown(Option<Duration>),
+    SlowDown,
 }
 
 async fn read_credentials(
@@ -541,9 +557,11 @@ async fn read_credentials(
         serde_json::from_str(&body).map_err(|error| Error::InvalidResponse(error.to_string()))?;
     let access_token = response
         .access_token
+        .filter(|token| !token.is_empty())
         .ok_or_else(|| Error::InvalidResponse("missing access_token".into()))?;
     let refresh_token = response
         .refresh_token
+        .filter(|token| !token.is_empty())
         .ok_or_else(|| Error::InvalidResponse("missing refresh_token".into()))?;
     let expires_in = response
         .expires_in
@@ -595,6 +613,7 @@ fn parse_device(body: &str) -> Result<Device, Error> {
     let interval = response
         .get("interval")
         .and_then(parse_seconds)
+        .map(clamp_device_interval)
         .ok_or_else(|| Error::InvalidResponse("invalid device interval".into()))?;
     Ok(Device {
         id: id.into(),
@@ -633,9 +652,7 @@ fn parse_device_poll(status: u16, body: &str) -> Result<DevicePoll, Error> {
         Some("authorization_pending" | "deviceauth_authorization_pending") => {
             Ok(DevicePoll::Pending)
         }
-        Some("slow_down") => Ok(DevicePoll::SlowDown(
-            response.get("interval").and_then(parse_seconds),
-        )),
+        Some("slow_down") => Ok(DevicePoll::SlowDown),
         _ => Err(Error::Server {
             operation: "device poll",
             status,
@@ -651,7 +668,26 @@ fn parse_seconds(value: &serde_json::Value) -> Option<Duration> {
     if !seconds.is_finite() || seconds < 0.0 {
         return None;
     }
-    Some(Duration::from_secs_f64(seconds))
+    let milliseconds = (seconds * 1_000.0).floor();
+    Some(Duration::from_millis(
+        milliseconds.min(u64::MAX as f64) as u64
+    ))
+}
+
+fn next_device_interval(interval: Duration) -> Duration {
+    clamp_device_interval(interval).saturating_add(Duration::from_secs(5))
+}
+
+fn clamp_device_interval(interval: Duration) -> Duration {
+    interval.max(MIN_DEVICE_POLL_INTERVAL)
+}
+
+fn device_poll_error(error: Error, slowed_down: bool) -> Error {
+    if slowed_down && matches!(error, Error::Timeout) {
+        Error::SlowDownTimeout
+    } else {
+        error
+    }
 }
 
 async fn wait_for_device_poll(
@@ -814,4 +850,54 @@ async fn write_callback(socket: &mut TcpStream, status: u16, message: &str) {
         body.len()
     );
     let _ = socket.write_all(response.as_bytes()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DevicePoll, next_device_interval, parse_device, parse_device_poll};
+    use std::time::Duration;
+
+    #[test]
+    fn applies_the_five_second_slow_down_fallback() {
+        assert!(matches!(
+            parse_device_poll(429, r#"{"error":"slow_down","interval":30}"#),
+            Ok(DevicePoll::SlowDown)
+        ));
+        assert_eq!(
+            next_device_interval(Duration::from_secs(2)),
+            Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn treats_a_zero_slow_down_interval_as_a_five_second_backoff() {
+        assert_eq!(next_device_interval(Duration::ZERO), Duration::from_secs(6));
+    }
+
+    #[test]
+    fn classifies_pending_device_responses() {
+        for (status, body) in [
+            (403, "{}"),
+            (404, "{}"),
+            (400, r#"{"error":"authorization_pending"}"#),
+            (
+                400,
+                r#"{"error":{"code":"deviceauth_authorization_pending"}}"#,
+            ),
+        ] {
+            assert!(matches!(
+                parse_device_poll(status, body),
+                Ok(DevicePoll::Pending)
+            ));
+        }
+    }
+
+    #[test]
+    fn floors_device_intervals_to_milliseconds() {
+        let device =
+            parse_device(r#"{"device_auth_id":"device","user_code":"code","interval":1.2349}"#)
+                .unwrap();
+
+        assert_eq!(device.interval, Duration::from_millis(1_234));
+    }
 }

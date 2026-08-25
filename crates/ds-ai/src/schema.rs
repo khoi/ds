@@ -67,25 +67,28 @@ fn normalize(schema: &mut Value) -> Result<(), String> {
         return Err("additionalProperties must be false".into());
     }
     let required = required_names(object)?;
-    let properties = object
-        .entry("properties")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| "object properties must be a schema map".to_string())?;
-    if required.iter().any(|name| !properties.contains_key(name)) {
+    let mut names = Vec::new();
+    if let Some(properties) = object.get("properties") {
+        let properties = properties
+            .as_object()
+            .ok_or_else(|| "object properties must be a schema map".to_string())?;
+        if required.iter().any(|name| !properties.contains_key(name)) {
+            return Err("required contains an unknown property".into());
+        }
+        names.extend(properties.keys().cloned());
+    } else if !required.is_empty() {
         return Err("required contains an unknown property".into());
     }
-    let mut names = required.clone();
-    names.extend(
-        properties
-            .keys()
-            .filter(|name| !required.contains(name))
-            .cloned(),
-    );
-    for (name, property) in properties.iter_mut() {
-        normalize(property)?;
-        if !required.contains(name) && !allows_null(property) {
-            *property = serde_json::json!({"anyOf": [property.take(), {"type": "null"}]});
+
+    if let Some(properties) = object.get_mut("properties") {
+        let properties = properties
+            .as_object_mut()
+            .ok_or_else(|| "object properties must be a schema map".to_string())?;
+        for (name, property) in properties.iter_mut() {
+            normalize(property)?;
+            if !required.contains(name) && !allows_null(property) {
+                *property = serde_json::json!({"anyOf": [property.take(), {"type": "null"}]});
+            }
         }
     }
     object.insert(

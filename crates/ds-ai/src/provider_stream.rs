@@ -289,7 +289,7 @@ pub(crate) fn adapt(
                     return;
                 }
                 Err(error) => {
-                    let response = partial_response(&error);
+                    let response = error.partial().cloned();
                     yield error_event(&model, error, response);
                     return;
                 }
@@ -426,12 +426,46 @@ fn final_message(model: &Model, response: Response) -> AssistantMessage {
 }
 
 fn error_event(model: &Model, error: Error, response: Option<Response>) -> AssistantMessageEvent {
-    let reason = if matches!(error, Error::Cancelled { .. }) {
+    let reason = if matches!(
+        error,
+        Error::Cancelled { .. } | Error::Hook { aborted: true, .. }
+    ) {
         StopReason::Aborted
     } else {
         StopReason::Error
     };
-    let error_message = error.to_string();
+    let error_message = match (&error, &model.api) {
+        (Error::Cancelled { partial: None }, crate::Api::OpenAiResponses) => {
+            "Request aborted".into()
+        }
+        (Error::Cancelled { partial: Some(_) }, crate::Api::OpenAiResponses) => {
+            "OpenAI Responses stream ended before a terminal response event".into()
+        }
+        (
+            Error::Cancelled { .. },
+            crate::Api::AnthropicMessages | crate::Api::OpenAiCodexResponses,
+        ) => "Request was aborted".into(),
+        (
+            Error::IncompleteStream { .. },
+            crate::Api::OpenAiResponses | crate::Api::OpenAiCodexResponses,
+        ) => "OpenAI Responses stream ended before a terminal response event".into(),
+        (
+            Error::Response { message, .. },
+            crate::Api::AnthropicMessages
+            | crate::Api::OpenAiResponses
+            | crate::Api::OpenAiCodexResponses,
+        ) => message.clone(),
+        (Error::Provider { status, message }, crate::Api::OpenAiResponses) => {
+            format!("OpenAI API error ({status}): {message}")
+        }
+        (Error::EmptyProviderResponse { status }, crate::Api::OpenAiResponses) => {
+            format!("OpenAI API error ({status}): {status} status code (no body)")
+        }
+        (Error::Stream { message, .. }, crate::Api::AnthropicMessages) => message.clone(),
+        (Error::Provider { message, .. }, crate::Api::AnthropicMessages) => message.clone(),
+        (Error::Provider { message, .. }, crate::Api::OpenAiCodexResponses) => message.clone(),
+        _ => error.to_string(),
+    };
     let mut message = response.map_or_else(
         || empty_message(model),
         |response| final_message(model, response),
@@ -441,16 +475,6 @@ fn error_event(model: &Model, error: Error, response: Option<Response>) -> Assis
     AssistantMessageEvent::Error {
         reason,
         error: message,
-    }
-}
-
-fn partial_response(error: &Error) -> Option<Response> {
-    match error {
-        Error::Stream { partial, .. }
-        | Error::IncompleteStream { partial }
-        | Error::Response { partial, .. } => Some(partial.clone()),
-        Error::Cancelled { partial } | Error::Timeout { partial, .. } => partial.clone(),
-        _ => None,
     }
 }
 

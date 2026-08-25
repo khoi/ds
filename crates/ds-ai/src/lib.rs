@@ -58,7 +58,7 @@ pub use model::{
 };
 pub use overflow::{is_context_overflow, is_recoverable_length};
 pub use provider::{
-    AnthropicOptions, ApiStreamOptions, Models, OpenAiCodexResponsesOptions,
+    AnthropicOptions, ApiStreamOptions, HeaderHook, Models, OpenAiCodexResponsesOptions,
     OpenAiResponsesOptions, PayloadHook, Provider, ProviderResponse, ResponseHook,
     SimpleStreamOptions, StreamOptions, ThinkingBudgets, ToolChoice, Transport,
 };
@@ -69,6 +69,6 @@ pub use types::{
     InputContent, Message, StopReason, Tool, ToolResultMessage, Usage, UsageCost, UserContent,
     UserMessage,
 };
-pub(crate) use types::{Error, Response, TimeoutPhase};
+pub(crate) use types::{Error, Response, RetryDelay, TimeoutPhase};
 pub use uuid::{UuidV7Error, uuid_v7, uuid_v7_at};
 pub use validation::{ToolValidationError, validate_tool_arguments, validate_tool_call};

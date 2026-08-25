@@ -29,6 +29,20 @@ fn accepts_uuid_v7_timestamp_boundaries_and_rejects_overflow() {
     ));
 }
 
+#[test]
+fn keeps_ordinary_ids_ordered_and_explicit_followers_at_their_timestamp() {
+    let first = ds_ai::uuid_v7().unwrap();
+    let second = ds_ai::uuid_v7().unwrap();
+    assert!(first < second);
+
+    let follower_timestamp = 0x0123_4567_89ab;
+    let follower = ds_ai::uuid_v7_at(follower_timestamp).unwrap();
+    let next_follower = ds_ai::uuid_v7_at(follower_timestamp).unwrap();
+    assert_eq!(uuid_timestamp(&follower), follower_timestamp);
+    assert_eq!(uuid_timestamp(&next_follower), follower_timestamp);
+    assert!(follower < next_follower);
+}
+
 fn uuid_timestamp(value: &str) -> u64 {
     u64::from_str_radix(&format!("{}{}", &value[..8], &value[9..13]), 16).unwrap()
 }

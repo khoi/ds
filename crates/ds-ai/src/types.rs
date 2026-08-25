@@ -1,8 +1,13 @@
-use crate::{AssistantContent, AssistantMessage, ImageContent, Model, ModelInput, TextContent};
+use crate::{
+    AssistantContent, AssistantMessage, ImageContent, Model, ModelInput, ProviderId, TextContent,
+};
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::SerializeStruct,
 };
-use std::time::Duration;
+use std::{
+    fmt::{self, Display, Formatter},
+    time::Duration,
+};
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -510,20 +515,36 @@ impl Response {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RetryDelay(pub Duration);
+
+impl Display for RetryDelay {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let seconds = self.0.as_secs() + u64::from(self.0.subsec_nanos() > 0);
+        write!(formatter, "{seconds}s")
+    }
+}
+
 #[derive(Clone, Debug, Error, PartialEq)]
 pub(crate) enum Error {
     #[error("HTTP request failed: {0}")]
     Http(String),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
-    #[error("request hook failed: {0}")]
-    Hook(String),
-    #[error("request compression failed: {0}")]
-    Compression(String),
+    #[error("No API key for provider: {0}")]
+    MissingApiKey(ProviderId),
+    #[error("{message}")]
+    Hook { message: String, aborted: bool },
+    #[error("{0}")]
+    HeaderTransform(String),
     #[error("provider returned HTTP {status}: {message}")]
     Provider { status: u16, message: String },
+    #[error("provider returned HTTP {status}")]
+    EmptyProviderResponse { status: u16 },
     #[error("invalid provider stream: {message}")]
     Stream { message: String, partial: Response },
+    #[error("invalid provider protocol: {message}")]
+    Protocol { message: String, partial: Response },
     #[error("provider stream ended before a terminal event")]
     IncompleteStream { partial: Response },
     #[error("provider response failed: {message}")]
@@ -539,11 +560,41 @@ pub(crate) enum Error {
         phase: TimeoutPhase,
         partial: Option<Response>,
     },
-    #[error("provider retry delay {requested:?} exceeds {maximum:?}")]
+    #[error("Server requested {requested} retry delay (max: {maximum})")]
     RetryDelayExceeded {
-        requested: Duration,
-        maximum: Duration,
+        requested: RetryDelay,
+        maximum: RetryDelay,
     },
+    #[error("Server requested {requested} retry delay (max: {maximum}). {provider_error}")]
+    RetryDelayExceededWithProvider {
+        requested: RetryDelay,
+        maximum: RetryDelay,
+        provider_error: String,
+    },
+}
+
+impl Error {
+    pub(crate) fn partial(&self) -> Option<&Response> {
+        match self {
+            Self::Stream { partial, .. }
+            | Self::Protocol { partial, .. }
+            | Self::IncompleteStream { partial }
+            | Self::Response { partial, .. } => Some(partial),
+            Self::Cancelled { partial } | Self::Timeout { partial, .. } => partial.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn partial_mut(&mut self) -> Option<&mut Response> {
+        match self {
+            Self::Stream { partial, .. }
+            | Self::Protocol { partial, .. }
+            | Self::IncompleteStream { partial }
+            | Self::Response { partial, .. } => Some(partial),
+            Self::Cancelled { partial } | Self::Timeout { partial, .. } => partial.as_mut(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

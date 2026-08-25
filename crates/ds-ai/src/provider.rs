@@ -1,17 +1,23 @@
+use crate::auth::resolution::{
+    api_login_error, check_provider_auth, oauth_login_error, race_cancellation, resolve_auth,
+    store_error,
+};
 use crate::{
     AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream,
     AssistantMessageStreamError, CacheRetention, Context, Model, ProviderId, StopReason,
     ThinkingLevel,
 };
 use async_stream::stream;
-use async_trait::async_trait;
 use futures_util::{StreamExt, stream as futures_stream};
 use std::{
     collections::BTreeMap,
     fmt,
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio_util::sync::CancellationToken;
@@ -19,6 +25,8 @@ use tokio_util::sync::CancellationToken;
 type PayloadFuture =
     Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, String>> + Send + 'static>>;
 type ResponseFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
+type HeaderMap = BTreeMap<String, Option<String>>;
+type HeaderFuture = Pin<Box<dyn Future<Output = Result<HeaderMap, String>> + Send + 'static>>;
 
 #[derive(Clone)]
 pub struct PayloadHook {
@@ -48,6 +56,33 @@ impl PayloadHook {
 impl fmt::Debug for PayloadHook {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PayloadHook")
+    }
+}
+
+#[derive(Clone)]
+pub struct HeaderHook {
+    hook: Arc<dyn Fn(HeaderMap) -> HeaderFuture + Send + Sync>,
+}
+
+impl HeaderHook {
+    pub fn new<F, Fut>(hook: F) -> Self
+    where
+        F: Fn(BTreeMap<String, Option<String>>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<BTreeMap<String, Option<String>>, String>> + Send + 'static,
+    {
+        Self {
+            hook: Arc::new(move |headers| Box::pin(hook(headers))),
+        }
+    }
+
+    async fn run(&self, headers: HeaderMap) -> Result<HeaderMap, String> {
+        (self.hook)(headers).await
+    }
+}
+
+impl fmt::Debug for HeaderHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HeaderHook")
     }
 }
 
@@ -89,6 +124,7 @@ pub(crate) struct RequestHooks {
     model: Model,
     payload: Option<PayloadHook>,
     response: Option<ResponseHook>,
+    cancellation: CancellationToken,
 }
 
 impl RequestHooks {
@@ -99,11 +135,10 @@ impl RequestHooks {
         let Some(hook) = &self.payload else {
             return Ok(payload);
         };
-        Ok(hook
-            .run(payload.clone(), self.model.clone())
-            .await
-            .map_err(crate::Error::Hook)?
-            .unwrap_or(payload))
+        match hook.run(payload.clone(), self.model.clone()).await {
+            Ok(payload_override) => Ok(payload_override.unwrap_or(payload)),
+            Err(message) => Err(self.error(message)),
+        }
     }
 
     pub(crate) async fn response(&self, response: ProviderResponse) -> Result<(), crate::Error> {
@@ -112,7 +147,14 @@ impl RequestHooks {
         };
         hook.run(response, self.model.clone())
             .await
-            .map_err(crate::Error::Hook)
+            .map_err(|message| self.error(message))
+    }
+
+    fn error(&self, message: String) -> crate::Error {
+        crate::Error::Hook {
+            message,
+            aborted: self.cancellation.is_cancelled(),
+        }
     }
 }
 
@@ -131,6 +173,7 @@ pub struct StreamOptions {
     pub http_client: Option<reqwest::Client>,
     pub env: BTreeMap<String, String>,
     pub headers: BTreeMap<String, Option<String>>,
+    pub transform_headers: Option<HeaderHook>,
     pub on_payload: Option<PayloadHook>,
     pub on_response: Option<ResponseHook>,
     pub timeout: Option<Duration>,
@@ -154,6 +197,7 @@ impl Default for StreamOptions {
             http_client: None,
             env: BTreeMap::new(),
             headers: BTreeMap::new(),
+            transform_headers: None,
             on_payload: None,
             on_response: None,
             timeout: None,
@@ -172,11 +216,44 @@ impl Default for StreamOptions {
 }
 
 impl StreamOptions {
+    pub fn with_transform_headers<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(BTreeMap<String, Option<String>>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<BTreeMap<String, Option<String>>, String>> + Send + 'static,
+    {
+        self.transform_headers = Some(HeaderHook::new(hook));
+        self
+    }
+
     pub(crate) fn request_hooks(&self, model: &Model) -> RequestHooks {
         RequestHooks {
             model: model.clone(),
             payload: self.on_payload.clone(),
             response: self.on_response.clone(),
+            cancellation: self.cancellation.clone(),
+        }
+    }
+
+    pub(crate) async fn request_headers(
+        &mut self,
+        model: &Model,
+    ) -> Result<HeaderMap, crate::Error> {
+        let model_headers = model
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), Some(value.clone())))
+            .collect();
+        let option_headers = std::mem::take(&mut self.headers);
+        let headers = merge_headers(&[&model_headers, &option_headers]);
+        self.run_header_transform(headers)
+            .await
+            .map_err(crate::Error::HeaderTransform)
+    }
+
+    async fn run_header_transform(&mut self, headers: HeaderMap) -> Result<HeaderMap, String> {
+        match self.transform_headers.take() {
+            Some(hook) => hook.run(headers).await,
+            None => Ok(headers),
         }
     }
 }
@@ -399,10 +476,11 @@ impl Models {
         let credentials = self.credentials.clone();
         let auth_context = self.auth_context.clone();
         lazy_stream(model.clone(), async move {
-            let resolution = resolve_auth(
+            let resolution = resolve_model_auth(
                 provider.clone(),
                 credentials,
                 auth_context,
+                &model,
                 crate::AuthResolutionOverrides {
                     api_key: options.stream().api_key.clone(),
                     env: options.stream().env.clone(),
@@ -417,8 +495,7 @@ impl Models {
                     model.provider
                 ))
             })?;
-            let (request_model, request_options) =
-                apply_auth(&provider, &model, options, resolution);
+            let (request_model, request_options) = apply_auth(&model, options, resolution).await?;
             Ok(provider.stream(&request_model, &context, &request_options))
         })
     }
@@ -447,10 +524,11 @@ impl Models {
         let credentials = self.credentials.clone();
         let auth_context = self.auth_context.clone();
         lazy_stream(model.clone(), async move {
-            let resolution = resolve_auth(
+            let resolution = resolve_model_auth(
                 provider.clone(),
                 credentials,
                 auth_context,
+                &model,
                 crate::AuthResolutionOverrides {
                     api_key: options.stream.api_key.clone(),
                     env: options.stream.env.clone(),
@@ -466,8 +544,8 @@ impl Models {
                 ))
             })?;
             let mut stream_options = options.stream;
-            let request_model =
-                apply_stream_auth(&provider, &model, &mut stream_options, resolution);
+            let request_model = apply_stream_auth(&model, &mut stream_options, resolution);
+            apply_header_transform(&mut stream_options).await?;
             Ok(provider.stream_simple(
                 &request_model,
                 &context,
@@ -507,6 +585,24 @@ impl Models {
         .await
     }
 
+    pub async fn auth_for_model(
+        &self,
+        model: &Model,
+        overrides: crate::AuthResolutionOverrides,
+    ) -> Result<Option<crate::AuthResult>, crate::AuthError> {
+        let Some(provider) = self.provider(model.provider.as_str()) else {
+            return Ok(None);
+        };
+        resolve_model_auth(
+            provider,
+            self.credentials.clone(),
+            self.auth_context.clone(),
+            model,
+            overrides,
+        )
+        .await
+    }
+
     pub async fn check_auth(
         &self,
         provider_id: &str,
@@ -515,12 +611,20 @@ impl Models {
         let Some(provider) = self.provider(provider_id) else {
             return Ok(None);
         };
-        let credential = self.credentials.read(provider_id, cancellation).await?;
-        check_provider_auth(
-            &provider,
-            credential.as_ref(),
-            self.auth_context.as_ref(),
+        let credential = race_cancellation(
             cancellation,
+            self.credentials.read(provider_id, cancellation),
+        )
+        .await
+        .map_err(|error| store_error("credential store read failed", provider_id, error))?;
+        race_cancellation(
+            cancellation,
+            check_provider_auth(
+                &provider,
+                credential.as_ref(),
+                self.auth_context.as_ref(),
+                cancellation,
+            ),
         )
         .await
     }
@@ -553,37 +657,72 @@ impl Models {
         credential_type: crate::CredentialType,
         interaction: &dyn crate::AuthInteraction,
     ) -> Result<crate::Credential, crate::AuthError> {
-        let provider = self.provider(provider_id).ok_or_else(|| {
-            crate::AuthError::Authentication(format!("Unknown provider {provider_id}"))
-        })?;
+        let provider = self
+            .provider(provider_id)
+            .ok_or_else(|| crate::AuthError::Provider(format!("Unknown provider {provider_id}")))?;
+        let cancellation = interaction.cancellation();
         let credential = match credential_type {
             crate::CredentialType::ApiKey => {
-                provider
-                    .auth()
-                    .api_key
-                    .as_ref()
-                    .ok_or_else(|| crate::AuthError::Unsupported("API key login".into()))?
-                    .login(interaction)
-                    .await?
+                let auth = provider.auth().api_key.as_ref().ok_or_else(|| {
+                    crate::AuthError::Unsupported(format!(
+                        "Provider {provider_id} does not support API key login"
+                    ))
+                })?;
+                race_cancellation(cancellation, auth.login(interaction))
+                    .await
+                    .map_err(|error| api_login_error(provider_id, error))?
             }
             crate::CredentialType::OAuth => {
-                provider
-                    .auth()
-                    .oauth
-                    .as_ref()
-                    .ok_or_else(|| crate::AuthError::Unsupported("OAuth login".into()))?
-                    .login(interaction)
-                    .await?
+                let auth = provider.auth().oauth.as_ref().ok_or_else(|| {
+                    crate::AuthError::Unsupported(format!(
+                        "Provider {provider_id} does not support OAuth login"
+                    ))
+                })?;
+                race_cancellation(cancellation, auth.login(interaction))
+                    .await
+                    .map_err(|error| oauth_login_error(provider_id, error))?
             }
         };
+        match (&credential_type, &credential) {
+            (crate::CredentialType::ApiKey, crate::Credential::OAuth { .. }) => {
+                return Err(crate::AuthError::Authentication(format!(
+                    "API key login returned an OAuth credential for provider {provider_id}"
+                )));
+            }
+            (crate::CredentialType::OAuth, crate::Credential::ApiKey { .. }) => {
+                return Err(crate::AuthError::OAuth(format!(
+                    "OAuth login returned an API key credential for provider {provider_id}"
+                )));
+            }
+            _ => {}
+        }
+        if cancellation.is_cancelled() {
+            return Err(crate::AuthError::Cancelled);
+        }
         let saved = credential.clone();
-        self.credentials
-            .modify(
-                provider_id,
-                Box::new(move |_| Box::pin(async move { Ok(Some(saved)) })),
-                interaction.cancellation(),
-            )
-            .await?;
+        let mutation_started = Arc::new(AtomicBool::new(false));
+        let mutation_started_for_callback = mutation_started.clone();
+        let mutation = self.credentials.modify(
+            provider_id,
+            Box::new(move |_| {
+                mutation_started_for_callback.store(true, Ordering::Release);
+                Box::pin(async move { Ok(Some(saved)) })
+            }),
+            cancellation,
+        );
+        tokio::pin!(mutation);
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                if !mutation_started.load(Ordering::Acquire) {
+                    return Err(crate::AuthError::Cancelled);
+                }
+                mutation.await
+            }
+            result = &mut mutation => result,
+        };
+        result
+            .map_err(|error| store_error("credential store modify failed", provider_id, error))?;
         Ok(credential)
     }
 
@@ -592,7 +731,12 @@ impl Models {
         provider_id: &str,
         cancellation: &CancellationToken,
     ) -> Result<(), crate::AuthError> {
-        self.credentials.delete(provider_id, cancellation).await
+        race_cancellation(
+            cancellation,
+            self.credentials.delete(provider_id, cancellation),
+        )
+        .await
+        .map_err(|error| store_error("credential store delete failed", provider_id, error))
     }
 }
 
@@ -655,7 +799,7 @@ fn lazy_stream(
         let mut source = match setup.await {
             Ok(source) => source,
             Err(error) => {
-                yield error_event(&model, error.to_string());
+                yield error_event(&model, auth_error_message(&error));
                 return;
             }
         };
@@ -674,19 +818,29 @@ fn lazy_stream(
     AssistantMessageEventStream::new(output)
 }
 
-fn apply_auth(
-    provider: &Arc<dyn Provider>,
+fn auth_error_message(error: &crate::AuthError) -> String {
+    match error {
+        crate::AuthError::Cancelled => error.to_string(),
+        crate::AuthError::Store(message)
+        | crate::AuthError::Provider(message)
+        | crate::AuthError::Authentication(message)
+        | crate::AuthError::OAuth(message)
+        | crate::AuthError::Unsupported(message) => message.clone(),
+    }
+}
+
+async fn apply_auth(
     model: &Model,
     mut options: ApiStreamOptions,
     resolution: crate::AuthResult,
-) -> (Model, ApiStreamOptions) {
+) -> Result<(Model, ApiStreamOptions), crate::AuthError> {
     let stream = options.stream_mut();
-    let model = apply_stream_auth(provider, model, stream, resolution);
-    (model, options)
+    let model = apply_stream_auth(model, stream, resolution);
+    apply_header_transform(stream).await?;
+    Ok((model, options))
 }
 
 fn apply_stream_auth(
-    provider: &Arc<dyn Provider>,
     model: &Model,
     stream: &mut StreamOptions,
     resolution: crate::AuthResult,
@@ -701,33 +855,26 @@ fn apply_stream_auth(
         .into_iter()
         .chain(std::mem::take(&mut stream.env))
         .collect();
-    stream.headers = merge_headers(
-        provider.headers(),
-        &model.headers,
-        &resolution.auth.headers,
-        &stream.headers,
-    );
+    stream.headers = merge_headers(&[&resolution.auth.headers, &stream.headers]);
+    model.headers.clear();
     model
 }
 
-fn merge_headers(
-    provider: &BTreeMap<String, Option<String>>,
-    model: &BTreeMap<String, String>,
-    auth: &BTreeMap<String, Option<String>>,
-    request: &BTreeMap<String, Option<String>>,
-) -> BTreeMap<String, Option<String>> {
+async fn apply_header_transform(stream: &mut StreamOptions) -> Result<(), crate::AuthError> {
+    let headers = std::mem::take(&mut stream.headers);
+    stream.headers = stream
+        .run_header_transform(headers)
+        .await
+        .map_err(crate::AuthError::Provider)?;
+    Ok(())
+}
+
+fn merge_headers(layers: &[&BTreeMap<String, Option<String>>]) -> HeaderMap {
     let mut headers = BTreeMap::new();
-    for (name, value) in provider {
-        insert_header(&mut headers, name, value.clone());
-    }
-    for (name, value) in model {
-        insert_header(&mut headers, name, Some(value.clone()));
-    }
-    for (name, value) in auth {
-        insert_header(&mut headers, name, value.clone());
-    }
-    for (name, value) in request {
-        insert_header(&mut headers, name, value.clone());
+    for layer in layers {
+        for (name, value) in *layer {
+            insert_header(&mut headers, name, value.clone());
+        }
     }
     headers
 }
@@ -747,168 +894,21 @@ fn insert_header(
     headers.insert(name.to_owned(), value);
 }
 
-async fn resolve_auth(
+async fn resolve_model_auth(
     provider: Arc<dyn Provider>,
     credentials: Arc<dyn crate::CredentialStore>,
     auth_context: Arc<dyn crate::AuthContext>,
+    model: &Model,
     overrides: crate::AuthResolutionOverrides,
 ) -> Result<Option<crate::AuthResult>, crate::AuthError> {
-    if overrides.cancellation.is_cancelled() {
-        return Err(crate::AuthError::Cancelled);
-    }
-    let context = OverlayAuthContext {
-        base: auth_context,
-        env: overrides.env.clone(),
-    };
-    if let (Some(api_key), Some(auth)) = (&overrides.api_key, &provider.auth().api_key) {
-        return auth
-            .resolve(
-                &context,
-                Some(&crate::Credential::ApiKey {
-                    key: Some(api_key.clone()),
-                    env: overrides.env,
-                }),
-                &overrides.cancellation,
-            )
-            .await;
-    }
-    let stored = credentials
-        .read(provider.id().as_str(), &overrides.cancellation)
-        .await?;
-    match stored {
-        Some(credential @ crate::Credential::OAuth { .. }) => {
-            let Some(oauth) = &provider.auth().oauth else {
-                return Ok(None);
-            };
-            resolve_oauth(
-                credentials,
-                provider.id().clone(),
-                oauth.clone(),
-                credential,
-                overrides,
-            )
-            .await
-        }
-        Some(mut credential @ crate::Credential::ApiKey { .. }) => {
-            let Some(auth) = &provider.auth().api_key else {
-                return Ok(None);
-            };
-            if let crate::Credential::ApiKey { env, .. } = &mut credential {
-                env.extend(overrides.env);
-            }
-            auth.resolve(&context, Some(&credential), &overrides.cancellation)
-                .await
-        }
-        None => match &provider.auth().api_key {
-            Some(auth) => auth.resolve(&context, None, &overrides.cancellation).await,
-            None => Ok(None),
-        },
-    }
-}
-
-async fn resolve_oauth(
-    credentials: Arc<dyn crate::CredentialStore>,
-    provider_id: ProviderId,
-    oauth: Arc<dyn crate::OAuthAuth>,
-    stored: crate::Credential,
-    overrides: crate::AuthResolutionOverrides,
-) -> Result<Option<crate::AuthResult>, crate::AuthError> {
-    let minimum = overrides
-        .minimum_oauth_validity
-        .unwrap_or(Duration::from_secs(5 * 60))
-        .max(Duration::from_secs(5 * 60));
-    let explicit_minimum = overrides.minimum_oauth_validity.is_some();
-    let mut credential = stored;
-    if expires_soon(&credential, minimum) {
-        let refresh = oauth.clone();
-        let cancellation = overrides.cancellation.clone();
-        credential = credentials
-            .modify(
-                provider_id.as_str(),
-                Box::new(move |current| {
-                    Box::pin(async move {
-                        let Some(current @ crate::Credential::OAuth { .. }) = current else {
-                            return Ok(None);
-                        };
-                        if !expires_soon(&current, minimum) {
-                            return Ok(None);
-                        }
-                        match tokio::time::timeout(
-                            Duration::from_secs(15),
-                            refresh.refresh(&current, &cancellation),
-                        )
-                        .await
-                        {
-                            Ok(result) => result.map(Some),
-                            Err(_) => Err(crate::AuthError::OAuth("refresh timed out".into())),
-                        }
-                    })
-                }),
-                &overrides.cancellation,
-            )
-            .await?
-            .ok_or_else(|| crate::AuthError::OAuth("credential was removed".into()))?;
-        if explicit_minimum && expires_soon(&credential, minimum) {
-            return Err(crate::AuthError::OAuth(
-                "refresh returned a token that expires too soon".into(),
-            ));
-        }
-    }
-    let auth = oauth.to_auth(&credential).await?;
-    Ok(Some(crate::AuthResult {
-        auth,
-        source: Some("OAuth".into()),
-        ..Default::default()
+    let result = resolve_auth(provider, credentials, auth_context, overrides).await?;
+    Ok(result.map(|mut result| {
+        let model_headers = model
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), Some(value.clone())))
+            .collect();
+        result.auth.headers = merge_headers(&[&result.auth.headers, &model_headers]);
+        result
     }))
-}
-
-fn expires_soon(credential: &crate::Credential, minimum: Duration) -> bool {
-    let crate::Credential::OAuth { expires, .. } = credential else {
-        return false;
-    };
-    timestamp().saturating_add(duration_millis(minimum)) >= *expires
-}
-
-fn duration_millis(duration: Duration) -> u64 {
-    duration.as_millis().try_into().unwrap_or(u64::MAX)
-}
-
-async fn check_provider_auth(
-    provider: &Arc<dyn Provider>,
-    credential: Option<&crate::Credential>,
-    auth_context: &dyn crate::AuthContext,
-    cancellation: &CancellationToken,
-) -> Result<Option<crate::AuthCheck>, crate::AuthError> {
-    match credential {
-        Some(crate::Credential::OAuth { .. }) if provider.auth().oauth.is_some() => {
-            Ok(Some(crate::AuthCheck {
-                source: Some("OAuth".into()),
-                credential_type: crate::CredentialType::OAuth,
-            }))
-        }
-        Some(crate::Credential::ApiKey { .. }) | None => match &provider.auth().api_key {
-            Some(auth) => auth.check(auth_context, credential, cancellation).await,
-            None => Ok(None),
-        },
-        _ => Ok(None),
-    }
-}
-
-struct OverlayAuthContext {
-    base: Arc<dyn crate::AuthContext>,
-    env: BTreeMap<String, String>,
-}
-
-#[async_trait]
-impl crate::AuthContext for OverlayAuthContext {
-    async fn env(&self, name: &str) -> Option<String> {
-        match self.env.get(name).filter(|value| !value.is_empty()) {
-            Some(value) => Some(value.clone()),
-            None => self.base.env(name).await,
-        }
-    }
-
-    async fn file_exists(&self, path: &str) -> bool {
-        self.base.file_exists(path).await
-    }
 }

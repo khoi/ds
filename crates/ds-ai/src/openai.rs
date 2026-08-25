@@ -16,6 +16,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 pub struct Provider {
@@ -48,11 +49,17 @@ pub fn stream(
     let context = context.for_model(&requested_model);
     let options = options.clone();
     crate::provider_stream::adapt(requested_model.clone(), async move {
-        let stream_options = options.stream;
+        let mut stream_options = options.stream;
         let request_hooks = stream_options.request_hooks(&requested_model);
+        let caller_headers = stream_options.headers.clone();
         let api_key = stream_options
             .api_key
-            .ok_or_else(|| Error::InvalidRequest("OpenAI API key is required".into()))?;
+            .take()
+            .filter(|api_key| !api_key.is_empty());
+        if api_key.is_none() && !has_auth_header(&caller_headers) {
+            return Err(Error::MissingApiKey(requested_model.provider.clone()));
+        }
+        let headers = stream_options.request_headers(&requested_model).await?;
         let provider_model =
             Model::new(&requested_model.id).with_base_url(requested_model.base_url.clone());
         let mut provider_options =
@@ -61,7 +68,7 @@ pub fn stream(
                 .with_max_retries(stream_options.max_retries.unwrap_or_default())
                 .with_max_retry_delay(stream_options.max_retry_delay)
                 .with_cache_retention(stream_options.cache_retention)
-                .with_request_options(stream_options.headers, request_hooks);
+                .with_request_options(headers, request_hooks);
         let compat = match &requested_model.compat {
             Some(crate::ModelCompatibility::OpenAi(compat)) => compat.clone(),
             _ => Default::default(),
@@ -75,7 +82,8 @@ pub fn stream(
         };
         provider_options = provider_options
             .with_deferred_tools_mode(mode)
-            .with_compatibility(&compat);
+            .with_compatibility(&compat)
+            .with_reasoning_model(requested_model.reasoning);
         if let Some(max_tokens) = stream_options.max_tokens {
             provider_options = provider_options.with_max_output_tokens(max_tokens);
         }
@@ -83,9 +91,8 @@ pub fn stream(
         if let Some(temperature) = stream_options.temperature {
             provider_options = provider_options.with_temperature(temperature);
         }
-        if let Some(timeout) = stream_options.timeout {
-            provider_options = provider_options.with_overall_timeout(timeout);
-        }
+        provider_options =
+            provider_options.with_timeout(stream_options.timeout.unwrap_or(DEFAULT_TIMEOUT));
         if let Some(session_id) = stream_options.session_id {
             provider_options = provider_options.with_session_id(session_id);
         }
@@ -110,6 +117,16 @@ pub fn stream(
             provider_options = provider_options.with_tool_choice(tool_choice);
         }
         response_events(&provider_model, &context, &provider_options).await
+    })
+}
+
+fn has_auth_header(headers: &BTreeMap<String, Option<String>>) -> bool {
+    headers.iter().any(|(name, value)| {
+        (name.eq_ignore_ascii_case("authorization")
+            || name.eq_ignore_ascii_case("cf-aig-authorization"))
+            && value
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
     })
 }
 
@@ -244,7 +261,7 @@ impl Model {
 }
 
 struct Options {
-    api_key: String,
+    api_key: Option<String>,
     http_client: reqwest::Client,
     max_retries: usize,
     max_retry_delay: Option<Duration>,
@@ -255,7 +272,7 @@ struct Options {
     reasoning: Option<Reasoning>,
     tool_choice: Option<ToolChoice>,
     service_tier: Option<ServiceTier>,
-    overall_timeout: Option<Duration>,
+    timeout: Duration,
     session_id: Option<String>,
     cache_retention: CacheRetention,
     session_affinity_format: crate::SessionAffinityFormat,
@@ -265,6 +282,7 @@ struct Options {
     supports_strict_mode: bool,
     supports_grammar_tools: bool,
     supports_explicit_prompt_cache_mode: bool,
+    reasoning_model: bool,
     headers: BTreeMap<String, Option<String>>,
     request_hooks: Option<crate::provider::RequestHooks>,
 }
@@ -372,9 +390,9 @@ struct Reasoning {
 }
 
 impl Options {
-    fn new(api_key: impl Into<String>, http_client: reqwest::Client) -> Self {
+    fn new(api_key: Option<String>, http_client: reqwest::Client) -> Self {
         Self {
-            api_key: api_key.into(),
+            api_key,
             http_client,
             max_retries: 0,
             max_retry_delay: Some(DEFAULT_MAX_RETRY_DELAY),
@@ -385,7 +403,7 @@ impl Options {
             reasoning: None,
             tool_choice: None,
             service_tier: None,
-            overall_timeout: None,
+            timeout: DEFAULT_TIMEOUT,
             session_id: None,
             cache_retention: CacheRetention::Short,
             session_affinity_format: crate::SessionAffinityFormat::OpenAi,
@@ -395,6 +413,7 @@ impl Options {
             supports_strict_mode: true,
             supports_grammar_tools: false,
             supports_explicit_prompt_cache_mode: true,
+            reasoning_model: false,
             headers: BTreeMap::new(),
             request_hooks: None,
         }
@@ -448,8 +467,8 @@ impl Options {
         self
     }
 
-    fn with_overall_timeout(mut self, timeout: Duration) -> Self {
-        self.overall_timeout = Some(timeout);
+    fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -478,6 +497,11 @@ impl Options {
         self.supports_grammar_tools = compat.supports_open_ai_grammar_tools.unwrap_or(false);
         self.supports_explicit_prompt_cache_mode =
             compat.supports_explicit_prompt_cache_mode.unwrap_or(false);
+        self
+    }
+
+    fn with_reasoning_model(mut self, reasoning: bool) -> Self {
+        self.reasoning_model = reasoning;
         self
     }
 
@@ -569,43 +593,82 @@ enum StreamEvent {
     Created { response: IdentifiedResponse },
     #[serde(rename = "response.output_item.added")]
     OutputItemAdded {
+        #[serde(default)]
         output_index: usize,
         item: OutputItem,
     },
     #[serde(rename = "response.output_text.delta")]
-    OutputTextDelta { output_index: usize, delta: String },
+    OutputTextDelta {
+        #[serde(default)]
+        output_index: usize,
+        delta: String,
+    },
     #[serde(rename = "response.reasoning_summary_text.delta")]
-    ReasoningSummaryTextDelta { output_index: usize, delta: String },
+    ReasoningSummaryTextDelta {
+        #[serde(default)]
+        output_index: usize,
+        delta: String,
+    },
+    #[serde(rename = "response.reasoning_summary_part.done")]
+    ReasoningSummaryPartDone {
+        #[serde(default)]
+        output_index: usize,
+    },
     #[serde(rename = "response.reasoning_text.delta")]
-    ReasoningTextDelta { output_index: usize, delta: String },
+    ReasoningTextDelta {
+        #[serde(default)]
+        output_index: usize,
+        delta: String,
+    },
     #[serde(rename = "response.refusal.delta")]
-    RefusalDelta { output_index: usize, delta: String },
+    RefusalDelta {
+        #[serde(default)]
+        output_index: usize,
+        delta: String,
+    },
     #[serde(rename = "response.function_call_arguments.delta")]
-    FunctionCallArgumentsDelta { output_index: usize, delta: String },
+    FunctionCallArgumentsDelta {
+        #[serde(default)]
+        output_index: usize,
+        delta: String,
+    },
     #[serde(rename = "response.function_call_arguments.done")]
     FunctionCallArgumentsDone {
+        #[serde(default)]
         output_index: usize,
         arguments: String,
     },
     #[serde(rename = "response.custom_tool_call_input.delta")]
-    CustomToolCallInputDelta { output_index: usize, delta: String },
+    CustomToolCallInputDelta {
+        #[serde(default)]
+        output_index: usize,
+        item_id: Option<String>,
+        delta: String,
+    },
     #[serde(rename = "response.custom_tool_call_input.done")]
-    CustomToolCallInputDone { output_index: usize, input: String },
+    CustomToolCallInputDone {
+        #[serde(default)]
+        output_index: usize,
+        item_id: Option<String>,
+        input: String,
+    },
     #[serde(rename = "response.output_item.done")]
     OutputItemDone {
+        #[serde(default)]
         output_index: usize,
         item: OutputItem,
     },
-    #[serde(rename = "response.completed", alias = "response.done")]
+    #[serde(rename = "response.completed", alias = "response.incomplete")]
     Completed { response: CompletedResponse },
-    #[serde(rename = "response.incomplete")]
-    Incomplete { response: IncompleteResponse },
+    #[serde(rename = "response.done")]
+    Done { response: CompletedResponse },
     #[serde(rename = "response.failed")]
     Failed { response: FailedResponse },
     #[serde(rename = "error")]
     Error {
         code: Option<String>,
-        message: String,
+        message: Option<String>,
+        error: Option<serde_json::Value>,
     },
     #[serde(other)]
     Unknown,
@@ -618,16 +681,14 @@ struct IdentifiedResponse {
 
 #[derive(Deserialize)]
 struct OutputItem {
-    id: Option<String>,
     r#type: String,
+    id: Option<String>,
     call_id: Option<String>,
     name: Option<String>,
     arguments: Option<String>,
     input: Option<String>,
-    #[serde(default)]
-    content: Vec<OutputContent>,
-    #[serde(default)]
-    summary: Vec<SummaryContent>,
+    content: Option<Vec<OutputContent>>,
+    summary: Option<Vec<SummaryContent>>,
     encrypted_content: Option<String>,
     phase: Option<String>,
     namespace: Option<String>,
@@ -788,21 +849,15 @@ fn assistant_tool_call(
 }
 
 fn thinking_content(
-    id: Option<&str>,
-    encrypted_content: Option<&str>,
+    item: &OutputItem,
+    raw_item: Option<&serde_json::Value>,
     thinking: String,
 ) -> ThinkingContent {
-    let thinking_signature = id.and_then(|id| {
-        let mut item = serde_json::json!({
-            "type": "reasoning",
-            "id": id,
-            "summary": [{"type": "summary_text", "text": thinking}]
-        });
-        if let Some(encrypted_content) = encrypted_content {
-            item["encrypted_content"] = encrypted_content.into();
-        }
-        serde_json::to_string(&item).ok()
-    });
+    let thinking_signature = item
+        .id
+        .as_ref()
+        .and(raw_item)
+        .and_then(|item| serde_json::to_string(item).ok());
     ThinkingContent {
         thinking,
         thinking_signature,
@@ -815,14 +870,6 @@ struct CompletedResponse {
     #[serde(flatten)]
     terminal: TerminalResponse,
     status: Option<String>,
-    incomplete_details: Option<IncompleteDetails>,
-    error: Option<FailedDetail>,
-}
-
-#[derive(Deserialize)]
-struct IncompleteResponse {
-    #[serde(flatten)]
-    terminal: TerminalResponse,
     incomplete_details: Option<IncompleteDetails>,
 }
 
@@ -844,9 +891,7 @@ struct IncompleteDetails {
 
 #[derive(Deserialize)]
 struct FailedResponse {
-    id: Option<String>,
-    service_tier: Option<String>,
-    end_turn: Option<bool>,
+    status: Option<String>,
     error: Option<FailedDetail>,
     incomplete_details: Option<IncompleteDetails>,
 }
@@ -855,6 +900,53 @@ struct FailedResponse {
 struct FailedDetail {
     code: Option<String>,
     message: Option<String>,
+}
+
+fn failed_error(
+    error: Option<&FailedDetail>,
+    incomplete_details: Option<&IncompleteDetails>,
+    codex: bool,
+) -> (Option<String>, String) {
+    if codex {
+        let code = error
+            .and_then(|error| error.code.as_deref())
+            .filter(|code| !code.is_empty())
+            .map(str::to_owned);
+        return (
+            code,
+            error
+                .and_then(|error| error.message.as_deref())
+                .filter(|message| !message.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| "Codex response failed".into()),
+        );
+    }
+    if let Some(error) = error {
+        let code = error
+            .code
+            .as_deref()
+            .filter(|code| !code.is_empty())
+            .map(str::to_owned);
+        let message = error
+            .message
+            .as_deref()
+            .filter(|message| !message.is_empty());
+        return (
+            code.clone(),
+            format!(
+                "{}: {}",
+                code.as_deref().unwrap_or("unknown"),
+                message.unwrap_or("no message")
+            ),
+        );
+    }
+    if let Some(reason) = incomplete_details
+        .and_then(|details| details.reason.as_deref())
+        .filter(|reason| !reason.is_empty())
+    {
+        return (None, format!("incomplete: {reason}"));
+    }
+    (None, "Unknown error (no error details in response)".into())
 }
 
 #[derive(Default, Deserialize)]
@@ -890,9 +982,6 @@ async fn response_events(
     context: &Context,
     options: &Options,
 ) -> Result<crate::provider_stream::ProviderEventStream, Error> {
-    let overall_deadline = options
-        .overall_timeout
-        .map(|timeout| Instant::now() + timeout);
     let placement = crate::deferred_tools::split(
         context,
         options.deferred_tools_mode.is_some(),
@@ -906,11 +995,13 @@ async fn response_events(
     let input = response_input(
         ResponseInputTarget::openai(&model.id),
         context,
-        Some(if options.supports_developer_role {
-            "developer"
-        } else {
-            "system"
-        }),
+        Some(
+            if options.reasoning_model && options.supports_developer_role {
+                "developer"
+            } else {
+                "system"
+            },
+        ),
         options.deferred_tools_mode.map(|mode| (&placement, mode)),
         &grammar_input_properties,
         tool_options,
@@ -923,7 +1014,10 @@ async fn response_events(
         tools,
         stream: true,
         store: false,
-        max_output_tokens: options.max_output_tokens.map(|tokens| tokens.max(16)),
+        max_output_tokens: options
+            .max_output_tokens
+            .filter(|tokens| *tokens > 0)
+            .map(|tokens| tokens.max(16)),
         temperature: options.temperature,
         reasoning: options
             .reasoning
@@ -968,14 +1062,18 @@ async fn response_events(
     let body =
         serde_json::to_vec(&request).map_err(|error| Error::InvalidRequest(error.to_string()))?;
     let mut default_headers = BTreeMap::from([
-        (
-            "authorization".into(),
-            format!("Bearer {}", options.api_key),
-        ),
         ("content-type".into(), "application/json".into()),
+        (
+            "user-agent".into(),
+            concat!("ds-ai/", env!("CARGO_PKG_VERSION")).into(),
+        ),
     ]);
+    if let Some(api_key) = &options.api_key {
+        default_headers.insert("authorization".into(), format!("Bearer {api_key}"));
+    }
     if options.cache_retention != CacheRetention::None
         && let Some(session_id) = &options.session_id
+        && !session_id.is_empty()
     {
         if options.session_affinity_format == crate::SessionAffinityFormat::OpenAi {
             default_headers.insert("session_id".into(), session_id.clone());
@@ -992,15 +1090,16 @@ async fn response_events(
                 max_retries: options.max_retries,
                 max_delay: options.max_retry_delay,
                 cancellation: &options.cancellation,
-                deadline: overall_deadline,
+                deadline: None,
                 profile: retry::Profile::Standard,
-                request_timeout: None,
+                request_timeout: Some(options.timeout),
             },
             || {
                 client
                     .post(&url)
                     .headers(headers.clone())
                     .body(body.clone())
+                    .timeout(retry::NO_BODY_TIMEOUT)
                     .send()
             },
             |response| async {
@@ -1011,11 +1110,11 @@ async fn response_events(
             },
         ),
         None,
-        overall_deadline,
+        None,
     )
     .await?;
     if !response.status().is_success() {
-        return Err(http::provider_error(response, &options.cancellation, overall_deadline).await);
+        return Err(http::openai_provider_error(response, &options.cancellation, None).await);
     }
     Ok(decode_stream(
         response,
@@ -1023,19 +1122,24 @@ async fn response_events(
         options.cancellation.clone(),
         None,
         None,
-        overall_deadline,
+        None,
         ResponseEventOptions {
             grammar_input_properties,
             requested_service_tier: options
                 .service_tier
                 .map(|service_tier| service_tier.as_str().into()),
             use_requested_for_default: false,
+            mode: ResponseMode::OpenAi,
         },
     ))
 }
 
 fn fallback_message_id(message_index: usize, text_index: usize) -> String {
-    format!("msg_ds_{message_index}_{text_index}")
+    if text_index == 0 {
+        format!("msg_pi_{message_index}")
+    } else {
+        format!("msg_pi_{message_index}_{text_index}")
+    }
 }
 
 fn openai_call_id(id: &str) -> String {
@@ -1174,7 +1278,7 @@ pub(crate) fn response_input(
     let mut pending_tool_calls = Vec::new();
     let mut tool_results = std::collections::BTreeSet::new();
     if let Some(role) = system_role
-        && let Some(system) = context.system()
+        && let Some(system) = context.system().filter(|system| !system.is_empty())
     {
         input.push(serde_json::json!({
             "role": role,
@@ -1353,8 +1457,8 @@ pub(crate) fn response_input(
                             .map(|tool| tool.name.as_str())
                             .collect::<Vec<_>>();
                         let call_id = format!(
-                            "ds_tool_load_{}",
-                            short_hash(&format!("{}:{}", normalized_id, names.join(",")))
+                            "pi_tool_load_{}",
+                            short_hash(&format!("{}:{}", result.tool_call_id, names.join(",")))
                         );
                         input.push(serde_json::json!({
                             "type": "tool_search_call",
@@ -1542,6 +1646,14 @@ pub(crate) struct ResponseEventOptions {
     pub(crate) grammar_input_properties: BTreeMap<String, String>,
     pub(crate) requested_service_tier: Option<String>,
     pub(crate) use_requested_for_default: bool,
+    pub(crate) mode: ResponseMode,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ResponseMode {
+    OpenAi,
+    CodexSse,
+    CodexWebSocket,
 }
 
 pub(crate) fn decode_stream(
@@ -1586,11 +1698,15 @@ pub(crate) fn decode_events(
     let output = stream! {
         let mut result = Response::new(response_model);
         let mut slots = HashMap::new();
+        let mut item_slots = HashMap::new();
         let ResponseEventOptions {
             grammar_input_properties,
             requested_service_tier,
             use_requested_for_default,
+            mode,
         } = options;
+        let codex = !matches!(mode, ResponseMode::OpenAi);
+        let websocket = matches!(mode, ResponseMode::CodexWebSocket);
 
         loop {
             let data = match events.next().await {
@@ -1621,23 +1737,84 @@ pub(crate) fn decode_events(
                     return;
                 }
             };
-            let event = match json::parse::<StreamEvent>(&data) {
+            let mut raw_event = match json::parse::<serde_json::Value>(&data) {
                 Ok(event) => event,
                 Err(error) => {
-                    yield Err(Error::Stream {
-                        message: error,
-                        partial: result,
+                    yield Err(if websocket {
+                        Error::Protocol {
+                            message: error,
+                            partial: result,
+                        }
+                    } else {
+                        Error::Stream {
+                            message: error,
+                            partial: result,
+                        }
                     });
                     return;
                 }
             };
-
+            let event_type = raw_event.get("type").and_then(serde_json::Value::as_str);
+            if !codex && event_type == Some("response.done") {
+                continue;
+            }
+            if codex && event_type.is_none() {
+                continue;
+            }
+            let terminal_codex_event = codex
+                && matches!(
+                    event_type,
+                    Some(
+                        "response.completed"
+                            | "response.done"
+                            | "response.incomplete"
+                            | "response.failed",
+                    )
+                );
+            if terminal_codex_event
+                && let Some(response) = raw_event
+                    .get_mut("response")
+                    .and_then(serde_json::Value::as_object_mut)
+            {
+                if response
+                    .get("status")
+                    .is_some_and(|status| !status.is_string())
+                {
+                    response.insert("status".into(), serde_json::Value::Null);
+                }
+                if response
+                    .get("end_turn")
+                    .is_some_and(|end_turn| !end_turn.is_boolean())
+                {
+                    response.insert("end_turn".into(), serde_json::Value::Null);
+                }
+            }
+            let event = match serde_json::from_value::<StreamEvent>(raw_event.clone()) {
+                Ok(event) => event,
+                Err(error) => {
+                    yield Err(if websocket {
+                        Error::Protocol {
+                            message: error.to_string(),
+                            partial: result,
+                        }
+                    } else {
+                        Error::Stream {
+                            message: error.to_string(),
+                            partial: result,
+                        }
+                    });
+                    return;
+                }
+            };
             match event {
-                    StreamEvent::Created { response } => {
+                    StreamEvent::Created { response } if !response.id.is_empty() => {
                         result.id = Some(response.id.clone());
                         yield Ok(crate::provider_stream::ProviderEvent::ResponseId(response.id));
                     }
                     StreamEvent::OutputItemAdded { output_index, item } => {
+                        if let Some(item_id) = &item.id {
+                            item_slots.insert(item_id.clone(), output_index);
+                        }
                         let content_index = result.content.len();
                         if let Some((content, slot, start)) =
                             output_slot(&item, content_index, &grammar_input_properties)
@@ -1682,6 +1859,20 @@ pub(crate) fn decode_events(
                             delta,
                         });
                     }
+                    StreamEvent::ReasoningSummaryPartDone { output_index } => {
+                        let Some(Slot::Reasoning(content_index)) = slots.get(&output_index) else {
+                            continue;
+                        };
+                        if let AssistantContent::Thinking(content) =
+                            &mut result.content[*content_index]
+                        {
+                            content.thinking.push_str("\n\n");
+                        }
+                        yield Ok(crate::provider_stream::ProviderEvent::ReasoningDelta {
+                            content_index: *content_index,
+                            delta: "\n\n".into(),
+                        });
+                    }
                     StreamEvent::FunctionCallArgumentsDelta { output_index, delta } => {
                         let Some(Slot::ToolCall { content_index, arguments }) = slots.get_mut(&output_index) else {
                             continue;
@@ -1720,7 +1911,16 @@ pub(crate) fn decode_events(
                             });
                         }
                     }
-                    StreamEvent::CustomToolCallInputDelta { output_index, delta } => {
+                    StreamEvent::CustomToolCallInputDelta {
+                        output_index,
+                        item_id,
+                        delta,
+                    } => {
+                        let output_index = resolved_output_index(
+                            output_index,
+                            item_id.as_deref(),
+                            &item_slots,
+                        );
                         let Some(Slot::ToolCall { content_index, arguments }) = slots.get_mut(&output_index) else {
                             continue;
                         };
@@ -1750,7 +1950,16 @@ pub(crate) fn decode_events(
                             });
                         }
                     }
-                    StreamEvent::CustomToolCallInputDone { output_index, input } => {
+                    StreamEvent::CustomToolCallInputDone {
+                        output_index,
+                        item_id,
+                        input,
+                    } => {
+                        let output_index = resolved_output_index(
+                            output_index,
+                            item_id.as_deref(),
+                            &item_slots,
+                        );
                         let Some(Slot::ToolCall { content_index, arguments }) = slots.get_mut(&output_index) else {
                             continue;
                         };
@@ -1780,6 +1989,13 @@ pub(crate) fn decode_events(
                         }
                     }
                     StreamEvent::OutputItemDone { output_index, item } => {
+                        let raw_item = raw_event.get("item").cloned();
+                        let item_slot_id = item.id.clone();
+                        let output_index = resolved_output_index(
+                            output_index,
+                            item_slot_id.as_deref(),
+                            &item_slots,
+                        );
                         if let std::collections::hash_map::Entry::Vacant(entry) =
                             slots.entry(output_index)
                         {
@@ -1810,6 +2026,8 @@ pub(crate) fn decode_events(
                                 let content_index = *content_index;
                                 let text = item
                                     .content
+                                    .as_deref()
+                                    .unwrap_or_default()
                                     .iter()
                                     .filter_map(|content| match content.r#type.as_str() {
                                         "output_text" => Some(content.text.as_str()),
@@ -1821,12 +2039,14 @@ pub(crate) fn decode_events(
                                 let stop_reason = (phase.as_deref() == Some("final_answer"))
                                     .then_some(StopReason::Stop);
                                 let text_signature = item.id.as_ref().and_then(|id| {
-                                    serde_json::to_string(&serde_json::json!({
+                                    let mut signature = serde_json::json!({
                                         "v": 1,
                                         "id": id,
-                                        "phase": phase
-                                    }))
-                                    .ok()
+                                    });
+                                    if let Some(phase) = phase.as_deref() {
+                                        signature["phase"] = phase.into();
+                                    }
+                                    serde_json::to_string(&signature).ok()
                                 });
                                 let content = TextContent {
                                     text,
@@ -1847,26 +2067,23 @@ pub(crate) fn decode_events(
                                     continue;
                                 };
                                 let content_index = *content_index;
-                                let reasoning = if item.summary.is_empty() {
-                                    item.content
+                                let summary = item.summary.as_deref().unwrap_or_default();
+                                let content = item.content.as_deref().unwrap_or_default();
+                                let reasoning = if summary.is_empty() {
+                                    content
                                         .iter()
                                         .map(|content| content.text.as_str())
                                         .collect::<Vec<_>>()
                                         .join("\n\n")
                                 } else {
-                                    item.summary
+                                    summary
                                         .iter()
                                         .map(|content| content.text.as_str())
                                         .collect::<Vec<_>>()
                                         .join("\n\n")
                                 };
-                                let id = item.id;
-                                let encrypted_content = item.encrypted_content;
-                                let content = thinking_content(
-                                    id.as_deref(),
-                                    encrypted_content.as_deref(),
-                                    reasoning,
-                                );
+                                let content =
+                                    thinking_content(&item, raw_item.as_ref(), reasoning);
                                 result.content[content_index] = AssistantContent::Thinking(content.clone());
                                 yield Ok(crate::provider_stream::ProviderEvent::ThinkingEnd {
                                     content_index,
@@ -1953,19 +2170,28 @@ pub(crate) fn decode_events(
                             _ => {}
                         }
                         slots.remove(&output_index);
+                        if let Some(item_id) = item_slot_id {
+                            item_slots.remove(&item_id);
+                        }
                     }
-                    StreamEvent::Completed { response } => {
+                    StreamEvent::Completed { response } | StreamEvent::Done { response } => {
                         apply_terminal_response(
                             &mut result,
                             response.terminal,
                             requested_service_tier.as_deref(),
                             use_requested_for_default,
+                            codex,
                         );
-                        match response.status.as_deref() {
+                        match response
+                            .status
+                            .as_deref()
+                            .filter(|status| !status.is_empty())
+                        {
                             Some("incomplete") => {
                                 let reason = response
                                     .incomplete_details
-                                    .and_then(|details| details.reason);
+                                    .and_then(|details| details.reason)
+                                    .filter(|reason| !reason.is_empty());
                                 if reason.as_deref() == Some("max_output_tokens") {
                                     result.stop_reason = StopReason::Length;
                                     result.raw_stop_reason =
@@ -1989,22 +2215,31 @@ pub(crate) fn decode_events(
                                 return;
                             }
                             Some("failed" | "cancelled") => {
-                                let code = response.error.as_ref().and_then(|error| error.code.clone());
-                                let message = response
-                                    .error
-                                    .and_then(|error| error.message)
-                                    .unwrap_or_else(|| "Provider response failed".into());
                                 result.stop_reason = StopReason::Error;
                                 result.raw_stop_reason = response.status;
                                 yield Err(Error::Response {
-                                    code,
-                                    message,
+                                    code: None,
+                                    message: "An unknown error occurred".into(),
                                     partial: result,
                                 });
                                 return;
                             }
                             Some("completed" | "in_progress" | "queued") | None => {}
                             Some(status) => {
+                                if codex {
+                                    result.stop_reason = if result
+                                        .content
+                                        .iter()
+                                        .any(|content| matches!(content, AssistantContent::ToolCall(_)))
+                                    {
+                                        StopReason::ToolUse
+                                    } else {
+                                        StopReason::Stop
+                                    };
+                                    result.raw_stop_reason = None;
+                                    yield Ok(crate::provider_stream::ProviderEvent::Done(Box::new(result)));
+                                    return;
+                                }
                                 result.stop_reason = StopReason::Error;
                                 result.raw_stop_reason = Some(status.into());
                                 yield Err(Error::Response {
@@ -2024,65 +2259,20 @@ pub(crate) fn decode_events(
                         } else {
                             StopReason::Stop
                         };
-                        result.raw_stop_reason = response.status;
+                        result.raw_stop_reason = response.status.filter(|status| !status.is_empty());
                         yield Ok(crate::provider_stream::ProviderEvent::Done(Box::new(result)));
                         return;
                     }
-                    StreamEvent::Incomplete { response } => {
-                        let reason = response
-                            .incomplete_details
-                            .and_then(|details| details.reason);
-                        apply_terminal_response(
-                            &mut result,
-                            response.terminal,
-                            requested_service_tier.as_deref(),
-                            use_requested_for_default,
-                        );
-                        if reason.as_deref() == Some("max_output_tokens") {
-                                result.stop_reason = StopReason::Length;
-                                result.raw_stop_reason =
-                                    Some("incomplete.max_output_tokens".into());
-                                yield Ok(crate::provider_stream::ProviderEvent::Done(Box::new(result)));
-                            return;
-                        }
-                        result.stop_reason = StopReason::Error;
-                        result.raw_stop_reason = Some(reason.as_ref().map_or_else(
-                            || "incomplete".into(),
-                            |reason| format!("incomplete.{reason}"),
-                        ));
-                        yield Err(Error::Response {
-                            code: None,
-                            message: reason.map_or_else(
-                                || "Response incomplete without a provider reason".into(),
-                                |reason| format!("Response incomplete: {reason}"),
-                            ),
-                            partial: result,
-                        });
-                        return;
-                    }
                     StreamEvent::Failed { response } => {
-                        let code = response.error.as_ref().and_then(|error| error.code.clone());
-                        let message = response
-                            .error
-                            .and_then(|error| error.message)
-                            .or_else(|| {
-                                response
-                                    .incomplete_details
-                                    .and_then(|details| details.reason)
-                                    .map(|reason| format!("Response incomplete: {reason}"))
-                            })
-                            .unwrap_or_else(|| "Unknown provider error".into());
-                        if response.id.is_some() {
-                            result.id = response.id;
-                        }
-                        result.service_tier = resolve_service_tier(
-                            response.service_tier,
-                            requested_service_tier.as_deref(),
-                            use_requested_for_default,
+                        let (code, message) = failed_error(
+                            response.error.as_ref(),
+                            response.incomplete_details.as_ref(),
+                            codex,
                         );
-                        result.end_turn = response.end_turn;
                         result.stop_reason = StopReason::Error;
-                        result.raw_stop_reason = Some("failed".into());
+                        if !codex {
+                            result.raw_stop_reason = response.status.filter(|status| !status.is_empty());
+                        }
                         yield Err(Error::Response {
                             code,
                             message,
@@ -2090,9 +2280,52 @@ pub(crate) fn decode_events(
                         });
                         return;
                     }
-                    StreamEvent::Error { code, message } => {
+                    StreamEvent::Error {
+                        code,
+                        message,
+                        error,
+                    } => {
+                        let code = if codex {
+                            code.or_else(|| {
+                                error
+                                    .as_ref()
+                                    .and_then(|error| error.get("code"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                        } else {
+                            code
+                        };
+                        let message = if codex {
+                            message.or_else(|| {
+                                error
+                                    .as_ref()
+                                    .and_then(|error| error.get("message"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                        } else {
+                            message
+                        };
+                        let message = if codex {
+                            let detail = message
+                                .as_deref()
+                                .filter(|message| !message.is_empty())
+                                .or_else(|| code.as_deref().filter(|code| !code.is_empty()))
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| {
+                                    serde_json::to_string(&raw_event)
+                                        .unwrap_or_else(|_| "Unknown error".into())
+                                });
+                            format!("Codex error: {detail}")
+                        } else {
+                            format!(
+                                "Error Code {}: {}",
+                                code.as_deref().unwrap_or("undefined"),
+                                message.as_deref().unwrap_or("undefined")
+                            )
+                        };
                         result.stop_reason = StopReason::Error;
-                        result.raw_stop_reason = Some("error".into());
                         yield Err(Error::Response {
                             code,
                             message,
@@ -2114,12 +2347,22 @@ fn parse_arguments(arguments: &str) -> serde_json::Value {
     json::value(arguments)
 }
 
+fn resolved_output_index(
+    output_index: usize,
+    item_id: Option<&str>,
+    item_slots: &HashMap<String, usize>,
+) -> usize {
+    item_id
+        .and_then(|item_id| item_slots.get(item_id).copied())
+        .unwrap_or(output_index)
+}
+
 fn backfill_reasoning(result: &mut Response, output: &[OutputItem]) {
     for item in output {
         let (Some(id), Some(encrypted)) = (&item.id, &item.encrypted_content) else {
             continue;
         };
-        if item.r#type != "reasoning" {
+        if item.r#type != "reasoning" || encrypted.is_empty() {
             continue;
         }
         for content in &mut result.content {
@@ -2135,6 +2378,12 @@ fn backfill_reasoning(result: &mut Response, output: &[OutputItem]) {
             if signature.get("id").and_then(serde_json::Value::as_str) != Some(id) {
                 continue;
             }
+            if signature
+                .get("encrypted_content")
+                .is_some_and(http::json_truthy)
+            {
+                continue;
+            }
             signature["encrypted_content"] = encrypted.clone().into();
             content.thinking_signature = serde_json::to_string(&signature).ok();
             break;
@@ -2147,9 +2396,10 @@ fn apply_terminal_response(
     response: TerminalResponse,
     requested_service_tier: Option<&str>,
     use_requested_for_default: bool,
+    codex: bool,
 ) {
     backfill_reasoning(result, &response.output);
-    if response.id.is_some() {
+    if response.id.as_deref().is_some_and(|id| !id.is_empty()) {
         result.id = response.id;
     }
     result.service_tier = resolve_service_tier(
@@ -2157,7 +2407,9 @@ fn apply_terminal_response(
         requested_service_tier,
         use_requested_for_default,
     );
-    result.end_turn = response.end_turn;
+    if codex {
+        result.end_turn = response.end_turn;
+    }
     result.usage = usage(response.usage);
 }
 

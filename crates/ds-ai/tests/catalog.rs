@@ -54,6 +54,79 @@ fn exposes_catalog_capabilities_costs_and_compatibility() {
 }
 
 #[test]
+fn matches_selected_catalog_thinking_level_matrices() {
+    use ThinkingLevel::*;
+
+    let cases = [
+        (
+            "anthropic",
+            "claude-opus-4-6",
+            &[Off, Minimal, Low, Medium, High, Max][..],
+        ),
+        (
+            "anthropic",
+            "claude-opus-4-8",
+            &[Off, Minimal, Low, Medium, High, XHigh, Max][..],
+        ),
+        (
+            "anthropic",
+            "claude-opus-5",
+            &[Off, Minimal, Low, Medium, High, XHigh, Max][..],
+        ),
+        (
+            "anthropic",
+            "claude-sonnet-4-6",
+            &[Off, Minimal, Low, Medium, High, Max][..],
+        ),
+        (
+            "anthropic",
+            "claude-sonnet-5",
+            &[Off, Minimal, Low, Medium, High, XHigh, Max][..],
+        ),
+        (
+            "anthropic",
+            "claude-fable-5",
+            &[Minimal, Low, Medium, High, XHigh, Max][..],
+        ),
+        (
+            "anthropic",
+            "claude-sonnet-4-5",
+            &[Off, Minimal, Low, Medium, High][..],
+        ),
+        (
+            "openai-codex",
+            "gpt-5.4",
+            &[Off, Minimal, Low, Medium, High, XHigh][..],
+        ),
+        (
+            "openai-codex",
+            "gpt-5.5",
+            &[Off, Minimal, Low, Medium, High, XHigh][..],
+        ),
+        (
+            "openai-codex",
+            "gpt-5.6-sol",
+            &[Off, Minimal, Low, Medium, High, XHigh, Max][..],
+        ),
+        ("openai", "gpt-5.5-pro", &[Medium, High, XHigh][..]),
+        (
+            "openai",
+            "gpt-5.6-sol",
+            &[Off, Low, Medium, High, XHigh, Max][..],
+        ),
+    ];
+
+    for (provider, id, expected) in cases {
+        let model = builtin_model(provider, id).unwrap();
+        assert_eq!(
+            model.supported_thinking_levels(),
+            expected,
+            "{provider}/{id}"
+        );
+    }
+}
+
+#[test]
 fn built_in_providers_own_their_catalogs() {
     let providers = builtin_providers();
     assert_eq!(providers.len(), 3);

@@ -11,12 +11,12 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 pub mod auth;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const OAUTH_TOOL_NAMES: [&str; 17] = [
     "Read",
@@ -70,20 +70,18 @@ pub fn stream(
     crate::provider_stream::adapt(requested_model.clone(), async move {
         let thinking = resolve_thinking(&requested_model, &options);
         let tool_choice = options.tool_choice;
-        let stream_options = options.stream;
+        let mut stream_options = options.stream;
         let request_hooks = stream_options.request_hooks(&requested_model);
-        let api_key = stream_options.api_key;
+        let api_key = stream_options.api_key.clone();
         if api_key.as_deref().is_none_or(str::is_empty) && !has_auth_header(&stream_options.headers)
         {
-            return Err(Error::InvalidRequest(
-                "Anthropic request authentication is required".into(),
-            ));
+            return Err(Error::MissingApiKey(requested_model.provider.clone()));
         }
+        let headers = stream_options.request_headers(&requested_model).await?;
         let provider_model = Model::from_public(&requested_model);
         let max_tokens = stream_options
             .max_tokens
-            .unwrap_or(requested_model.max_tokens)
-            .min(requested_model.max_tokens);
+            .unwrap_or(requested_model.max_tokens);
         let mut provider_options =
             Options::with_auth(api_key, stream_options.http_client.unwrap_or_default())
                 .with_max_tokens(max_tokens)
@@ -93,13 +91,12 @@ pub fn stream(
                 .with_cache_retention(stream_options.cache_retention)
                 .with_interleaved_thinking(options.interleaved_thinking.unwrap_or(true))
                 .with_session_id(stream_options.session_id)
-                .with_request_options(stream_options.headers, request_hooks);
+                .with_request_options(headers, request_hooks);
         if let Some(temperature) = stream_options.temperature {
             provider_options = provider_options.with_temperature(temperature);
         }
-        if let Some(timeout) = stream_options.timeout {
-            provider_options = provider_options.with_overall_timeout(timeout);
-        }
+        provider_options =
+            provider_options.with_timeout(stream_options.timeout.unwrap_or(DEFAULT_TIMEOUT));
         if let Some(user_id) = stream_options
             .metadata
             .get("user_id")
@@ -113,7 +110,13 @@ pub fn stream(
         if let Some(tool_choice) = tool_choice {
             provider_options = provider_options.with_tool_choice(tool_choice);
         }
-        response_events(&provider_model, &context, &provider_options).await
+        response_events(
+            &provider_model,
+            &requested_model.provider,
+            &context,
+            &provider_options,
+        )
+        .await
     })
 }
 
@@ -328,6 +331,12 @@ fn has_auth_header(headers: &BTreeMap<String, Option<String>>) -> bool {
         })
 }
 
+fn has_final_auth_header(headers: &reqwest::header::HeaderMap) -> bool {
+    ["authorization", "x-api-key", "cf-aig-authorization"]
+        .into_iter()
+        .any(|expected| headers.get(expected).is_some_and(|value| !value.is_empty()))
+}
+
 fn is_oauth_token(api_key: Option<&str>) -> bool {
     api_key.is_some_and(|api_key| api_key.contains("sk-ant-oat"))
 }
@@ -360,6 +369,9 @@ impl crate::ApiKeyAuth for AnthropicApiKeyAuth {
                 placeholder: None,
             })
             .await?;
+        if interaction.cancellation().is_cancelled() {
+            return Err(crate::AuthError::Cancelled);
+        }
         Ok(crate::Credential::ApiKey {
             key: Some(key),
             env: BTreeMap::new(),
@@ -379,6 +391,7 @@ impl crate::ApiKeyAuth for AnthropicApiKeyAuth {
             key: Some(key),
             env,
         }) = credential
+            && !key.is_empty()
         {
             return Ok(Some(crate::AuthResult {
                 auth: crate::ModelAuth {
@@ -389,7 +402,11 @@ impl crate::ApiKeyAuth for AnthropicApiKeyAuth {
                 source: Some("stored credential".into()),
             }));
         }
-        if let Some(token) = context.env("ANTHROPIC_AUTH_TOKEN").await {
+        let token = context.env("ANTHROPIC_AUTH_TOKEN").await;
+        if cancellation.is_cancelled() {
+            return Err(crate::AuthError::Cancelled);
+        }
+        if let Some(token) = token.filter(|token| !token.is_empty()) {
             return Ok(Some(crate::AuthResult {
                 auth: crate::ModelAuth {
                     headers: BTreeMap::from([(
@@ -403,7 +420,11 @@ impl crate::ApiKeyAuth for AnthropicApiKeyAuth {
             }));
         }
         for name in ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"] {
-            if let Some(key) = context.env(name).await {
+            let key = context.env(name).await;
+            if cancellation.is_cancelled() {
+                return Err(crate::AuthError::Cancelled);
+            }
+            if let Some(key) = key.filter(|key| !key.is_empty()) {
                 return Ok(Some(crate::AuthResult {
                     auth: crate::ModelAuth {
                         api_key: Some(key),
@@ -490,7 +511,7 @@ struct Options {
     max_retries: usize,
     max_retry_delay: Option<Duration>,
     cancellation: CancellationToken,
-    overall_timeout: Option<Duration>,
+    timeout: Duration,
     temperature: Option<f64>,
     thinking: Option<Thinking>,
     metadata_user_id: Option<String>,
@@ -549,7 +570,7 @@ impl Options {
             max_retries: 0,
             max_retry_delay: Some(DEFAULT_MAX_RETRY_DELAY),
             cancellation: CancellationToken::new(),
-            overall_timeout: None,
+            timeout: DEFAULT_TIMEOUT,
             temperature: None,
             thinking: None,
             metadata_user_id: None,
@@ -582,8 +603,8 @@ impl Options {
         self
     }
 
-    fn with_overall_timeout(mut self, timeout: Duration) -> Self {
-        self.overall_timeout = Some(timeout);
+    fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -665,7 +686,7 @@ struct FallbackRequest<'a> {
 #[derive(Serialize)]
 struct RequestMessage {
     role: &'static str,
-    content: Vec<serde_json::Value>,
+    content: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -708,12 +729,10 @@ enum StreamEvent {
     MessageDelta {
         delta: MessageDelta,
         #[serde(default)]
-        usage: AnthropicUsage,
+        usage: Option<AnthropicUsage>,
     },
     #[serde(rename = "message_stop")]
     MessageStop,
-    #[serde(rename = "error")]
-    Error { error: ErrorDetail },
     #[serde(other)]
     Unknown,
 }
@@ -786,12 +805,6 @@ struct OutputTokenDetails {
     thinking_tokens: Option<u64>,
 }
 
-#[derive(Deserialize)]
-struct ErrorDetail {
-    r#type: String,
-    message: String,
-}
-
 enum Slot {
     Text(usize),
     Thinking(usize),
@@ -804,12 +817,10 @@ enum Slot {
 
 async fn response_events(
     model: &Model,
+    provider_id: &crate::ProviderId,
     context: &Context,
     options: &Options,
 ) -> Result<crate::provider_stream::ProviderEventStream, Error> {
-    let overall_deadline = options
-        .overall_timeout
-        .map(|timeout| Instant::now() + timeout);
     let oauth = is_oauth_token(options.api_key.as_deref());
     let cache_control = cache_control(options.cache_retention, model.long_cache_retention);
     let (thinking, output_config) = thinking(&options.thinking);
@@ -829,7 +840,14 @@ async fn response_events(
     let request = Request {
         model: &model.id,
         system: system(context, cache_control.as_ref(), oauth),
-        messages: messages(model, context, cache_control.as_ref(), &placement, oauth),
+        messages: messages(
+            model,
+            provider_id,
+            context,
+            cache_control.as_ref(),
+            &placement,
+            oauth,
+        ),
         tools,
         max_tokens: options.max_tokens,
         stream: true,
@@ -864,6 +882,7 @@ async fn response_events(
         Some(hooks) => hooks.payload(request).await?,
         None => request,
     };
+    let request = force_streaming_payload(request);
     let body =
         serde_json::to_vec(&request).map_err(|error| Error::InvalidRequest(error.to_string()))?;
     let client = &options.http_client;
@@ -912,29 +931,37 @@ async fn response_events(
     if !beta_features.is_empty() {
         default_headers.insert("anthropic-beta".into(), beta_features);
     }
-    if model.session_affinity_headers
-        && options.cache_retention != CacheRetention::None
+    if !oauth
+        && model.session_affinity_headers
+        && options
+            .session_id
+            .as_deref()
+            .is_some_and(|session_id| !session_id.is_empty())
         && let Some(session_id) = &options.session_id
     {
         default_headers.insert("x-session-affinity".into(), session_id.clone());
     }
     let headers =
         http::request_headers(default_headers, &options.headers).map_err(Error::InvalidRequest)?;
+    if !has_final_auth_header(&headers) {
+        return Err(Error::MissingApiKey(provider_id.clone()));
+    }
     let response = transport::connect(
         retry::send(
             retry::Policy {
                 max_retries: options.max_retries,
                 max_delay: options.max_retry_delay,
                 cancellation: &options.cancellation,
-                deadline: overall_deadline,
-                profile: retry::Profile::Standard,
-                request_timeout: None,
+                deadline: None,
+                profile: retry::Profile::Anthropic,
+                request_timeout: Some(options.timeout),
             },
             || {
                 client
                     .post(&url)
                     .headers(headers.clone())
                     .body(body.clone())
+                    .timeout(retry::NO_BODY_TIMEOUT)
                     .send()
             },
             |response| async {
@@ -945,11 +972,11 @@ async fn response_events(
             },
         ),
         None,
-        overall_deadline,
+        None,
     )
     .await?;
     if !response.status().is_success() {
-        return Err(http::provider_error(response, &options.cancellation, overall_deadline).await);
+        return Err(http::anthropic_provider_error(response, &options.cancellation, None).await);
     }
 
     let response_model = model.id.clone();
@@ -965,15 +992,17 @@ async fn response_events(
             stream_cancellation,
             None,
             None,
-            overall_deadline,
-        );
+            None,
+        )
+        .with_eof_flush();
         let mut result = Response::new(response_model.clone());
         let mut slots = HashMap::new();
         let mut terminal_error = None;
+        let mut saw_message_start = false;
 
         loop {
-            let data = match events.next().await {
-                Ok(Some(data)) => data,
+            let event = match events.next_event().await {
+                Ok(Some(event)) => event,
                 Ok(None) => break,
                 Err(transport::ReadError::Cancelled) => {
                     result.stop_reason = StopReason::Aborted;
@@ -1000,11 +1029,42 @@ async fn response_events(
                     return;
                 }
             };
+            if event.event.as_deref() == Some("error") {
+                result.stop_reason = StopReason::Error;
+                yield Err(Error::Response {
+                    code: None,
+                    message: event.data,
+                    partial: result,
+                });
+                return;
+            }
+            if !matches!(
+                event.event.as_deref(),
+                Some(
+                    "message_start"
+                        | "content_block_start"
+                        | "content_block_delta"
+                        | "content_block_stop"
+                        | "message_delta"
+                        | "message_stop"
+                )
+            ) {
+                continue;
+            }
+            let event_name = event.event.clone();
+            let raw = event.raw;
+            let data = event.data;
             let event = match json::parse::<StreamEvent>(&data) {
                 Ok(event) => event,
                 Err(error) => {
                     yield Err(Error::Stream {
-                        message: error,
+                        message: format!(
+                            "Could not parse Anthropic SSE event {}: {}; data={}; raw={}",
+                            event_name.as_deref().unwrap_or("null"),
+                            error,
+                            data,
+                            raw.join("\\n")
+                        ),
                         partial: result,
                     });
                     return;
@@ -1012,6 +1072,7 @@ async fn response_events(
             };
             match event {
                     StreamEvent::MessageStart { message } => {
+                        saw_message_start = true;
                         result.id = Some(message.id.clone());
                         yield Ok(crate::provider_stream::ProviderEvent::ResponseId(message.id));
                         if let Some(model) = message.model {
@@ -1094,7 +1155,10 @@ async fn response_events(
                                 .unwrap_or(name);
                         }
                         let content_index = result.content.len();
-                        let arguments = content_block.input.unwrap_or_else(|| serde_json::json!({}));
+                        let arguments = content_block
+                            .input
+                            .filter(serde_json::Value::is_object)
+                            .unwrap_or_else(|| serde_json::json!({}));
                         let tool_call = AssistantToolCall {
                             id,
                             name,
@@ -1196,8 +1260,10 @@ async fn response_events(
                         }
                     }
                     StreamEvent::MessageDelta { delta, usage } => {
-                        apply_usage(&mut result.usage, usage);
-                        if let Some(reason) = delta.stop_reason {
+                        if let Some(usage) = usage {
+                            apply_usage(&mut result.usage, usage);
+                        }
+                        if let Some(reason) = delta.stop_reason.filter(|reason| !reason.is_empty()) {
                             terminal_error = None;
                             result.stop_reason = match reason.as_str() {
                                 "end_turn" | "stop_sequence" => StopReason::Stop,
@@ -1237,7 +1303,7 @@ async fn response_events(
                 StreamEvent::MessageStop => {
                         if result.stop_reason == StopReason::Pending {
                             yield Err(Error::Stream {
-                                message: "message_stop arrived without a stop reason".into(),
+                                message: "Anthropic stream ended without a stop reason".into(),
                                 partial: result,
                             });
                         } else if let Some((code, message)) = terminal_error {
@@ -1251,23 +1317,57 @@ async fn response_events(
                         }
                     return;
                 }
-                StreamEvent::Error { error } => {
-                    result.stop_reason = StopReason::Error;
-                    result.raw_stop_reason = Some(format!("error.{}", error.r#type));
-                    yield Err(Error::Response {
-                        code: Some(error.r#type),
-                        message: error.message,
-                        partial: result,
-                    });
-                    return;
-                }
                 _ => {}
             }
         }
 
-        yield Err(Error::IncompleteStream { partial: result });
+        if saw_message_start {
+            yield Err(Error::Stream {
+                message: "Anthropic stream ended before message_stop".into(),
+                partial: result,
+            });
+        } else if result.stop_reason == StopReason::Pending {
+            yield Err(Error::Stream {
+                message: "Anthropic stream ended without a stop reason".into(),
+                partial: result,
+            });
+        } else if let Some((code, message)) = terminal_error {
+            yield Err(Error::Response {
+                code: Some(code),
+                message,
+                partial: result,
+            });
+        } else {
+            yield Ok(crate::provider_stream::ProviderEvent::Done(Box::new(result)));
+        }
     };
     Ok(Box::pin(output))
+}
+
+fn force_streaming_payload(payload: serde_json::Value) -> serde_json::Value {
+    let mut object = match payload {
+        serde_json::Value::Object(object) => object,
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| (index.to_string(), value))
+            .collect(),
+        serde_json::Value::String(value) => value
+            .encode_utf16()
+            .enumerate()
+            .map(|(index, unit)| {
+                (
+                    index.to_string(),
+                    serde_json::Value::String(String::from_utf16_lossy(&[unit])),
+                )
+            })
+            .collect(),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            serde_json::Map::new()
+        }
+    };
+    object.insert("stream".into(), serde_json::Value::Bool(true));
+    serde_json::Value::Object(object)
 }
 
 fn system(
@@ -1293,6 +1393,7 @@ fn system(
 
 fn messages(
     model: &Model,
+    provider_id: &crate::ProviderId,
     context: &Context,
     cache_control: Option<&CacheControl>,
     placement: &crate::deferred_tools::ToolPlacement,
@@ -1301,16 +1402,36 @@ fn messages(
     let mut messages = Vec::new();
     let mut pending_tool_calls = Vec::new();
     let mut tool_results = HashSet::new();
+    let mut tool_id_map = HashMap::new();
     let mut loaded_tools = BTreeSet::new();
-    for message in context.messages() {
-        match message {
+    let context_messages = context.messages();
+    let mut index = 0;
+    while index < context_messages.len() {
+        match &context_messages[index] {
             Message::User(message) => {
                 finish_tool_calls(&mut messages, &mut pending_tool_calls, &mut tool_results);
                 let content = match &message.content {
-                    UserContent::Text(text) => {
-                        vec![serde_json::json!({"type": "text", "text": text})]
+                    UserContent::Text(text) if text.trim().is_empty() => serde_json::Value::Null,
+                    UserContent::Text(text) => serde_json::Value::String(text.clone()),
+                    UserContent::Blocks(content) => {
+                        serde_json::Value::Array(content.iter().map(input_content).collect())
                     }
-                    UserContent::Blocks(content) => content.iter().map(input_content).collect(),
+                };
+                let content = match content {
+                    serde_json::Value::Array(content) => serde_json::Value::Array(
+                        content
+                            .into_iter()
+                            .filter(|content| {
+                                content.get("type").and_then(serde_json::Value::as_str)
+                                    != Some("text")
+                                    || content
+                                        .get("text")
+                                        .and_then(serde_json::Value::as_str)
+                                        .is_some_and(|text| !text.trim().is_empty())
+                            })
+                            .collect(),
+                    ),
+                    content => content,
                 };
                 push_message(&mut messages, "user", content);
             }
@@ -1320,37 +1441,82 @@ fn messages(
                     response.stop_reason,
                     StopReason::Error | StopReason::Aborted
                 ) {
+                    index += 1;
                     continue;
                 }
-                let content = assistant_content(model, response, oauth);
+                let content = assistant_content(model, provider_id, response, oauth);
                 pending_tool_calls.extend(response.content.iter().filter_map(|content| {
                     if let AssistantContent::ToolCall(call) = content {
-                        Some(normalize_id(&call.id))
+                        let id = if same_model(model, provider_id, response) {
+                            call.id.clone()
+                        } else {
+                            normalize_id(&call.id)
+                        };
+                        tool_id_map.insert(call.id.clone(), id.clone());
+                        Some(id)
                     } else {
                         None
                     }
                 }));
-                push_message(&mut messages, "assistant", content);
-            }
-            Message::ToolResult(result) => {
-                let id = normalize_id(&result.tool_call_id);
-                tool_results.insert(id.clone());
                 push_message(
                     &mut messages,
-                    "user",
-                    tool_result(result, &id, placement, &mut loaded_tools, oauth),
+                    "assistant",
+                    serde_json::Value::Array(content),
                 );
             }
+            Message::ToolResult(_) => {
+                let mut tool_blocks = Vec::new();
+                let mut sibling_blocks = Vec::new();
+                while index < context_messages.len() {
+                    let Message::ToolResult(result) = &context_messages[index] else {
+                        break;
+                    };
+                    let id = tool_id_map
+                        .get(&result.tool_call_id)
+                        .cloned()
+                        .unwrap_or_else(|| result.tool_call_id.clone());
+                    tool_results.insert(id.clone());
+                    let mut blocks =
+                        tool_result(result, &id, placement, &mut loaded_tools, oauth).into_iter();
+                    if let Some(tool_block) = blocks.next() {
+                        tool_blocks.push(tool_block);
+                        sibling_blocks.extend(blocks);
+                    }
+                    index += 1;
+                }
+                tool_blocks.extend(take_missing_tool_results(
+                    &mut pending_tool_calls,
+                    &mut tool_results,
+                ));
+                tool_blocks.extend(sibling_blocks);
+                push_message(&mut messages, "user", serde_json::Value::Array(tool_blocks));
+                continue;
+            }
         }
+        index += 1;
     }
     finish_tool_calls(&mut messages, &mut pending_tool_calls, &mut tool_results);
     if let Some(message) = messages
         .iter_mut()
         .rev()
         .find(|message| message.role == "user")
-        && let Some(content) = message.content.last_mut()
+        && let Some(cache_control) = cache_control
     {
-        add_cache_control(content, cache_control);
+        match &mut message.content {
+            serde_json::Value::Array(content) => {
+                if let Some(content) = content.last_mut() {
+                    add_cache_control(content, Some(cache_control));
+                }
+            }
+            serde_json::Value::String(text) => {
+                message.content = serde_json::json!([{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": cache_control
+                }]);
+            }
+            _ => {}
+        }
     }
     messages
 }
@@ -1358,18 +1524,15 @@ fn messages(
 fn push_message(
     messages: &mut Vec<RequestMessage>,
     role: &'static str,
-    content: Vec<serde_json::Value>,
+    content: serde_json::Value,
 ) {
-    if content.is_empty() {
+    if content.as_array().is_some_and(Vec::is_empty)
+        || content.as_str().is_some_and(str::is_empty)
+        || content.is_null()
+    {
         return;
     }
-    if let Some(message) = messages.last_mut()
-        && message.role == role
-    {
-        message.content.extend(content);
-    } else {
-        messages.push(RequestMessage { role, content });
-    }
+    messages.push(RequestMessage { role, content });
 }
 
 fn finish_tool_calls(
@@ -1377,21 +1540,29 @@ fn finish_tool_calls(
     pending: &mut Vec<String>,
     results: &mut HashSet<String>,
 ) {
-    for id in pending.drain(..) {
-        if !results.contains(&id) {
-            push_message(
-                messages,
-                "user",
-                vec![serde_json::json!({
-                    "type": "tool_result",
-                    "tool_use_id": id,
-                    "content": [{"type": "text", "text": "No result provided"}],
-                    "is_error": true
-                })],
-            );
-        }
+    let missing = take_missing_tool_results(pending, results);
+    if !missing.is_empty() {
+        push_message(messages, "user", serde_json::Value::Array(missing));
     }
+}
+
+fn take_missing_tool_results(
+    pending: &mut Vec<String>,
+    results: &mut HashSet<String>,
+) -> Vec<serde_json::Value> {
+    let missing = pending
+        .drain(..)
+        .filter_map(|id| {
+            (!results.contains(&id)).then_some(serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": "No result provided",
+                "is_error": true
+            }))
+        })
+        .collect::<Vec<_>>();
     results.clear();
+    missing
 }
 
 fn request_tools(
@@ -1440,10 +1611,11 @@ fn request_tools(
 
 fn assistant_content(
     model: &Model,
+    provider_id: &crate::ProviderId,
     message: &crate::AssistantMessage,
     oauth: bool,
 ) -> Vec<serde_json::Value> {
-    let same_model = message.model == model.id;
+    let same_model = same_model(model, provider_id, message);
     message
         .content
         .iter()
@@ -1454,7 +1626,7 @@ fn assistant_content(
             AssistantContent::Text(_) => None,
             AssistantContent::ToolCall(call) => Some(serde_json::json!({
                 "type": "tool_use",
-                "id": normalize_id(&call.id),
+                "id": if same_model { call.id.clone() } else { normalize_id(&call.id) },
                 "name": if oauth { oauth_tool_name(&call.name) } else { call.name.clone() },
                 "input": call.arguments
             })),
@@ -1479,7 +1651,7 @@ fn assistant_content(
                     Some(serde_json::json!({
                         "type": "thinking",
                         "thinking": thinking.thinking,
-                        "signature": signature.unwrap_or_default().trim()
+                        "signature": signature.unwrap_or_default()
                     }))
                 } else if thinking.thinking.trim().is_empty() {
                     None
@@ -1492,6 +1664,16 @@ fn assistant_content(
             }
         })
         .collect()
+}
+
+fn same_model(
+    model: &Model,
+    provider_id: &crate::ProviderId,
+    message: &crate::AssistantMessage,
+) -> bool {
+    message.api == crate::Api::AnthropicMessages
+        && &message.provider == provider_id
+        && message.model == model.id
 }
 
 fn parse_arguments(arguments: &str) -> serde_json::Value {
@@ -1596,18 +1778,61 @@ fn tool_result(
             })
         })
         .collect::<Vec<_>>();
-    let content = result.content.iter().map(input_content).collect::<Vec<_>>();
+    let content = tool_result_content(&result.content);
     let loaded = !references.is_empty();
     let mut blocks = vec![serde_json::json!({
         "type": "tool_result",
         "tool_use_id": id,
-        "content": if loaded { references } else { content.clone() },
+        "content": if loaded {
+            serde_json::Value::Array(references)
+        } else {
+            content.clone()
+        },
         "is_error": result.is_error
     })];
     if loaded {
-        blocks.extend(content);
+        match content {
+            serde_json::Value::String(text) => {
+                blocks.push(serde_json::json!({"type": "text", "text": text}));
+            }
+            serde_json::Value::Array(content) => blocks.extend(content),
+            _ => {}
+        }
     }
     blocks
+}
+
+fn tool_result_content(content: &[InputContent]) -> serde_json::Value {
+    if !content
+        .iter()
+        .any(|content| matches!(content, InputContent::Image(_)))
+    {
+        return serde_json::Value::String(
+            content
+                .iter()
+                .filter_map(|content| match content {
+                    InputContent::Text(text) => Some(text.text.as_str()),
+                    InputContent::Image(_) => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+
+    let mut blocks = content.iter().map(input_content).collect::<Vec<_>>();
+    if !blocks
+        .iter()
+        .any(|content| content.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+    {
+        blocks.insert(
+            0,
+            serde_json::json!({
+                "type": "text",
+                "text": "(see attached image)"
+            }),
+        );
+    }
+    serde_json::Value::Array(blocks)
 }
 
 fn apply_usage(usage: &mut Usage, update: AnthropicUsage) {

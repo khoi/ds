@@ -10,6 +10,13 @@ fn coerces_plain_schema_primitives() {
         (json!({"type": "number"}), json!(true), json!(1)),
         (json!({"type": "number"}), Value::Null, json!(0)),
         (json!({"type": "integer"}), json!("42"), json!(42)),
+        (json!({"type": "integer"}), json!("42.0"), json!(42)),
+        (json!({"type": "integer"}), json!("4e1"), json!(40)),
+        (
+            json!({"type": "integer"}),
+            json!("18446744073709551616"),
+            json!(18446744073709551616.0),
+        ),
         (json!({"type": "boolean"}), json!("true"), json!(true)),
         (json!({"type": "boolean"}), json!("false"), json!(false)),
         (json!({"type": "boolean"}), json!(1), json!(true)),
@@ -128,6 +135,26 @@ fn coerces_nested_unions_arrays_and_additional_properties() {
             "items": [true, false],
             "metadata": {"first": 1, "second": 0}
         })
+    );
+}
+
+#[test]
+fn preserves_valid_multibyte_and_emoji_strings() {
+    let tool = Tool::new(
+        "echo",
+        "Echo tool",
+        json!({
+            "type": "object",
+            "properties": {"message": {"type": "string"}},
+            "required": ["message"]
+        }),
+    );
+    let message = "🙈 👍 ❤️ 🤔 🚀 こんにちは 你好 ∑∫∂√";
+    let call = tool_call(json!({"message": message}));
+
+    assert_eq!(
+        validate_tool_arguments(&tool, &call).unwrap(),
+        json!({"message": message})
     );
 }
 

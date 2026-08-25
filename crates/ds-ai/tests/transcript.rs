@@ -6,7 +6,7 @@ use ds_ai::{
 };
 
 #[test]
-fn serializes_user_messages_with_pi_roles_and_content_shapes() {
+fn serializes_user_messages_with_wire_roles_and_content_shapes() {
     let text = UserMessage::new("Hello", 42);
     assert_eq!(
         serde_json::to_value(&text).unwrap(),
@@ -88,7 +88,7 @@ fn serializes_tool_results_with_optional_execution_data() {
 }
 
 #[test]
-fn serializes_complete_assistant_messages_with_pi_fields() {
+fn serializes_complete_assistant_messages_with_wire_fields() {
     let message = AssistantMessage {
         content: vec![
             AssistantContent::Text(TextContent {

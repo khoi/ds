@@ -110,6 +110,100 @@ async fn serializes_mutation_and_preserves_credentials_after_failure() {
 }
 
 #[tokio::test]
+async fn cancels_queued_mutation_without_running_it_later() {
+    let store = Arc::new(InMemoryCredentialStore::new());
+    let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+    let (finish_sender, finish_receiver) = tokio::sync::oneshot::channel();
+    let first_store = store.clone();
+    let first = tokio::spawn(async move {
+        first_store
+            .modify(
+                "openai",
+                Box::new(move |_| {
+                    Box::pin(async move {
+                        started_sender.send(()).unwrap();
+                        finish_receiver.await.unwrap();
+                        Ok(Some(api_key("first")))
+                    })
+                }),
+                &CancellationToken::new(),
+            )
+            .await
+    });
+    started_receiver.await.unwrap();
+
+    let cancellation = CancellationToken::new();
+    let second_ran = Arc::new(AtomicUsize::new(0));
+    let second_store = store.clone();
+    let second_ran_clone = second_ran.clone();
+    let second_cancellation = cancellation.clone();
+    let second = tokio::spawn(async move {
+        second_store
+            .modify(
+                "openai",
+                Box::new(move |_| {
+                    Box::pin(async move {
+                        second_ran_clone.fetch_add(1, Ordering::SeqCst);
+                        Ok(Some(api_key("second")))
+                    })
+                }),
+                &second_cancellation,
+            )
+            .await
+    });
+    cancellation.cancel();
+
+    assert!(matches!(second.await.unwrap(), Err(AuthError::Cancelled)));
+    finish_sender.send(()).unwrap();
+    assert!(first.await.unwrap().is_ok());
+    assert_eq!(second_ran.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store
+            .read("openai", &CancellationToken::new())
+            .await
+            .unwrap(),
+        Some(api_key("first"))
+    );
+}
+
+#[tokio::test]
+async fn cancels_a_mutation_before_committing_its_result() {
+    let store = InMemoryCredentialStore::new();
+    let cancellation = CancellationToken::new();
+    store
+        .modify(
+            "openai",
+            Box::new(|_| Box::pin(async { Ok(Some(api_key("initial"))) })),
+            &cancellation,
+        )
+        .await
+        .unwrap();
+
+    let mutation_cancellation = cancellation.clone();
+    let result = store
+        .modify(
+            "openai",
+            Box::new(move |_| {
+                Box::pin(async move {
+                    mutation_cancellation.cancel();
+                    Ok(Some(api_key("next")))
+                })
+            }),
+            &cancellation,
+        )
+        .await;
+
+    assert!(matches!(result, Err(AuthError::Cancelled)));
+    assert_eq!(
+        store
+            .read("openai", &CancellationToken::new())
+            .await
+            .unwrap(),
+        Some(api_key("initial"))
+    );
+}
+
+#[tokio::test]
 async fn resolves_stored_keys_before_ambient_keys() {
     let auth = EnvApiKeyAuth::new("API key", ["TEST_API_KEY"]);
     let context = TestContext(BTreeMap::from([("TEST_API_KEY".into(), "ambient".into())]));
@@ -130,6 +224,39 @@ async fn resolves_stored_keys_before_ambient_keys() {
         .unwrap();
     assert_eq!(ambient.auth.api_key.as_deref(), Some("ambient"));
     assert_eq!(ambient.source.as_deref(), Some("TEST_API_KEY"));
+}
+
+#[tokio::test]
+async fn distinguishes_empty_and_whitespace_api_keys() {
+    let auth = EnvApiKeyAuth::new("API key", ["TEST_API_KEY"]);
+    let empty = TestContext(BTreeMap::from([("TEST_API_KEY".into(), "".into())]));
+    let cancellation = CancellationToken::new();
+
+    assert_eq!(
+        auth.resolve(&empty, Some(&api_key("")), &cancellation)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        auth.resolve(&empty, None, &cancellation).await.unwrap(),
+        None
+    );
+
+    let stored = auth
+        .resolve(&empty, Some(&api_key("   ")), &cancellation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.auth.api_key.as_deref(), Some("   "));
+
+    let whitespace = TestContext(BTreeMap::from([("TEST_API_KEY".into(), "   ".into())]));
+    let ambient = auth
+        .resolve(&whitespace, None, &cancellation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ambient.auth.api_key.as_deref(), Some("   "));
 }
 
 fn api_key(key: &str) -> Credential {

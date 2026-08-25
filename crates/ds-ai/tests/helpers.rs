@@ -1,15 +1,24 @@
+use crate::support::{Reply, serve};
 use async_trait::async_trait;
 use ds_ai::{
-    Api, AssistantContent, AssistantMessage, AssistantToolCall, Context, InputContent, Message,
-    Model, ModelCost, ModelInput, ProviderId, RetryCallbacks, RetryPolicy, StopReason, TextContent,
-    ThinkingContent, Tool, ToolResultMessage, Usage, calculate_context_tokens,
-    clamp_max_tokens_to_context, content_text, content_text_with_separator,
-    estimate_context_tokens, estimate_message_tokens, is_context_overflow, is_recoverable_length,
-    is_retryable_assistant_error, retry_assistant_call,
+    Api, AssistantContent, AssistantMessage, AssistantMessageEvent, AssistantToolCall, Context,
+    InputContent, Message, Model, ModelCost, ModelInput, OpenAiResponsesOptions, ProviderId,
+    RetryCallbacks, RetryPolicy, StopReason, StreamOptions, TextContent, ThinkingContent, Tool,
+    ToolResultMessage, Usage, calculate_context_tokens, clamp_max_tokens_to_context, content_text,
+    content_text_with_separator, estimate_context_tokens, estimate_message_tokens,
+    is_context_overflow, is_recoverable_length, is_retryable_assistant_error, openai,
+    retry_assistant_call,
 };
+use futures_util::StreamExt;
 use serde_json::json;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    sync::Notify,
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 #[test]
@@ -126,18 +135,38 @@ fn detects_context_overflow_and_recoverable_length() {
         "Service unavailable: The service is temporarily unavailable.",
         "Rate limit exceeded, please retry after 30 seconds.",
         "Too many requests. Please slow down.",
+        "HTTP 429: request throttled",
     ] {
         assert!(!is_context_overflow(
             &assistant(1, StopReason::Error, Some(message), 0),
             Some(200_000)
         ));
     }
+    assert!(is_context_overflow(
+        &assistant(
+            1,
+            StopReason::Error,
+            Some("provider returned HTTP 429: Too many tokens, please slow down."),
+            0
+        ),
+        Some(200_000)
+    ));
 
     let mut filled = assistant(1, StopReason::Length, None, 0);
     filled.usage.input = 58;
     filled.usage.cache_read = 1_048_512;
     assert!(is_context_overflow(&filled, Some(1_048_576)));
     assert!(is_recoverable_length(&filled, 128_000));
+
+    let zero_output = assistant(1, StopReason::Length, None, 100);
+    assert!(is_recoverable_length(&zero_output, 128_000));
+
+    let mut normal_length = assistant(1, StopReason::Length, None, 1_000);
+    normal_length.usage.output = 4_096;
+    assert!(!is_context_overflow(&normal_length, Some(200_000)));
+
+    let far_below_context = assistant(1, StopReason::Length, None, 100);
+    assert!(!is_context_overflow(&far_below_context, Some(200_000)));
 
     let mut reached = assistant(1, StopReason::Length, None, 0);
     reached.usage.output = 1_024;
@@ -155,6 +184,7 @@ fn classifies_retryable_assistant_errors() {
         "getaddrinfo ENOTFOUND example.invalid",
         "EAI_AGAIN example.invalid",
         "stream ended before a terminal response event",
+        "provider stream ended before a terminal event",
         "overloaded_error",
         "524 status code (no body)",
     ] {
@@ -179,6 +209,152 @@ fn classifies_retryable_assistant_errors() {
         None,
         0
     )));
+}
+
+#[tokio::test]
+async fn preserves_structured_provider_error_fields() {
+    let server = serve([Reply::json(
+        403,
+        json!({
+            "error": {
+                "message": "Provider returned error",
+                "code": 403,
+                "metadata": {"raw": "upstream WAF blocked policy XYZ"}
+            }
+        }),
+    )])
+    .await;
+    let mut provider_model = model();
+    provider_model.base_url = server.base_url.clone();
+    let options = OpenAiResponsesOptions {
+        stream: StreamOptions {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let events = openai::stream(
+        &provider_model,
+        &Context::new([Message::user("Hello")]),
+        &options,
+    )
+    .collect::<Vec<_>>()
+    .await;
+    let Some(AssistantMessageEvent::Error { error, .. }) = events.last() else {
+        panic!("stream did not fail");
+    };
+    let message = error.error_message.as_deref().unwrap();
+    assert!(message.contains("\"code\":403"));
+    assert!(message.contains("upstream WAF blocked policy XYZ"));
+    assert_eq!(
+        message.matches("upstream WAF blocked policy XYZ").count(),
+        1
+    );
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn preserves_nested_provider_codes_and_metadata_once() {
+    let server = serve([
+        Reply::json(
+            400,
+            json!({
+                "error": {
+                    "code": "rate_limit_exceeded",
+                    "message": "slow down",
+                    "metadata": {"raw": "upstream WAF blocked policy XYZ"}
+                }
+            }),
+        ),
+        Reply::json(400, json!({"error": {"message": "slow down"}})),
+        Reply::json(403, json!({"error": {}})),
+        Reply::json(429, json!({"message": "Too many requests"})),
+    ])
+    .await;
+    let mut provider_model = model();
+    provider_model.base_url = server.base_url.clone();
+    let options = OpenAiResponsesOptions {
+        stream: StreamOptions {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let context = Context::new([Message::user("Hello")]);
+
+    let structured = openai::stream(&provider_model, &context, &options)
+        .collect::<Vec<_>>()
+        .await;
+    let Some(AssistantMessageEvent::Error { error, .. }) = structured.last() else {
+        panic!("stream did not fail");
+    };
+    let structured_message = error.error_message.as_deref().unwrap();
+    assert_eq!(
+        structured_message,
+        r#"OpenAI API error (400): {"code":"rate_limit_exceeded","message":"slow down","metadata":{"raw":"upstream WAF blocked policy XYZ"}}"#
+    );
+
+    let simple = openai::stream(&provider_model, &context, &options)
+        .collect::<Vec<_>>()
+        .await;
+    let Some(AssistantMessageEvent::Error { error, .. }) = simple.last() else {
+        panic!("stream did not fail");
+    };
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some(r#"OpenAI API error (400): {"message":"slow down"}"#)
+    );
+
+    let empty_inner = openai::stream(&provider_model, &context, &options)
+        .collect::<Vec<_>>()
+        .await;
+    let Some(AssistantMessageEvent::Error { error, .. }) = empty_inner.last() else {
+        panic!("stream did not fail");
+    };
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("OpenAI API error (403): 403 {}")
+    );
+
+    let top_level = openai::stream(&provider_model, &context, &options)
+        .collect::<Vec<_>>()
+        .await;
+    let Some(AssistantMessageEvent::Error { error, .. }) = top_level.last() else {
+        panic!("stream did not fail");
+    };
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("OpenAI API error (429): 429 status code (no body)")
+    );
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn rejects_a_provider_error_body_read_failure() {
+    let (base_url, server) = serve_truncated_error().await;
+    let mut provider_model = model();
+    provider_model.base_url = base_url;
+    let options = OpenAiResponsesOptions {
+        stream: StreamOptions {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let events = openai::stream(
+        &provider_model,
+        &Context::new([Message::user("Hello")]),
+        &options,
+    )
+    .collect::<Vec<_>>()
+    .await;
+    let Some(AssistantMessageEvent::Error { error, .. }) = events.last() else {
+        panic!("stream did not fail");
+    };
+    let message = error.error_message.as_deref().unwrap();
+    assert!(message.starts_with("HTTP request failed:"));
+    assert!(!message.contains("partial"));
+    server.await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -256,8 +432,12 @@ async fn skips_retry_for_success_abort_disabled_and_terminal_errors() {
 #[tokio::test(start_paused = true)]
 async fn exhausts_retries_and_aborts_a_retry_wait() {
     let callbacks = RecordingCallbacks::default();
+    let calls = Mutex::new(0);
     let exhausted = retry_assistant_call(
-        || async { assistant(1, StopReason::Error, Some("terminated"), 0) },
+        || async {
+            *calls.lock().unwrap() += 1;
+            assistant(1, StopReason::Error, Some("terminated"), 0)
+        },
         Some(&RetryPolicy {
             enabled: true,
             max_retries: 2,
@@ -268,6 +448,7 @@ async fn exhausts_retries_and_aborts_a_retry_wait() {
     )
     .await;
     assert_eq!(exhausted.stop_reason, StopReason::Error);
+    assert_eq!(*calls.lock().unwrap(), 3);
     assert!(
         callbacks
             .events
@@ -293,9 +474,129 @@ async fn exhausts_retries_and_aborts_a_retry_wait() {
     assert_eq!(aborted.error_message, None);
 }
 
+#[tokio::test]
+async fn aborts_an_active_retry_backoff_without_a_second_call() {
+    let cancellation = CancellationToken::new();
+    let scheduled = Arc::new(Notify::new());
+    let callbacks = Arc::new(CancelOnSchedule {
+        scheduled: scheduled.clone(),
+    });
+    let calls = Arc::new(Mutex::new(0));
+    let task_calls = calls.clone();
+    let task_cancellation = cancellation.clone();
+    let task_callbacks = callbacks.clone();
+    let task = tokio::spawn(async move {
+        retry_assistant_call(
+            || {
+                let calls = task_calls.clone();
+                async move {
+                    *calls.lock().unwrap() += 1;
+                    assistant(1, StopReason::Error, Some("terminated"), 0)
+                }
+            },
+            Some(&RetryPolicy {
+                enabled: true,
+                max_retries: 5,
+                base_delay: Duration::from_secs(60),
+            }),
+            Some(&task_cancellation),
+            Some(task_callbacks.as_ref()),
+        )
+        .await
+    });
+
+    scheduled.notified().await;
+    cancellation.cancel();
+    let response = task.await.unwrap();
+
+    assert_eq!(response.stop_reason, StopReason::Aborted);
+    assert_eq!(response.error_message, None);
+    assert_eq!(*calls.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn does_not_retry_with_a_pre_cancelled_zero_delay() {
+    for _ in 0..16 {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let calls = Mutex::new(0);
+        let response = retry_assistant_call(
+            || async {
+                *calls.lock().unwrap() += 1;
+                assistant(1, StopReason::Error, Some("terminated"), 0)
+            },
+            Some(&RetryPolicy {
+                enabled: true,
+                max_retries: 1,
+                base_delay: Duration::ZERO,
+            }),
+            Some(&cancellation),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.stop_reason, StopReason::Aborted);
+        assert_eq!(response.error_message, None);
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+}
+
+#[tokio::test]
+async fn reports_a_transient_then_aborted_retry_as_unsuccessful() {
+    let calls = Mutex::new(0);
+    let callbacks = RecordingCallbacks::default();
+    let response = retry_assistant_call(
+        || async {
+            let mut calls = calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                assistant(1, StopReason::Error, Some("terminated"), 0)
+            } else {
+                assistant(1, StopReason::Aborted, None, 0)
+            }
+        },
+        Some(&RetryPolicy {
+            enabled: true,
+            max_retries: 1,
+            base_delay: Duration::ZERO,
+        }),
+        None,
+        Some(&callbacks),
+    )
+    .await;
+
+    assert_eq!(response.stop_reason, StopReason::Aborted);
+    assert_eq!(*calls.lock().unwrap(), 2);
+    assert_eq!(
+        callbacks.events.lock().unwrap().as_slice(),
+        [
+            "scheduled:1:1:0:terminated",
+            "start",
+            "finished:false:1:none"
+        ]
+    );
+}
+
 #[derive(Default)]
 struct RecordingCallbacks {
     events: Mutex<Vec<String>>,
+}
+
+struct CancelOnSchedule {
+    scheduled: Arc<Notify>,
+}
+
+#[async_trait]
+impl RetryCallbacks for CancelOnSchedule {
+    async fn on_retry_scheduled(
+        &self,
+        _attempt: usize,
+        _max_attempts: usize,
+        _delay: Duration,
+        _error_message: &str,
+    ) {
+        self.scheduled.notify_one();
+    }
 }
 
 #[async_trait]
@@ -376,4 +677,28 @@ fn assistant(
         end_turn: None,
         timestamp,
     }
+}
+
+async fn serve_truncated_error() -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0; 1024];
+            let count = socket.read(&mut chunk).await.unwrap();
+            request.extend_from_slice(&chunk[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 100\r\nconnection: close\r\n\r\n{\"message\":\"partial",
+            )
+            .await
+            .unwrap();
+    });
+    (format!("http://{address}"), server)
 }

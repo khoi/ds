@@ -77,6 +77,40 @@ async fn loads_an_anthropic_tool_at_its_result_marker() {
 }
 
 #[tokio::test]
+async fn ignores_a_deferred_marker_for_a_missing_tool() {
+    let payload = capture_anthropic(
+        model("anthropic", "claude-opus-4-6"),
+        context([tool("base_tool")]),
+    )
+    .await;
+
+    assert_eq!(payload["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["tools"][0]["name"], "base_tool");
+    assert_no_anthropic_tool_reference(&payload);
+}
+
+#[tokio::test]
+async fn loads_a_deferred_tool_after_an_openai_handoff() {
+    let mut context = context([tool("base_tool"), tool("late_tool")]);
+    let Message::Assistant(message) = &mut context.messages[1] else {
+        panic!("expected assistant message");
+    };
+    message.api = Api::OpenAiResponses;
+    message.provider = ProviderId::new("openai");
+    message.model = "gpt-5.4".into();
+
+    let payload = capture_anthropic(model("anthropic", "claude-opus-4-8"), context).await;
+
+    assert_eq!(payload["tools"][0]["name"], "base_tool");
+    assert_eq!(payload["tools"][1]["name"], "late_tool");
+    assert_eq!(payload["tools"][1]["defer_loading"], true);
+    assert_eq!(
+        anthropic_tool_result_blocks(&payload)[0]["content"][0],
+        json!({"type": "tool_reference", "tool_name": "late_tool"})
+    );
+}
+
+#[tokio::test]
 async fn keeps_a_previously_used_anthropic_tool_immediate() {
     let mut context = context([tool("base_tool"), tool("late_tool")]);
     let Message::Assistant(message) = &mut context.messages[1] else {
@@ -98,13 +132,112 @@ async fn keeps_a_previously_used_anthropic_tool_immediate() {
             .iter()
             .all(|tool| tool.get("defer_loading").is_none())
     );
-    assert!(
+    assert_no_anthropic_tool_reference(&payload);
+}
+
+#[tokio::test]
+async fn normalizes_oauth_tool_names_before_deferred_placement() {
+    let mut context = context([tool("base_tool"), tool("read")]);
+    let Message::Assistant(message) = &mut context.messages[1] else {
+        panic!("expected assistant message");
+    };
+    let AssistantContent::ToolCall(call) = &mut message.content[0] else {
+        panic!("expected tool call");
+    };
+    call.name = "Read".into();
+    let payload = capture_anthropic_with_key(
+        model("anthropic", "claude-opus-4-6"),
+        context,
+        "sk-ant-oat-fake",
+    )
+    .await;
+
+    assert_eq!(payload["tools"][1]["name"], "Read");
+    assert!(payload["tools"][1].get("defer_loading").is_none());
+    assert_no_anthropic_tool_reference(&payload);
+}
+
+#[tokio::test]
+async fn matches_oauth_canonicalized_deferred_markers() {
+    let payload = capture_anthropic_with_key(
+        model("anthropic", "claude-opus-4-6"),
+        context_with_marker([tool("base_tool"), tool("read")], ["Read".into()]),
+        "sk-ant-oat-fake",
+    )
+    .await;
+
+    assert_eq!(payload["tools"][1]["name"], "Read");
+    assert_eq!(payload["tools"][1]["defer_loading"], true);
+    assert_eq!(
         anthropic_tool_result_blocks(&payload)[0]["content"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|block| block["type"] != "tool_reference")
+            .find(|block| block["type"] == "tool_reference")
+            .unwrap()["tool_name"],
+        "Read"
     );
+}
+
+#[tokio::test]
+async fn deduplicates_tools_after_oauth_canonicalization() {
+    let payload = capture_anthropic_with_key(
+        model("anthropic", "claude-opus-4-6"),
+        Context::new([Message::user("Hello")]).with_tools([
+            tool("read"),
+            Tool::new(
+                "Read",
+                "Canonical definition",
+                json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"]
+                }),
+            ),
+        ]),
+        "sk-ant-oat-fake",
+    )
+    .await;
+
+    assert_eq!(payload["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["tools"][0]["name"], "Read");
+    assert_eq!(payload["tools"][0]["description"], "Canonical definition");
+}
+
+#[tokio::test]
+async fn uses_the_explicit_anthropic_tool_reference_capability_override() {
+    let mut model = model("anthropic", "claude-haiku-4-5");
+    model.compat = Some(ModelCompatibility::Anthropic(
+        ds_ai::AnthropicMessagesCompatibility {
+            supports_tool_references: Some(true),
+            ..Default::default()
+        },
+    ));
+    let payload = capture_anthropic(model, context([tool("base_tool"), tool("late_tool")])).await;
+
+    assert_eq!(payload["tools"][1]["defer_loading"], true);
+}
+
+#[tokio::test]
+async fn uses_normal_anthropic_tools_when_references_are_unsupported() {
+    let mut model = model("anthropic", "claude-opus-4-6");
+    model.compat = Some(ModelCompatibility::Anthropic(
+        ds_ai::AnthropicMessagesCompatibility {
+            supports_tool_references: Some(false),
+            ..Default::default()
+        },
+    ));
+    let payload = capture_anthropic(model, context([tool("base_tool"), tool("late_tool")])).await;
+
+    assert_eq!(tool_names(&payload), ["base_tool", "late_tool"]);
+    assert!(
+        payload["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool.get("defer_loading").is_none())
+    );
+    assert_no_anthropic_tool_reference(&payload);
 }
 
 #[tokio::test]
@@ -118,13 +251,7 @@ async fn keeps_one_anthropic_tool_immediate_when_all_are_marked() {
     assert_eq!(payload["tools"].as_array().unwrap().len(), 1);
     assert_eq!(payload["tools"][0]["name"], "late_tool");
     assert!(payload["tools"][0].get("defer_loading").is_none());
-    assert!(
-        anthropic_tool_result_blocks(&payload)[0]["content"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|block| block["type"] != "tool_reference")
-    );
+    assert_no_anthropic_tool_reference(&payload);
 }
 
 #[tokio::test]
@@ -144,11 +271,60 @@ async fn selects_each_codex_tool_placement_mode() {
 }
 
 #[tokio::test]
+async fn preserves_the_additional_tools_marker_after_loading_a_tool() {
+    let mut context = context([tool("base_tool"), tool("late_tool")]);
+    let Message::Assistant(message) = &context.messages[1] else {
+        panic!("expected assistant message");
+    };
+    let mut late_call = (**message).clone();
+    late_call.api = Api::OpenAiResponses;
+    late_call.provider = ProviderId::new("openai");
+    late_call.model = "gpt-5.4".into();
+    late_call.content = vec![AssistantContent::ToolCall(AssistantToolCall {
+        id: "call_late|fc_late".into(),
+        name: "late_tool".into(),
+        arguments: json!({"value": "late"}),
+        thought_signature: None,
+        namespace: None,
+    })];
+    let mut late_result = ToolResultMessage::new(
+        "call_late|fc_late",
+        "late_tool",
+        [InputContent::text("done")],
+    );
+    late_result.added_tool_names = Some(vec!["late_tool".into()]);
+    context.messages.splice(
+        3..3,
+        [
+            Message::assistant(late_call),
+            Message::tool_result(late_result),
+        ],
+    );
+
+    let payload = capture_openai(model("openai", "gpt-5.4"), context).await;
+    let inputs = payload["input"].as_array().unwrap();
+    let markers = inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| (item["type"] == "additional_tools").then_some(index))
+        .collect::<Vec<_>>();
+    let late_call_index = inputs
+        .iter()
+        .position(|item| item["type"] == "function_call" && item["name"] == "late_tool")
+        .unwrap();
+
+    assert_eq!(markers.len(), 1);
+    assert!(markers[0] < late_call_index);
+    assert_eq!(tool_names(&payload), ["base_tool"]);
+}
+
+#[tokio::test]
 async fn drops_foreign_tool_identity_with_the_same_model_id() {
     let target = model("openai", "gpt-5.4");
+    let raw_id = "call_4VnzVawQXPB9MgYib7CiQFEY|I9b95oN1wD/cHXKTw3PpRkL6KkCtzTJhUxMouMWYwHeTo2j3htzfSk7YPx2vifiIM4g3A8XXyOj8q4Bt6SLUG7gqY1E3ELkrkVQNHglRfUmWj84lqxJY+Puieb3VKyX0FB+83TUzn91cDMF/4gzt990IzqVrc+nIb9RRscRD070Du16q1glydVjWR0SBJsE6TbY/esOjFpqplogQqrajm1eI++f3eLi73R6q7hVusY0QbeFySVxABCjhN0lXB04caBe1rzHjYzul6MAXj7uq+0r17VLq+yrtyYhN12wkmFqHeqTyEei6EFPbMy24Nc+IbJlkP0OCg02W+gOnyBFcbi2ctvJFSOhSjt1CqBdqCnnhwUqXjbWiT0wh3DmLScRgTHmGkaI+oAcQQjfic65nxj+TnEkReA==";
     let assistant = AssistantMessage {
         content: vec![AssistantContent::ToolCall(AssistantToolCall {
-            id: "call_1|fc_1".into(),
+            id: raw_id.into(),
             name: "lookup".into(),
             arguments: json!({"value": "hello"}),
             thought_signature: None,
@@ -170,7 +346,8 @@ async fn drops_foreign_tool_identity_with_the_same_model_id() {
     let payload = capture_openai(target, Context::new([Message::assistant(assistant)])).await;
     let call = item(&payload, "function_call");
 
-    assert!(call["id"].as_str().is_some_and(|id| id.starts_with("fc_")));
+    assert_eq!(call["id"], "fc_ifd2c719fz6a9");
+    assert!(call["id"].as_str().unwrap().len() <= 64);
     assert!(call.get("namespace").is_none());
 }
 
@@ -187,6 +364,13 @@ fn tool(name: &str) -> Tool {
 }
 
 fn context(tools: impl IntoIterator<Item = Tool>) -> Context {
+    context_with_marker(tools, ["late_tool".into()])
+}
+
+fn context_with_marker(
+    tools: impl IntoIterator<Item = Tool>,
+    added_tool_names: impl IntoIterator<Item = String>,
+) -> Context {
     let assistant = AssistantMessage {
         content: vec![AssistantContent::ToolCall(AssistantToolCall {
             id: "call_1".into(),
@@ -209,7 +393,7 @@ fn context(tools: impl IntoIterator<Item = Tool>) -> Context {
         timestamp: 2,
     };
     let mut result = ToolResultMessage::new("call_1", "base_tool", [InputContent::text("done")]);
-    result.added_tool_names = Some(vec!["late_tool".into()]);
+    result.added_tool_names = Some(added_tool_names.into_iter().collect());
     result.timestamp = 3;
     Context::new([
         Message::user("Hello"),
@@ -246,7 +430,11 @@ async fn capture_openai(mut model: Model, context: Context) -> Value {
     request_json(&server.requests().await[0])
 }
 
-async fn capture_anthropic(mut model: Model, context: Context) -> Value {
+async fn capture_anthropic(model: Model, context: Context) -> Value {
+    capture_anthropic_with_key(model, context, "test-key").await
+}
+
+async fn capture_anthropic_with_key(mut model: Model, context: Context, api_key: &str) -> Value {
     let server = serve([Reply::sse(anthropic_done())]).await;
     model.base_url = server.base_url.clone();
     let provider = ds_ai::anthropic::Provider::new([model.clone()]);
@@ -256,7 +444,7 @@ async fn capture_anthropic(mut model: Model, context: Context) -> Value {
             &context,
             &ApiStreamOptions::AnthropicMessages(AnthropicOptions {
                 stream: StreamOptions {
-                    api_key: Some("test-key".into()),
+                    api_key: Some(api_key.into()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -333,6 +521,15 @@ fn anthropic_tool_result_blocks(payload: &Value) -> &[Value] {
                 .filter(|content| content.iter().any(|block| block["type"] == "tool_result"))
         })
         .unwrap()
+}
+
+fn assert_no_anthropic_tool_reference(payload: &Value) {
+    let content = &anthropic_tool_result_blocks(payload)[0]["content"];
+    assert!(content.as_array().is_none_or(|content| {
+        content
+            .iter()
+            .all(|block| block["type"] != "tool_reference")
+    }));
 }
 
 fn openai_done() -> &'static str {

@@ -254,6 +254,21 @@ fn coerce_primitive(value: &Value, kind: &str) -> Option<Value> {
                 .parse::<i64>()
                 .ok()
                 .map(Number::from)
+                .or_else(|| value.parse::<u64>().ok().map(Number::from))
+                .or_else(|| {
+                    value
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|value| value.is_finite() && value.fract() == 0.0)
+                        .and_then(|value| {
+                            if (-9_007_199_254_740_991.0..=9_007_199_254_740_991.0).contains(&value)
+                            {
+                                Some(Number::from(value as i64))
+                            } else {
+                                Number::from_f64(value)
+                            }
+                        })
+                })
                 .map(Value::Number),
             Value::Bool(value) => Some(Value::Number(Number::from(u8::from(*value)))),
             _ => None,

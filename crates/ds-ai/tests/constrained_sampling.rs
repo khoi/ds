@@ -31,16 +31,22 @@ async fn encodes_streams_and_replays_openai_constrained_tools() {
     });
 
     let mut stream = provider.stream(&model, &context, &options);
-    let mut deltas = String::new();
+    let mut deltas = Vec::new();
     while let Some(event) = stream.next().await {
         if let ds_ai::AssistantMessageEvent::ToolCallDelta { delta, .. } = event {
-            deltas.push_str(&delta);
+            deltas.push(delta);
         }
     }
     let message = stream.result().await.unwrap();
+    let delta_json = deltas.iter().map(String::as_str).collect::<String>();
     assert_eq!(
-        serde_json::from_str::<Value>(&deltas).unwrap(),
+        serde_json::from_str::<Value>(&delta_json).unwrap(),
         json!({"payload": "a\"\nb"})
+    );
+    assert_eq!(deltas.len(), 2);
+    assert_eq!(
+        deltas,
+        vec![String::from(r#"{"payload":"a\""#), String::from(r#"\nb"}"#),]
     );
     let AssistantContent::ToolCall(call) = &message.content[0] else {
         panic!("expected tool call");
@@ -169,6 +175,270 @@ async fn falls_back_from_preferred_strict_sampling_without_mutating_the_tool() {
 }
 
 #[tokio::test]
+async fn normalizes_nested_optional_properties_for_strict_sampling() {
+    let server = serve([Reply::sse(openai_done())]).await;
+    let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    model.base_url = server.base_url.clone();
+    model.compat = Some(ModelCompatibility::OpenAi(OpenAiResponsesCompatibility {
+        supports_strict_mode: Some(true),
+        ..Default::default()
+    }));
+    let tool = Tool {
+        name: "nested".into(),
+        description: "Nested".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "metadata": {
+                    "type": "object",
+                    "properties": {"enabled": {"type": "boolean"}}
+                },
+                "nullable": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+            },
+            "required": ["path", "metadata"]
+        }),
+        constrained_sampling: Some(ConstrainedSampling::JsonSchema {
+            strict: ConstrainedSamplingStrictness::Prefer,
+        }),
+    };
+    let original = tool.parameters.clone();
+    let provider = ds_ai::openai::Provider::new([model.clone()]);
+
+    provider
+        .stream(
+            &model,
+            &Context::new([Message::user("Use the nested tool")]).with_tools([tool.clone()]),
+            &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .result()
+        .await
+        .unwrap();
+
+    let payload = request_json(&server.requests().await[0]);
+    assert_eq!(
+        payload["tools"][0]["parameters"],
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "metadata": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}
+                    },
+                    "required": ["enabled"],
+                    "additionalProperties": false
+                },
+                "nullable": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+            },
+            "required": ["path", "metadata", "nullable"],
+            "additionalProperties": false
+        })
+    );
+    assert_eq!(tool.parameters, original);
+}
+
+#[tokio::test]
+async fn orders_strict_required_names_like_properties() {
+    let server = serve([Reply::sse(openai_done())]).await;
+    let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    model.base_url = server.base_url.clone();
+    model.compat = Some(ModelCompatibility::OpenAi(OpenAiResponsesCompatibility {
+        supports_strict_mode: Some(true),
+        ..Default::default()
+    }));
+    let provider = ds_ai::openai::Provider::new([model.clone()]);
+    let tool = Tool::new(
+        "ordered",
+        "Ordered",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "offset": {"type": "number"},
+                "metadata": {"type": "string"},
+                "nullable": {"type": "string"}
+            },
+            "required": ["path", "metadata"]
+        }),
+    )
+    .with_strict();
+
+    provider
+        .stream(
+            &model,
+            &Context::new([Message::user("Use the tool")]).with_tools([tool]),
+            &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .result()
+        .await
+        .unwrap();
+
+    let payload = request_json(&server.requests().await[0]);
+    assert_eq!(
+        payload["tools"][0]["parameters"]["required"],
+        json!(["path", "offset", "metadata", "nullable"])
+    );
+}
+
+#[tokio::test]
+async fn keeps_bare_strict_object_schemas_without_properties() {
+    let server = serve([Reply::sse(openai_done())]).await;
+    let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    model.base_url = server.base_url.clone();
+    model.compat = Some(ModelCompatibility::OpenAi(OpenAiResponsesCompatibility {
+        supports_strict_mode: Some(true),
+        ..Default::default()
+    }));
+    let provider = ds_ai::openai::Provider::new([model.clone()]);
+    let tool = Tool::new("bare", "Bare", json!({"type": "object"})).with_strict();
+
+    provider
+        .stream(
+            &model,
+            &Context::new([Message::user("Use the tool")]).with_tools([tool]),
+            &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .result()
+        .await
+        .unwrap();
+
+    let payload = request_json(&server.requests().await[0]);
+    assert_eq!(
+        payload["tools"][0]["parameters"],
+        json!({
+            "type": "object",
+            "required": [],
+            "additionalProperties": false
+        })
+    );
+}
+
+#[tokio::test]
+async fn falls_back_or_rejects_each_unsupported_strict_schema() {
+    let schemas = [
+        json!({
+            "type": "object",
+            "properties": {
+                "metadata": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"}
+                }
+            }
+        }),
+        json!({
+            "type": "object",
+            "allOf": [
+                {"type": "object", "properties": {"a": {"type": "string"}}},
+                {"type": "object", "properties": {"b": {"type": "number"}}}
+            ]
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "value": {"anyOf": [{"type": "object", "properties": {}}, {"type": "null"}]}
+            }
+        }),
+        json!({
+            "type": "object",
+            "properties": {"child": {"$ref": "https://example.com/child.json"}},
+            "required": ["child"]
+        }),
+    ];
+    let server = serve((0..schemas.len()).map(|_| Reply::sse(openai_done()))).await;
+    let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    model.base_url = server.base_url.clone();
+    model.compat = Some(ModelCompatibility::OpenAi(OpenAiResponsesCompatibility {
+        supports_strict_mode: Some(true),
+        ..Default::default()
+    }));
+    let provider = ds_ai::openai::Provider::new([model.clone()]);
+
+    for (index, parameters) in schemas.iter().enumerate() {
+        let tool = Tool {
+            name: format!("fallback_{index}"),
+            description: "Fallback".into(),
+            parameters: parameters.clone(),
+            constrained_sampling: Some(ConstrainedSampling::JsonSchema {
+                strict: ConstrainedSamplingStrictness::Prefer,
+            }),
+        };
+        provider
+            .stream(
+                &model,
+                &Context::new([Message::user("Use the tool")]).with_tools([tool]),
+                &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+                    stream: StreamOptions {
+                        api_key: Some("test-key".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            )
+            .result()
+            .await
+            .unwrap();
+    }
+    let requests = server.requests().await;
+    for (parameters, request) in schemas.iter().zip(requests.iter()) {
+        let payload = request_json(request);
+        assert_eq!(payload["tools"][0]["strict"], false);
+        assert_eq!(payload["tools"][0]["parameters"], *parameters);
+    }
+    for (index, parameters) in schemas.iter().enumerate() {
+        let tool = Tool {
+            name: format!("required_{index}"),
+            description: "Required".into(),
+            parameters: parameters.clone(),
+            constrained_sampling: Some(ConstrainedSampling::JsonSchema {
+                strict: ConstrainedSamplingStrictness::Require,
+            }),
+        };
+        let result = provider
+            .stream(
+                &model,
+                &Context::new([Message::user("Use the tool")]).with_tools([tool]),
+                &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+                    stream: StreamOptions {
+                        api_key: Some("test-key".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            )
+            .result()
+            .await
+            .unwrap();
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert!(
+            result
+                .error_message
+                .unwrap()
+                .contains("requires JSON-schema constrained sampling")
+        );
+    }
+}
+
+#[tokio::test]
 async fn rejects_supported_grammar_without_a_provider_variant() {
     let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
     model.compat = Some(ModelCompatibility::OpenAi(OpenAiResponsesCompatibility {
@@ -208,6 +478,99 @@ async fn rejects_supported_grammar_without_a_provider_variant() {
             .unwrap()
             .contains("no supported grammar variant was provided")
     );
+}
+
+#[tokio::test]
+async fn rejects_grammar_input_that_changes_after_close() {
+    let server = serve([Reply::sse(grammar_changed_after_close())]).await;
+    let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    model.base_url = server.base_url.clone();
+    model.compat = Some(ModelCompatibility::OpenAi(OpenAiResponsesCompatibility {
+        supports_open_ai_grammar_tools: Some(true),
+        ..Default::default()
+    }));
+    let provider = ds_ai::openai::Provider::new([model.clone()]);
+    let result = provider
+        .stream(
+            &model,
+            &Context::new([Message::user("Use the grammar tool")]).with_tools([Tool {
+                name: "grammar".into(),
+                description: "Grammar".into(),
+                parameters: schema(),
+                constrained_sampling: Some(ConstrainedSampling::Grammar {
+                    variants: GrammarVariants {
+                        openai_lark: Some("start: /[a-z]+/".into()),
+                        openai_regex: None,
+                    },
+                }),
+            }]),
+            &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .result()
+        .await
+        .unwrap();
+
+    assert_eq!(result.stop_reason, StopReason::Error);
+    assert!(
+        result
+            .error_message
+            .unwrap()
+            .contains("changed after it was closed")
+    );
+}
+
+#[tokio::test]
+async fn accepts_repeated_closed_grammar_input() {
+    let server = serve([Reply::sse(grammar_repeated_closed())]).await;
+    let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    model.base_url = server.base_url.clone();
+    model.compat = Some(ModelCompatibility::OpenAi(OpenAiResponsesCompatibility {
+        supports_open_ai_grammar_tools: Some(true),
+        ..Default::default()
+    }));
+    let provider = ds_ai::openai::Provider::new([model.clone()]);
+    let mut stream = provider.stream(
+        &model,
+        &Context::new([Message::user("Use the grammar tool")]).with_tools([Tool {
+            name: "grammar".into(),
+            description: "Grammar".into(),
+            parameters: schema(),
+            constrained_sampling: Some(ConstrainedSampling::Grammar {
+                variants: GrammarVariants {
+                    openai_lark: Some("start: /[a-z]+/".into()),
+                    openai_regex: None,
+                },
+            }),
+        }]),
+        &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+            stream: StreamOptions {
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+    );
+    let mut deltas = Vec::new();
+    while let Some(event) = stream.next().await {
+        if let ds_ai::AssistantMessageEvent::ToolCallDelta { delta, .. } = event {
+            deltas.push(delta);
+        }
+    }
+    let result = stream.result().await.unwrap();
+
+    assert_eq!(result.stop_reason, StopReason::ToolUse);
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas, vec![String::from(r#"{"payload":"abc"}"#)]);
+    let AssistantContent::ToolCall(call) = &result.content[0] else {
+        panic!("expected grammar tool call");
+    };
+    assert_eq!(call.arguments, json!({"payload": "abc"}));
 }
 
 #[tokio::test]
@@ -375,9 +738,29 @@ fn custom_tool_events() -> &'static str {
     concat!(
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"call_1\",\"id\":\"ctc_1\",\"name\":\"grammar\",\"input\":\"\"}}\n\n",
         "data: {\"type\":\"response.custom_tool_call_input.delta\",\"output_index\":0,\"delta\":\"a\\\"\"}\n\n",
+        "data: {\"type\":\"response.custom_tool_call_input.delta\",\"output_index\":0,\"delta\":\"\"}\n\n",
         "data: {\"type\":\"response.custom_tool_call_input.done\",\"output_index\":0,\"input\":\"a\\\"\\nb\"}\n\n",
         "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"call_1\",\"id\":\"ctc_1\",\"name\":\"grammar\",\"input\":\"a\\\"\\nb\"}}\n\n",
         "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{},\"output_tokens\":1,\"output_tokens_details\":{}}}}\n\n"
+    )
+}
+
+fn grammar_changed_after_close() -> &'static str {
+    concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"call_1\",\"id\":\"ctc_1\",\"name\":\"grammar\",\"input\":\"\"}}\n\n",
+        "data: {\"type\":\"response.custom_tool_call_input.delta\",\"output_index\":0,\"delta\":\"abc\"}\n\n",
+        "data: {\"type\":\"response.custom_tool_call_input.done\",\"output_index\":0,\"input\":\"abc\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"call_1\",\"id\":\"ctc_1\",\"name\":\"grammar\",\"input\":\"changed\"}}\n\n"
+    )
+}
+
+fn grammar_repeated_closed() -> &'static str {
+    concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"call_1\",\"id\":\"ctc_1\",\"name\":\"grammar\",\"input\":\"\"}}\n\n",
+        "data: {\"type\":\"response.custom_tool_call_input.done\",\"output_index\":0,\"input\":\"abc\"}\n\n",
+        "data: {\"type\":\"response.custom_tool_call_input.done\",\"output_index\":0,\"input\":\"abc\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"call_1\",\"id\":\"ctc_1\",\"name\":\"grammar\",\"input\":\"abc\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_3\",\"status\":\"completed\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n"
     )
 }
 

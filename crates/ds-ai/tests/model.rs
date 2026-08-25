@@ -32,7 +32,7 @@ fn model() -> Model {
 }
 
 #[test]
-fn serializes_api_as_pi_identifier() {
+fn serializes_api_as_wire_identifier() {
     assert_eq!(
         serde_json::to_string(&Api::OpenAiCodexResponses).unwrap(),
         r#""openai-codex-responses""#
@@ -44,7 +44,7 @@ fn serializes_api_as_pi_identifier() {
 }
 
 #[test]
-fn serializes_model_compatibility_with_pi_names() {
+fn serializes_model_compatibility_with_wire_names() {
     let mut model = model();
     model.compat = Some(ModelCompatibility::OpenAi(OpenAiResponsesCompatibility {
         session_affinity_format: Some(SessionAffinityFormat::OpenAiNoSession),
@@ -62,7 +62,7 @@ fn serializes_model_compatibility_with_pi_names() {
 }
 
 #[test]
-fn lists_and_clamps_thinking_levels_like_pi() {
+fn lists_and_clamps_supported_thinking_levels() {
     let mut model = model();
     assert_eq!(
         model.supported_thinking_levels(),
@@ -105,6 +105,31 @@ fn lists_and_clamps_thinking_levels_like_pi() {
     assert_eq!(
         model.clamp_thinking_level(ThinkingLevel::High),
         ThinkingLevel::Off
+    );
+}
+
+#[test]
+fn skips_a_missing_maximum_level_when_clamping() {
+    let mut model = model();
+    model.thinking_level_map.insert(ThinkingLevel::XHigh, None);
+    model
+        .thinking_level_map
+        .insert(ThinkingLevel::Max, Some("max".into()));
+
+    assert_eq!(
+        model.supported_thinking_levels(),
+        [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Max,
+        ]
+    );
+    assert_eq!(
+        model.clamp_thinking_level(ThinkingLevel::XHigh),
+        ThinkingLevel::Max
     );
 }
 

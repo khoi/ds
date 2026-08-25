@@ -1,11 +1,145 @@
 use crate::support::{Reply, serve};
 use async_trait::async_trait;
 use base64::prelude::*;
-use ds_ai::{AuthError, AuthEvent, AuthInteraction, AuthPrompt, Credential, ModelAuth, OAuthAuth};
+use ds_ai::{
+    AuthContext, AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthResolutionOverrides,
+    Credential, InMemoryCredentialStore, ModelAuth, Models, OAuthAuth,
+};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{collections::BTreeMap, net::SocketAddr, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+
+#[tokio::test]
+async fn preserves_whitespace_anthropic_api_key_login() {
+    let auth = ds_ai::anthropic::provider().auth().api_key.clone().unwrap();
+    let interaction = ApiKeyInteraction {
+        cancellation: CancellationToken::new(),
+        key: "   ".into(),
+        cancel_after_prompt: false,
+    };
+
+    assert_eq!(
+        auth.login(&interaction).await.unwrap(),
+        Credential::ApiKey {
+            key: Some("   ".into()),
+            env: BTreeMap::new(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn cancels_anthropic_api_key_login_after_prompt() {
+    let auth = ds_ai::anthropic::provider().auth().api_key.clone().unwrap();
+    let interaction = ApiKeyInteraction {
+        cancellation: CancellationToken::new(),
+        key: "api-key".into(),
+        cancel_after_prompt: true,
+    };
+
+    assert!(matches!(
+        auth.login(&interaction).await,
+        Err(AuthError::Cancelled)
+    ));
+}
+
+#[tokio::test]
+async fn ignores_empty_anthropic_api_keys() {
+    let auth = ds_ai::anthropic::provider().auth().api_key.clone().unwrap();
+    let context = StaticContext {
+        values: BTreeMap::from([
+            ("ANTHROPIC_AUTH_TOKEN".into(), "".into()),
+            ("ANTHROPIC_OAUTH_TOKEN".into(), "".into()),
+            ("ANTHROPIC_API_KEY".into(), "".into()),
+        ]),
+    };
+    let credential = Credential::ApiKey {
+        key: Some("".into()),
+        env: BTreeMap::new(),
+    };
+
+    assert_eq!(
+        auth.resolve(&context, Some(&credential), &CancellationToken::new())
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn cancels_anthropic_api_key_resolution_after_each_env_read() {
+    let auth = ds_ai::anthropic::provider().auth().api_key.clone().unwrap();
+
+    for name in [
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+    ] {
+        let cancellation = CancellationToken::new();
+        let context = CancelOnReadContext {
+            cancellation: cancellation.clone(),
+            cancel_on: name,
+        };
+
+        assert!(
+            matches!(
+                auth.resolve(&context, None, &cancellation).await,
+                Err(AuthError::Cancelled)
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resolves_anthropic_api_key_through_models() {
+    let context = StaticContext {
+        values: BTreeMap::from([(String::from("ANTHROPIC_API_KEY"), String::from("api-key"))]),
+    };
+    let mut models = Models::with_auth(Arc::new(InMemoryCredentialStore::new()), Arc::new(context));
+    models.set_provider(ds_ai::anthropic::provider());
+
+    let result = models
+        .auth("anthropic", Default::default())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(result.auth.api_key.as_deref(), Some("api-key"));
+    assert_eq!(result.source.as_deref(), Some("ANTHROPIC_API_KEY"));
+}
+
+#[tokio::test]
+async fn ignores_empty_anthropic_explicit_model_key() {
+    let context = StaticContext {
+        values: BTreeMap::from([
+            ("ANTHROPIC_AUTH_TOKEN".into(), "".into()),
+            ("ANTHROPIC_OAUTH_TOKEN".into(), "".into()),
+            ("ANTHROPIC_API_KEY".into(), "".into()),
+        ]),
+    };
+    let mut models = Models::with_auth(Arc::new(InMemoryCredentialStore::new()), Arc::new(context));
+    models.set_provider(ds_ai::anthropic::provider());
+
+    assert_eq!(
+        models
+            .auth(
+                "anthropic",
+                AuthResolutionOverrides {
+                    api_key: Some("".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        None
+    );
+}
 
 #[tokio::test]
 async fn exposes_anthropic_subscription_oauth() {
@@ -136,6 +270,105 @@ async fn cancels_anthropic_oauth_while_reading_the_token_body() {
 
     assert!(matches!(refresh.await.unwrap(), Err(AuthError::Cancelled)));
     server.requests().await;
+}
+
+#[tokio::test]
+async fn cancels_anthropic_login_and_cooperative_prompt() {
+    let interaction = Arc::new(CooperativeInteraction::default());
+    let oauth = ds_ai::anthropic::auth::OAuth::new()
+        .with_callback_address(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let cancellation = interaction.cancellation.clone();
+    let login_interaction = interaction.clone();
+    let login = tokio::spawn(async move { oauth.login(login_interaction.as_ref()).await });
+
+    interaction.prompt_started.notified().await;
+    cancellation.cancel();
+
+    assert!(matches!(login.await.unwrap(), Err(AuthError::Cancelled)));
+    assert!(
+        interaction
+            .prompt_cancellation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    );
+}
+
+#[tokio::test]
+async fn cancels_anthropic_login_with_a_non_cooperative_prompt() {
+    let interaction = Arc::new(NonCooperativeInteraction::default());
+    let oauth = ds_ai::anthropic::auth::OAuth::new()
+        .with_callback_address(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let cancellation = interaction.cancellation.clone();
+    let login_interaction = interaction.clone();
+    let login = tokio::spawn(async move { oauth.login(login_interaction.as_ref()).await });
+
+    interaction.prompt_started.notified().await;
+    cancellation.cancel();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), login)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(AuthError::Cancelled)));
+}
+
+struct ApiKeyInteraction {
+    cancellation: CancellationToken,
+    key: String,
+    cancel_after_prompt: bool,
+}
+
+#[async_trait]
+impl AuthInteraction for ApiKeyInteraction {
+    fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    async fn prompt(&self, prompt: AuthPrompt) -> Result<String, AuthError> {
+        assert!(matches!(prompt, AuthPrompt::Secret { .. }));
+        if self.cancel_after_prompt {
+            self.cancellation.cancel();
+        }
+        Ok(self.key.clone())
+    }
+
+    fn notify(&self, _event: AuthEvent) {}
+}
+
+struct StaticContext {
+    values: BTreeMap<String, String>,
+}
+
+#[async_trait]
+impl AuthContext for StaticContext {
+    async fn env(&self, name: &str) -> Option<String> {
+        self.values.get(name).cloned()
+    }
+
+    async fn file_exists(&self, _path: &str) -> bool {
+        false
+    }
+}
+
+struct CancelOnReadContext {
+    cancellation: CancellationToken,
+    cancel_on: &'static str,
+}
+
+#[async_trait]
+impl AuthContext for CancelOnReadContext {
+    async fn env(&self, name: &str) -> Option<String> {
+        if name == self.cancel_on {
+            self.cancellation.cancel();
+        }
+        None
+    }
+
+    async fn file_exists(&self, _path: &str) -> bool {
+        false
+    }
 }
 
 fn now_millis() -> u64 {
@@ -353,6 +586,55 @@ impl AuthInteraction for CallbackInteraction {
                 .unwrap();
         });
     }
+}
+
+#[derive(Default)]
+struct CooperativeInteraction {
+    cancellation: CancellationToken,
+    prompt_started: Notify,
+    prompt_cancellation: Mutex<Option<CancellationToken>>,
+}
+
+#[async_trait]
+impl AuthInteraction for CooperativeInteraction {
+    fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    async fn prompt(&self, prompt: AuthPrompt) -> Result<String, AuthError> {
+        let AuthPrompt::ManualCode { cancellation, .. } = prompt else {
+            return Err(AuthError::Authentication("unexpected prompt".into()));
+        };
+        *self.prompt_cancellation.lock().unwrap() = Some(cancellation.clone());
+        self.prompt_started.notify_one();
+        cancellation.cancelled().await;
+        Err(AuthError::Cancelled)
+    }
+
+    fn notify(&self, _event: AuthEvent) {}
+}
+
+#[derive(Default)]
+struct NonCooperativeInteraction {
+    cancellation: CancellationToken,
+    prompt_started: Notify,
+}
+
+#[async_trait]
+impl AuthInteraction for NonCooperativeInteraction {
+    fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
+    async fn prompt(&self, prompt: AuthPrompt) -> Result<String, AuthError> {
+        let AuthPrompt::ManualCode { .. } = prompt else {
+            return Err(AuthError::Authentication("unexpected prompt".into()));
+        };
+        self.prompt_started.notify_one();
+        std::future::pending().await
+    }
+
+    fn notify(&self, _event: AuthEvent) {}
 }
 
 fn query(url: &url::Url, name: &str) -> String {

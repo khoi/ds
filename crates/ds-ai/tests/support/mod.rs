@@ -105,9 +105,19 @@ impl Reply {
 
 pub(crate) struct Server {
     pub base_url: String,
-    requests: oneshot::Receiver<Vec<Vec<u8>>>,
+    requests: Option<oneshot::Receiver<Vec<Vec<u8>>>>,
     request_count: Arc<AtomicUsize>,
     request_notify: Arc<Notify>,
+    reply_count: Arc<AtomicUsize>,
+    _task: TaskGuard,
+}
+
+struct TaskGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl Server {
@@ -125,8 +135,18 @@ impl Server {
         }
     }
 
-    pub(crate) async fn requests(self) -> Vec<String> {
+    pub(crate) async fn wait_for_requests_paused(&self, count: usize) {
+        wait_for_count_paused(&self.request_count, count).await;
+    }
+
+    pub(crate) async fn wait_for_replies_paused(&self, count: usize) {
+        wait_for_count_paused(&self.reply_count, count).await;
+    }
+
+    pub(crate) async fn requests(mut self) -> Vec<String> {
         self.requests
+            .take()
+            .unwrap()
             .await
             .unwrap()
             .into_iter()
@@ -134,8 +154,14 @@ impl Server {
             .collect()
     }
 
-    pub(crate) async fn request_bytes(self) -> Vec<Vec<u8>> {
-        self.requests.await.unwrap()
+    pub(crate) async fn request_bytes(mut self) -> Vec<Vec<u8>> {
+        self.requests.take().unwrap().await.unwrap()
+    }
+}
+
+async fn wait_for_count_paused(count: &AtomicUsize, expected: usize) {
+    while count.load(Ordering::SeqCst) < expected {
+        tokio::task::yield_now().await;
     }
 }
 
@@ -146,10 +172,12 @@ pub(crate) async fn serve(replies: impl IntoIterator<Item = Reply>) -> Server {
     let (request_sender, request_receiver) = oneshot::channel();
     let request_count = Arc::new(AtomicUsize::new(0));
     let request_notify = Arc::new(Notify::new());
+    let reply_count = Arc::new(AtomicUsize::new(0));
     let task_request_count = request_count.clone();
     let task_request_notify = request_notify.clone();
+    let task_reply_count = reply_count.clone();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut requests = Vec::with_capacity(replies.len());
         for reply in replies {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -157,15 +185,19 @@ pub(crate) async fn serve(replies: impl IntoIterator<Item = Reply>) -> Server {
             task_request_count.fetch_add(1, Ordering::SeqCst);
             task_request_notify.notify_waiters();
             write_reply(&mut socket, reply).await;
+            drop(socket);
+            task_reply_count.fetch_add(1, Ordering::SeqCst);
         }
-        request_sender.send(requests).unwrap();
+        let _ = request_sender.send(requests);
     });
 
     Server {
         base_url: format!("http://{address}"),
-        requests: request_receiver,
+        requests: Some(request_receiver),
         request_count,
         request_notify,
+        reply_count,
+        _task: TaskGuard(task),
     }
 }
 

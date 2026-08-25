@@ -1,5 +1,5 @@
 use crate::{
-    CacheRetention, Context, Error,
+    CacheRetention, Context, Error, Response,
     deferred_tools::{DeferredToolsMode, ToolPlacement},
     http, openai, retry, transport,
 };
@@ -66,11 +66,14 @@ pub fn stream(
     let context = context.for_model(&requested_model);
     let options = options.clone();
     crate::provider_stream::adapt(requested_model.clone(), async move {
-        let stream_options = options.stream;
+        let mut stream_options = options.stream;
         let request_hooks = stream_options.request_hooks(&requested_model);
         let access_token = stream_options
             .api_key
-            .ok_or_else(|| Error::InvalidRequest("Codex access token is required".into()))?;
+            .take()
+            .filter(|access_token| !access_token.is_empty())
+            .ok_or_else(|| Error::MissingApiKey(requested_model.provider.clone()))?;
+        let headers = stream_options.request_headers(&requested_model).await?;
         let provider_model =
             Model::new(&requested_model.id).with_base_url(requested_model.base_url.clone());
         let mut provider_options =
@@ -79,7 +82,7 @@ pub fn stream(
                 .with_max_retries(stream_options.max_retries.unwrap_or_default())
                 .with_max_retry_delay(stream_options.max_retry_delay)
                 .with_cache_retention(stream_options.cache_retention)
-                .with_request_options(stream_options.headers, request_hooks);
+                .with_request_options(headers, request_hooks);
         let compat = match &requested_model.compat {
             Some(crate::ModelCompatibility::OpenAi(compat)) => compat.clone(),
             _ => Default::default(),
@@ -257,13 +260,15 @@ struct Continuation {
 
 struct WebSocketLease {
     key: Option<String>,
-    busy: Option<Arc<AtomicBool>>,
+    busy: Arc<StdMutex<Option<Arc<AtomicBool>>>>,
 }
 
 impl WebSocketLease {
     fn complete(&mut self, idle_ttl: Duration) {
         if let Some(key) = self.key.take() {
             self.busy
+                .lock()
+                .expect("cached websocket busy lock")
                 .take()
                 .expect("cached websocket busy state")
                 .store(false, Ordering::Release);
@@ -337,7 +342,7 @@ impl Model {
     }
 
     fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
+        self.base_url = normalize_base_url(&base_url.into());
         self
     }
 }
@@ -352,7 +357,7 @@ struct Options {
     session_id: Option<String>,
     cache_retention: CacheRetention,
     transport: Transport,
-    websocket_connect_timeout: Duration,
+    websocket_connect_timeout: Option<Duration>,
     temperature: Option<f64>,
     reasoning: Option<Reasoning>,
     service_tier: Option<ServiceTier>,
@@ -469,7 +474,7 @@ impl Options {
             session_id: None,
             cache_retention: CacheRetention::Short,
             transport: Transport::Auto,
-            websocket_connect_timeout: DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
+            websocket_connect_timeout: Some(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT),
             temperature: None,
             reasoning: None,
             service_tier: None,
@@ -519,7 +524,7 @@ impl Options {
     }
 
     fn with_websocket_connect_timeout(mut self, timeout: Duration) -> Self {
-        self.websocket_connect_timeout = timeout;
+        self.websocket_connect_timeout = Some(timeout);
         self
     }
 
@@ -633,11 +638,17 @@ async fn response_events(
 ) -> Result<crate::provider_stream::ProviderEventStream, Error> {
     let overall_deadline: Option<Instant> = None;
     let account_id = account_id(&options.access_token).map_err(Error::InvalidRequest)?;
-    let cache_session_id = match options.cache_retention {
+    let base_url = normalize_base_url(&model.base_url);
+    let requested_session_id = match options.cache_retention {
         CacheRetention::None => None,
         CacheRetention::Short | CacheRetention::Long => options.session_id.clone(),
     };
-    let session_id = cache_session_id.as_deref().map(openai::clamp_cache_key);
+    let prompt_cache_key = requested_session_id.as_deref().map(openai::clamp_cache_key);
+    let cache_session_id = requested_session_id.filter(|session_id| !session_id.is_empty());
+    let session_id = prompt_cache_key
+        .as_deref()
+        .filter(|session_id| !session_id.is_empty())
+        .map(str::to_owned);
     let placement = crate::deferred_tools::split(
         context,
         options.deferred_tools_mode.is_some(),
@@ -678,7 +689,7 @@ async fn response_events(
             }),
         service_tier: options.service_tier,
         include: ["reasoning.encrypted_content"],
-        prompt_cache_key: session_id.clone(),
+        prompt_cache_key,
         tool_choice: options.tool_choice,
         parallel_tool_calls: true,
     };
@@ -693,7 +704,7 @@ async fn response_events(
     let request_bytes = json.len();
     let sse_request = SseRequest {
         http_client: options.http_client.clone(),
-        base_url: model.base_url.clone(),
+        base_url: base_url.clone(),
         model: model.id.clone(),
         access_token: options.access_token.clone(),
         account_id: account_id.clone(),
@@ -718,14 +729,18 @@ async fn response_events(
     }
     let mut fallback_diagnostic = None;
     if options.transport != Transport::Sse && !websocket_disabled_for_session {
-        let mut websocket_value = value.clone();
-        websocket_value
-            .as_object_mut()
-            .expect("request serializes as an object")
-            .insert("type".into(), "response.create".into());
+        let websocket_value = match value.clone() {
+            serde_json::Value::Object(mut object) => {
+                object
+                    .entry("type")
+                    .or_insert_with(|| serde_json::Value::String("response.create".into()));
+                serde_json::Value::Object(object)
+            }
+            _ => serde_json::json!({"type": "response.create"}),
+        };
         match websocket_stream(
             WebSocketRequest {
-                base_url: &model.base_url,
+                base_url: &base_url,
                 model: &model.id,
                 access_token: &options.access_token,
                 account_id: &account_id,
@@ -783,7 +798,9 @@ async fn response_events(
                                         yield event;
                                     }
                                 }
-                                Err(error) => yield Err(error),
+                                Err(error) => {
+                                    yield Err(with_websocket_diagnostic(error, diagnostic));
+                                }
                             }
                         }
                     }
@@ -821,8 +838,10 @@ async fn response_events(
 async fn sse_stream(
     request: &SseRequest,
 ) -> Result<crate::provider_stream::ProviderEventStream, Error> {
-    let body = zstd::stream::encode_all(request.json.as_slice(), 3)
-        .map_err(|error| Error::Compression(error.to_string()))?;
+    let (body, compressed) = match zstd::stream::encode_all(request.json.as_slice(), 3) {
+        Ok(body) => (body, true),
+        Err(_) => (request.json.clone(), false),
+    };
     let client = &request.http_client;
     let url = response_url(&request.base_url);
     let mut headers =
@@ -841,8 +860,10 @@ async fn sse_stream(
         ),
         ("accept".into(), "text/event-stream".into()),
         ("content-type".into(), "application/json".into()),
-        ("content-encoding".into(), "zstd".into()),
     ]);
+    if compressed {
+        fixed.insert("content-encoding".into(), "zstd".into());
+    }
     if let Some(session_id) = &request.session_id {
         fixed.insert("session-id".into(), session_id.clone());
         fixed.insert("x-client-request-id".into(), session_id.clone());
@@ -856,7 +877,9 @@ async fn sse_stream(
                 cancellation: &request.cancellation,
                 deadline: request.overall_deadline,
                 profile: retry::Profile::Codex,
-                request_timeout: request.connection_timeout,
+                request_timeout: request
+                    .connection_timeout
+                    .filter(|timeout| !timeout.is_zero()),
             },
             || {
                 client
@@ -897,6 +920,7 @@ async fn sse_stream(
                 .service_tier
                 .map(|service_tier| service_tier.as_str().into()),
             use_requested_for_default: true,
+            mode: openai::ResponseMode::CodexSse,
         },
     ))
 }
@@ -1024,21 +1048,63 @@ fn add_websocket_diagnostic(
         Ok(crate::provider_stream::ProviderEvent::Done(response)) => {
             response.add_diagnostic(diagnostic)
         }
-        Err(
-            Error::Stream { partial, .. }
-            | Error::IncompleteStream { partial }
-            | Error::Response { partial, .. },
-        ) => partial.add_diagnostic(diagnostic),
-        Err(
-            Error::Cancelled {
-                partial: Some(partial),
+        Err(error) if !matches!(&*error, Error::Protocol { .. }) => {
+            if let Some(partial) = error.partial_mut() {
+                partial.add_diagnostic(diagnostic);
             }
-            | Error::Timeout {
-                partial: Some(partial),
-                ..
-            },
-        ) => partial.add_diagnostic(diagnostic),
+        }
         _ => {}
+    }
+}
+
+fn with_websocket_diagnostic(
+    mut error: Error,
+    diagnostic: crate::AssistantMessageDiagnostic,
+) -> Error {
+    if !matches!(&error, Error::Protocol { .. })
+        && let Some(partial) = error.partial_mut()
+    {
+        partial.add_diagnostic(diagnostic);
+        return error;
+    }
+    match error {
+        Error::Protocol { .. } => error,
+        Error::Cancelled { partial: None } => error,
+        Error::Timeout {
+            phase,
+            partial: None,
+        } => {
+            let mut partial = Response::default();
+            partial.add_diagnostic(diagnostic);
+            Error::Response {
+                code: None,
+                message: Error::Timeout {
+                    phase,
+                    partial: None,
+                }
+                .to_string(),
+                partial,
+            }
+        }
+        Error::Provider { message, .. } => {
+            let mut partial = Response::default();
+            partial.add_diagnostic(diagnostic);
+            Error::Response {
+                code: None,
+                message,
+                partial,
+            }
+        }
+        error => {
+            let message = error.to_string();
+            let mut partial = Response::default();
+            partial.add_diagnostic(diagnostic);
+            Error::Response {
+                code: None,
+                message,
+                partial,
+            }
+        }
     }
 }
 
@@ -1134,9 +1200,12 @@ async fn websocket_stream(
         (connection, false, active_cache_key)
     };
     let mut lease = WebSocketLease {
-        busy: active_cache_key.as_ref().map(|_| connection.busy.clone()),
+        busy: Arc::new(StdMutex::new(
+            active_cache_key.as_ref().map(|_| connection.busy.clone()),
+        )),
         key: active_cache_key.clone(),
     };
+    let lease_busy = lease.busy.clone();
     let CachedWebSocket {
         socket,
         mut continuation,
@@ -1188,7 +1257,7 @@ async fn websocket_stream(
         if !reused {
             return Err(WebSocketConnectError::Transport(error.to_string()));
         }
-        (socket, continuation, last_used) = replace_websocket(
+        let (fresh_socket, fresh_continuation, fresh_last_used, fresh_busy) = replace_websocket(
             socket,
             active_cache_key.as_deref(),
             &handshake,
@@ -1198,6 +1267,10 @@ async fn websocket_stream(
             &full_body,
         )
         .await?;
+        socket = fresh_socket;
+        continuation = fresh_continuation;
+        last_used = fresh_last_used;
+        *lease_busy.lock().expect("cached websocket busy lock") = Some(fresh_busy);
         used_continuation = false;
         retried_socket = true;
         record_websocket_request(
@@ -1260,10 +1333,11 @@ async fn websocket_stream(
                 )
                 .await
                 {
-                    Ok((fresh_socket, fresh_continuation, fresh_last_used)) => {
+                    Ok((fresh_socket, fresh_continuation, fresh_last_used, fresh_busy)) => {
                         socket = fresh_socket;
                         continuation = fresh_continuation;
                         last_used = fresh_last_used;
+                        *lease_busy.lock().expect("cached websocket busy lock") = Some(fresh_busy);
                         record_websocket_request(
                             debug_session_id.as_deref(),
                             false,
@@ -1295,13 +1369,7 @@ async fn websocket_stream(
             let data = match message {
                 Some(Ok(WebSocketMessage::Text(text))) => Some(text.to_string()),
                 Some(Ok(WebSocketMessage::Binary(bytes))) => {
-                    match String::from_utf8(bytes.to_vec()) {
-                        Ok(text) => Some(text),
-                        Err(error) => {
-                            yield Err(transport::ReadError::Stream(error.to_string()));
-                            return;
-                        }
-                    }
+                    Some(String::from_utf8_lossy(&bytes).into_owned())
                 }
                 Some(Ok(WebSocketMessage::Close(frame))) => {
                     let message = frame.map_or_else(
@@ -1347,10 +1415,11 @@ async fn websocket_stream(
                     )
                     .await
                     {
-                        Ok((fresh_socket, fresh_continuation, fresh_last_used)) => {
+                        Ok((fresh_socket, fresh_continuation, fresh_last_used, fresh_busy)) => {
                             socket = fresh_socket;
                             continuation = fresh_continuation;
                             last_used = fresh_last_used;
+                            *lease_busy.lock().expect("cached websocket busy lock") = Some(fresh_busy);
                             record_websocket_request(
                                 debug_session_id.as_deref(),
                                 false,
@@ -1380,7 +1449,6 @@ async fn websocket_stream(
                     continue;
                 }
                 if used_continuation
-                    && !emitted
                     && !retried_missing_continuation
                     && code.as_deref() == Some("previous_response_not_found")
                 {
@@ -1396,10 +1464,11 @@ async fn websocket_stream(
                     )
                     .await
                     {
-                        Ok((fresh_socket, fresh_continuation, fresh_last_used)) => {
+                        Ok((fresh_socket, fresh_continuation, fresh_last_used, fresh_busy)) => {
                             socket = fresh_socket;
                             continuation = fresh_continuation;
                             last_used = fresh_last_used;
+                            *lease_busy.lock().expect("cached websocket busy lock") = Some(fresh_busy);
                             record_websocket_request(
                                 debug_session_id.as_deref(),
                                 false,
@@ -1439,6 +1508,7 @@ async fn websocket_stream(
                     &mut response_items,
                 );
                 if terminal
+                    && cached_context
                     && let Some(response_id) = response_id.take()
                 {
                     *continuation.lock().expect("websocket continuation lock") = Some(Continuation {
@@ -1467,6 +1537,7 @@ async fn websocket_stream(
                 .service_tier
                 .map(|service_tier| service_tier.as_str().into()),
             use_requested_for_default: true,
+            mode: openai::ResponseMode::CodexWebSocket,
         },
     );
     let output = async_stream::stream! {
@@ -1480,7 +1551,12 @@ async fn websocket_stream(
                 }
                 Err(error) => {
                     drop(decoded);
-                    lease.evict();
+                    let error = codex_protocol_error(error);
+                    if keep_cached_websocket_after_response_error(&error) {
+                        lease.complete(WEBSOCKET_IDLE_TTL);
+                    } else {
+                        lease.evict();
+                    }
                     yield Err(error);
                     return;
                 }
@@ -1491,10 +1567,35 @@ async fn websocket_stream(
     Ok(Box::pin(output))
 }
 
+fn codex_protocol_error(error: Error) -> Error {
+    match error {
+        Error::Protocol { message, partial } => Error::Response {
+            code: None,
+            message: format!("Invalid Codex WebSocket JSON: {message}"),
+            partial,
+        },
+        error => error,
+    }
+}
+
+fn keep_cached_websocket_after_response_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Response {
+            code: None,
+            partial,
+            ..
+        } if partial.raw_stop_reason.as_deref().is_some_and(|status| {
+            matches!(status, "failed" | "cancelled" | "incomplete")
+                || status.starts_with("incomplete.")
+        })
+    )
+}
+
 async fn connect_websocket(
     handshake: &WebSocketHandshake,
     cancellation: &CancellationToken,
-    connect_timeout: Duration,
+    connect_timeout: Option<Duration>,
     overall_deadline: Option<Instant>,
 ) -> Result<CachedWebSocket, WebSocketConnectError> {
     let mut connection_request = handshake
@@ -1518,6 +1619,8 @@ async fn connect_websocket(
             }
         }
     }
+    connection_request.headers_mut().remove("accept");
+    connection_request.headers_mut().remove("content-type");
     for (name, value) in [
         (
             "authorization",
@@ -1542,17 +1645,20 @@ async fn connect_websocket(
     connection_request
         .headers_mut()
         .insert("session-id", session_header);
-    let connect_deadline = Instant::now() + connect_timeout;
+    let connect_timeout = connect_timeout.filter(|timeout| !timeout.is_zero());
+    let connect_deadline = connect_timeout.map(|timeout| Instant::now() + timeout);
     let (socket, _) = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(WebSocketConnectError::Cancelled),
         _ = transport::wait_until(overall_deadline) => {
             return Err(WebSocketConnectError::OverallTimeout);
         }
-        _ = tokio::time::sleep_until(connect_deadline) => {
+        _ = transport::wait_until(connect_deadline) => {
             return Err(WebSocketConnectError::Transport(format!(
                 "websocket connect timeout after {}ms",
-                connect_timeout.as_millis()
+                connect_timeout
+                    .unwrap_or(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT)
+                    .as_millis()
             )));
         }
         connection = connect_async(connection_request) => {
@@ -1574,7 +1680,7 @@ async fn replace_websocket(
     cache_key: Option<&str>,
     handshake: &WebSocketHandshake,
     cancellation: &CancellationToken,
-    connect_timeout: Duration,
+    connect_timeout: Option<Duration>,
     overall_deadline: Option<Instant>,
     body: &str,
 ) -> Result<
@@ -1582,6 +1688,7 @@ async fn replace_websocket(
         OwnedMutexGuard<WebSocket>,
         Arc<StdMutex<Option<Continuation>>>,
         Arc<StdMutex<Instant>>,
+        Arc<AtomicBool>,
     ),
     WebSocketConnectError,
 > {
@@ -1597,6 +1704,7 @@ async fn replace_websocket(
         connect_websocket(handshake, cancellation, connect_timeout, overall_deadline).await?;
     let continuation = connection.continuation.clone();
     let last_used = connection.last_used.clone();
+    let fresh_busy = connection.busy.clone();
     let fresh_socket = connection.socket.clone();
     let mut socket = tokio::select! {
         biased;
@@ -1622,7 +1730,7 @@ async fn replace_websocket(
             .expect("websocket cache lock")
             .insert(cache_key.to_owned(), connection);
     }
-    Ok((socket, continuation, last_used))
+    Ok((socket, continuation, last_used, fresh_busy))
 }
 
 fn codex_error_code(data: &str) -> Option<String> {
@@ -1630,6 +1738,7 @@ fn codex_error_code(data: &str) -> Option<String> {
     event
         .get("code")
         .or_else(|| event.get("error").and_then(|error| error.get("code")))
+        .or_else(|| event.pointer("/response/error/code"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
 }
@@ -1925,32 +2034,7 @@ fn continuation_request(
 }
 
 fn equivalent_json(left: &serde_json::Value, right: &serde_json::Value) -> bool {
-    match (left, right) {
-        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
-            left.iter()
-                .filter(|(_, value)| !value.is_null())
-                .all(|(key, value)| {
-                    right
-                        .get(key)
-                        .is_some_and(|right| equivalent_json(value, right))
-                })
-                && right
-                    .iter()
-                    .filter(|(_, value)| !value.is_null())
-                    .all(|(key, value)| {
-                        left.get(key)
-                            .is_some_and(|left| equivalent_json(left, value))
-                    })
-        }
-        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| equivalent_json(left, right))
-        }
-        _ => left == right,
-    }
+    left == right
 }
 
 fn request_configuration(request: &serde_json::Value) -> serde_json::Value {
@@ -1990,28 +2074,40 @@ fn observe_websocket_event(
 }
 
 fn account_id(token: &str) -> Result<String, String> {
-    let payload = token
-        .split('.')
-        .nth(1)
-        .ok_or_else(|| "access token is not a JWT".to_string())?;
+    let mut parts = token.split('.');
+    let (Some(_), Some(payload), Some(_), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err("Failed to extract accountId from token".into());
+    };
     let bytes = BASE64_URL_SAFE_NO_PAD
         .decode(payload)
         .or_else(|_| BASE64_URL_SAFE.decode(payload))
         .or_else(|_| BASE64_STANDARD.decode(payload))
-        .map_err(|_| "access token has an invalid JWT payload".to_string())?;
+        .map_err(|_| "Failed to extract accountId from token".to_string())?;
     let payload: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|_| "access token has an invalid JWT payload".to_string())?;
+        .map_err(|_| "Failed to extract accountId from token".to_string())?;
     payload
         .get("https://api.openai.com/auth")
         .and_then(|claim| claim.get("chatgpt_account_id"))
         .and_then(serde_json::Value::as_str)
         .filter(|account_id| !account_id.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| "access token has no account ID".to_string())
+        .ok_or_else(|| "Failed to extract accountId from token".to_string())
+}
+
+fn normalize_base_url(base_url: &str) -> String {
+    let base_url = base_url.trim();
+    if base_url.is_empty() {
+        DEFAULT_BASE_URL.into()
+    } else {
+        base_url.into()
+    }
 }
 
 fn response_url(base_url: &str) -> String {
-    let base_url = base_url.trim().trim_end_matches('/');
+    let normalized = normalize_base_url(base_url);
+    let base_url = normalized.trim_end_matches('/');
     if base_url.ends_with("/codex/responses") {
         base_url.into()
     } else if base_url.ends_with("/codex") {
@@ -2032,4 +2128,22 @@ fn tools(
     options: openai::ResponseToolOptions,
 ) -> Result<Vec<serde_json::Value>, String> {
     openai::response_tools(&placement.immediate, options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_BASE_URL, normalize_base_url, response_url, websocket_url};
+
+    #[test]
+    fn defaults_an_empty_base_url_to_the_codex_endpoint() {
+        assert_eq!(normalize_base_url(" \t\n"), DEFAULT_BASE_URL);
+        assert_eq!(
+            response_url(" \t\n"),
+            format!("{DEFAULT_BASE_URL}/codex/responses")
+        );
+        assert_eq!(
+            websocket_url(" \t\n"),
+            "wss://chatgpt.com/backend-api/codex/responses"
+        );
+    }
 }

@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use base64::prelude::*;
 use ds_ai::codex::auth::OAuth;
 use ds_ai::{
-    AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthSelectOption, Credential, OAuthAuth,
-    Provider as _,
+    AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthSelectOption, Credential, ModelAuth,
+    OAuthAuth, Provider as _,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -41,7 +41,8 @@ async fn refreshes_codex_credentials() {
             if refresh == "refresh_next"
                 && access == token("acc_refreshed")
                 && expires >= before + 3_600_000
-                && extra.is_empty()
+                && extra.get("accountId").and_then(serde_json::Value::as_str)
+                    == Some("acc_refreshed")
     ));
     let request = server.requests().await.pop().unwrap();
     assert!(request.starts_with("POST /oauth/token HTTP/1.1\r\n"));
@@ -49,6 +50,23 @@ async fn refreshes_codex_credentials() {
     assert!(body.contains("grant_type=refresh_token"));
     assert!(body.contains("refresh_token=refresh_old"));
     assert!(body.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
+}
+
+#[tokio::test]
+async fn exposes_codex_subscription_oauth_and_auth() {
+    let provider = ds_ai::codex::Provider::new([]);
+    let oauth = provider.auth().oauth.as_ref().unwrap();
+    let credential = credential("account", "refresh", 0);
+
+    assert_eq!(oauth.name(), "OpenAI (ChatGPT Plus/Pro)");
+    assert!(oauth.is_subscription());
+    assert_eq!(
+        oauth.to_auth(&credential).await.unwrap(),
+        ModelAuth {
+            api_key: Some(credential_access(&credential)),
+            ..Default::default()
+        }
+    );
 }
 
 #[tokio::test]
@@ -125,9 +143,13 @@ async fn logs_in_with_a_manual_codex_redirect() {
 
     let credentials = oauth.login(&interaction).await.unwrap();
 
-    assert!(
-        matches!(credentials, Credential::OAuth { access, .. } if access == token("acc_manual"))
-    );
+    assert!(matches!(
+        credentials,
+        Credential::OAuth { access, extra, .. }
+            if access == token("acc_manual")
+                && extra.get("accountId").and_then(serde_json::Value::as_str)
+                    == Some("acc_manual")
+    ));
     let authorization_url = interaction.authorization_url();
     let authorization_url = url::Url::parse(&authorization_url).unwrap();
     assert_eq!(authorization_url.path(), "/oauth/authorize");
@@ -188,12 +210,6 @@ async fn logs_in_with_the_codex_device_flow() {
             }),
         ),
         Reply::json(403, json!({"error": "authorization_pending"})),
-        Reply::json(404, json!({"error": "not_found"})),
-        Reply::json(
-            400,
-            json!({"error": {"code": "deviceauth_authorization_pending"}}),
-        ),
-        Reply::json(429, json!({"error": "slow_down", "interval": 0})),
         Reply::json(
             200,
             json!({
@@ -212,34 +228,120 @@ async fn logs_in_with_the_codex_device_flow() {
     ])
     .await;
     let interaction = DeviceInteraction::default();
+    let event = interaction.event.clone();
     let oauth = OAuth::new().with_base_url(&server.base_url);
+    let login = tokio::spawn(async move { oauth.login(&interaction).await });
 
-    let credentials = oauth.login(&interaction).await.unwrap();
+    let credentials = login.await.unwrap().unwrap();
 
     assert!(
         matches!(credentials, Credential::OAuth { access, .. } if access == token("acc_device"))
     );
     assert_eq!(
-        interaction.event.lock().unwrap().clone(),
+        event.lock().unwrap().clone(),
         Some(AuthEvent::DeviceCode {
             user_code: "ABCD-EFGH".into(),
             verification_uri: format!("{}/codex/device", server.base_url),
-            interval_seconds: Some(0),
+            interval_seconds: Some(1),
             expires_in_seconds: Some(15 * 60),
         })
     );
     let device_redirect = format!("{}/deviceauth/callback", server.base_url);
     let requests = server.requests().await;
-    assert_eq!(requests.len(), 7);
+    assert_eq!(requests.len(), 4);
     assert!(requests[0].starts_with("POST /api/accounts/deviceauth/usercode HTTP/1.1\r\n"));
     assert!(requests[1].starts_with("POST /api/accounts/deviceauth/token HTTP/1.1\r\n"));
-    assert!(requests[6].starts_with("POST /oauth/token HTTP/1.1\r\n"));
-    let exchange = requests[6].split("\r\n\r\n").nth(1).unwrap();
+    assert!(requests[3].starts_with("POST /oauth/token HTTP/1.1\r\n"));
+    let exchange = requests[3].split("\r\n\r\n").nth(1).unwrap();
     assert!(exchange.contains("code=device_code"));
     assert!(exchange.contains("code_verifier=device_verifier"));
     assert!(exchange.contains(
         &url::form_urlencoded::byte_serialize(device_redirect.as_bytes()).collect::<String>()
     ));
+}
+
+#[tokio::test]
+async fn reports_clock_drift_guidance_after_a_slow_down_timeout() {
+    let server = serve([
+        Reply::json(
+            200,
+            json!({
+                "device_auth_id": "device_slow_timeout",
+                "user_code": "SLOW-TIMEOUT",
+                "interval": 0
+            }),
+        ),
+        Reply::json(429, json!({"error": "slow_down", "interval": 0.2})),
+    ])
+    .await;
+    let oauth = OAuth::new()
+        .with_base_url(&server.base_url)
+        .with_device_timeout(Duration::from_millis(20));
+    let login = tokio::spawn(async move { oauth.login(&DeviceInteraction::default()).await });
+
+    let error = login.await.unwrap().unwrap_err();
+
+    assert!(matches!(
+        error,
+        AuthError::OAuth(message)
+            if message == "Device flow timed out after one or more slow_down responses. This is often caused by clock drift in WSL or VM environments. Please sync or restart the VM clock and try again."
+    ));
+}
+
+#[tokio::test]
+async fn rejects_empty_codex_oauth_tokens() {
+    for (access_token, refresh_token, missing) in [
+        (String::new(), String::from("refresh"), "access_token"),
+        (token("account"), String::new(), "refresh_token"),
+    ] {
+        let server = serve([Reply::json(
+            200,
+            json!({
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "expires_in": 3600
+            }),
+        )])
+        .await;
+        let oauth = OAuth::new().with_base_url(&server.base_url);
+        let error = oauth
+            .refresh(
+                &credential("account", "refresh", 0),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, AuthError::OAuth(message) if message == format!("invalid OAuth response: missing {missing}"))
+        );
+        server.requests().await;
+    }
+}
+
+#[tokio::test]
+async fn rejects_two_and_four_segment_codex_jwt_access_tokens_during_exchange() {
+    for access_token in ["header.payload", "header.payload.signature.extra"] {
+        let server = serve([Reply::json(
+            200,
+            json!({
+                "access_token": access_token,
+                "refresh_token": "refresh",
+                "expires_in": 3600
+            }),
+        )])
+        .await;
+        let interaction = ManualInteraction::default();
+        let oauth = OAuth::new()
+            .with_base_url(&server.base_url)
+            .with_callback_address(local_address());
+        let error = oauth.login(&interaction).await.unwrap_err();
+
+        assert!(
+            matches!(error, AuthError::OAuth(message) if message == "invalid OAuth response: Failed to extract accountId from token")
+        );
+        server.requests().await;
+    }
 }
 
 #[tokio::test]
@@ -325,7 +427,7 @@ async fn preserves_codex_device_poll_failure_details() {
 }
 
 #[tokio::test]
-async fn offers_pi_codex_login_methods_and_preserves_selection_cancellation() {
+async fn offers_codex_login_methods_and_preserves_selection_cancellation() {
     let provider = ds_ai::codex::Provider::new([]);
     let oauth = provider.auth().oauth.as_ref().unwrap();
     let interaction = SelectionInteraction {
@@ -381,7 +483,7 @@ async fn rejects_an_unknown_codex_login_method() {
 }
 
 #[tokio::test]
-async fn exposes_pi_codex_browser_login_events_and_manual_prompt() {
+async fn exposes_codex_browser_login_events_and_manual_prompt() {
     let provider = ds_ai::codex::Provider::new([]);
     let interaction = BrowserSelectionInteraction::default();
 
@@ -393,7 +495,7 @@ async fn exposes_pi_codex_browser_login_events_and_manual_prompt() {
         .login(&interaction)
         .await;
 
-    assert!(matches!(result, Err(AuthError::OAuth(_))));
+    assert!(matches!(result, Err(AuthError::Cancelled)));
     let events = interaction.events.lock().unwrap();
     let [AuthEvent::AuthUrl { url, instructions }] = events.as_slice() else {
         panic!("missing authorization URL event");
@@ -593,6 +695,13 @@ fn credential(account_id: &str, refresh: &str, expires: u64) -> Credential {
         expires,
         extra: Default::default(),
     }
+}
+
+fn credential_access(credential: &Credential) -> String {
+    let Credential::OAuth { access, .. } = credential else {
+        unreachable!();
+    };
+    access.clone()
 }
 
 fn now_millis() -> u64 {

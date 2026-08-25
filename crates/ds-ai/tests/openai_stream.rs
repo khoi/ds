@@ -1,8 +1,10 @@
 use crate::support::{Reply, serve};
 use ds_ai::{
-    AssistantContent, AssistantMessage, AssistantMessageEvent, AssistantToolCall, CacheRetention,
-    Context, InputContent, Message, OpenAiResponsesOptions, ResponseHook, StopReason,
-    StreamOptions, TextContent, ThinkingContent, Tool, ToolResultMessage, builtin_model, openai,
+    Api, AssistantContent, AssistantMessage, AssistantMessageEvent, AssistantToolCall,
+    CacheRetention, Context, InputContent, Message, ModelCompatibility,
+    OpenAiResponsesCompatibility, OpenAiResponsesOptions, ProviderId, ResponseHook, StopReason,
+    StreamOptions, TextContent, ThinkingContent, Tool, ToolResultMessage, Usage, builtin_model,
+    openai,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -65,6 +67,301 @@ async fn streams_openai_text_until_the_provider_completes() {
 }
 
 #[tokio::test]
+async fn accepts_openai_header_auth_and_merges_model_headers() {
+    let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_headers\",\"usage\":{}}}\n\n";
+    let server = serve([Reply::sse(sse)]).await;
+    let mut model = model(&server.base_url);
+    model
+        .headers
+        .insert("x-model-header".into(), "model".into());
+    let mut options = options(|_| {});
+    options.stream.api_key = None;
+    options.stream.headers = [
+        ("Authorization".into(), Some("Bearer gateway-token".into())),
+        ("x-request-header".into(), Some("request".into())),
+    ]
+    .into();
+
+    done(&events(&model, &Context::new([Message::user("Hello")]), &options).await);
+
+    let request = server.requests().await.pop().unwrap().to_ascii_lowercase();
+    assert!(request.contains("authorization: bearer gateway-token\r\n"));
+    assert!(request.contains("x-model-header: model\r\n"));
+    assert!(request.contains("x-request-header: request\r\n"));
+}
+
+#[tokio::test]
+async fn requires_direct_openai_auth_from_options_or_caller_headers() {
+    let server = serve([Reply::sse(Vec::new())]).await;
+    let mut model = model(&server.base_url);
+    model
+        .headers
+        .insert("Authorization".into(), "Bearer model-token".into());
+    let mut options = options(|_| {});
+    options.stream.api_key = None;
+
+    let events = events(&model, &Context::new([Message::user("Hello")]), &options).await;
+    let error = failed(&events);
+
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("No API key for provider: openai")
+    );
+    assert_eq!(server.request_count(), 0);
+}
+
+#[tokio::test]
+async fn preserves_openai_custom_tool_namespaces() {
+    let sse = [
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_1\",\"call_id\":\"call_1\",\"name\":\"query\",\"input\":\"\"}}\n\n",
+        "data: {\"type\":\"response.custom_tool_call_input.done\",\"output_index\":0,\"input\":\"abc\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_1\",\"call_id\":\"call_1\",\"name\":\"query\",\"input\":\"abc\",\"namespace\":\"custom\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_custom\",\"status\":\"completed\",\"usage\":{}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let model = model(&server.base_url);
+    let result_events = events(
+        &model,
+        &Context::new([Message::user("Query")]),
+        &options(|_| {}),
+    )
+    .await;
+    let result = done(&result_events);
+
+    let [AssistantContent::ToolCall(call)] = result.content.as_slice() else {
+        panic!("expected one custom tool call");
+    };
+    assert_eq!(call.id, "call_1|ctc_1");
+    assert_eq!(call.name, "query");
+    assert_eq!(call.arguments, json!({"input": "abc"}));
+    assert_eq!(call.namespace.as_deref(), Some("custom"));
+    server.request_bytes().await;
+}
+
+#[tokio::test]
+async fn hashes_deferred_tool_loads_from_the_original_tool_result_id() {
+    let server = serve([Reply::sse(
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_deferred\",\"usage\":{}}}\n\n",
+    )])
+    .await;
+    let mut model = model(&server.base_url);
+    model.compat = Some(ModelCompatibility::OpenAi(OpenAiResponsesCompatibility {
+        supports_additional_tools: Some(false),
+        supports_tool_search: Some(true),
+        ..Default::default()
+    }));
+    let raw_id = "call_source|foreign_item";
+    let assistant = AssistantMessage {
+        content: vec![AssistantContent::ToolCall(AssistantToolCall {
+            id: raw_id.into(),
+            name: "base_tool".into(),
+            arguments: json!({}),
+            thought_signature: None,
+            namespace: None,
+        })],
+        api: Api::AnthropicMessages,
+        provider: ProviderId::new("anthropic"),
+        model: "claude-opus-4-6".into(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 2,
+    };
+    let mut result = ToolResultMessage::new(raw_id, "base_tool", [InputContent::text("done")]);
+    result.added_tool_names = Some(vec!["late_tool".into()]);
+    let context = Context::new([
+        Message::user("Hello"),
+        Message::assistant(assistant),
+        Message::tool_result(result),
+        Message::user("Continue"),
+    ])
+    .with_tools([
+        Tool::new("base_tool", "Base tool", json!({"type": "object"})),
+        Tool::new("late_tool", "Late tool", json!({"type": "object"})),
+    ]);
+
+    done(&events(&model, &context, &options(|_| {})).await);
+
+    let body: Value = serde_json::from_str(
+        server
+            .requests()
+            .await
+            .pop()
+            .unwrap()
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap(),
+    )
+    .unwrap();
+    let call = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "tool_search_call")
+        .unwrap();
+    assert_eq!(call["call_id"], "pi_tool_load_qq9zvz1smp2zs");
+}
+
+#[tokio::test]
+async fn hashes_long_foreign_openai_tool_item_ids() {
+    let server = serve([Reply::sse(
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_foreign\",\"usage\":{}}}\n\n",
+    )])
+    .await;
+    let model = model(&server.base_url);
+    let raw_id = "call_4VnzVawQXPB9MgYib7CiQFEY|I9b95oN1wD/cHXKTw3PpRkL6KkCtzTJhUxMouMWYwHeTo2j3htzfSk7YPx2vifiIM4g3A8XXyOj8q4Bt6SLUG7gqY1E3ELkrkVQNHglRfUmWj84lqxJY+Puieb3VKyX0FB+83TUzn91cDMF/4gzt990IzqVrc+nIb9RRscRD070Du16q1glydVjWR0SBJsE6TbY/esOjFpqplogQqrajm1eI++f3eLi73R6q7hVusY0QbeFySVxABCjhN0lXB04caBe1rzHjYzul6MAXj7uq+0r17VLq+yrtyYhN12wkmFqHeqTyEei6EFPbMy24Nc+IbJlkP0OCg02W+gOnyBFcbi2ctvJFSOhSjt1CqBdqCnnhwUqXjbWiT0wh3DmLScRgTHmGkaI+oAcQQjfic65nxj+TnEkReA==";
+    let assistant = AssistantMessage {
+        content: vec![AssistantContent::ToolCall(AssistantToolCall {
+            id: raw_id.into(),
+            name: "edit".into(),
+            arguments: json!({"path": "src/styles/app.css"}),
+            thought_signature: None,
+            namespace: None,
+        })],
+        api: Api::OpenAiResponses,
+        provider: ProviderId::new("github-copilot"),
+        model: "gpt-5.5".into(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 2,
+    };
+    let context = Context::new([
+        Message::user("Use the tool."),
+        Message::assistant(assistant),
+        Message::tool_result(ToolResultMessage::new(
+            raw_id,
+            "edit",
+            [InputContent::text("ok")],
+        )),
+        Message::user("Continue"),
+    ]);
+
+    done(&events(&model, &context, &options(|_| {})).await);
+
+    let body: Value = serde_json::from_str(
+        server
+            .requests()
+            .await
+            .pop()
+            .unwrap()
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap(),
+    )
+    .unwrap();
+    let function_call = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .unwrap();
+    assert_eq!(function_call["id"], "fc_ifd2c719fz6a9");
+    assert_eq!(function_call["id"].as_str().unwrap().len(), 16);
+    assert_eq!(function_call["call_id"], "call_4VnzVawQXPB9MgYib7CiQFEY");
+}
+
+#[tokio::test]
+async fn drops_unreplayable_openai_tool_namespaces() {
+    let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_namespace_drop\",\"usage\":{}}}\n\n";
+    let server = serve([Reply::sse(sse)]).await;
+    let mut model = model(&server.base_url);
+    model.id = "gpt-5.5".into();
+    model.name = "gpt-5.5".into();
+    let assistant = AssistantMessage {
+        content: vec![
+            AssistantContent::ToolCall(AssistantToolCall {
+                id: "call_function|fc_function".into(),
+                name: "lookup".into(),
+                arguments: json!({"value": "hello"}),
+                thought_signature: None,
+                namespace: Some("dynamic_tools".into()),
+            }),
+            AssistantContent::ToolCall(AssistantToolCall {
+                id: "call_custom|ctc_custom".into(),
+                name: "query".into(),
+                arguments: json!({"input": "hello"}),
+                thought_signature: None,
+                namespace: Some("dynamic_tools".into()),
+            }),
+        ],
+        api: Api::OpenAiResponses,
+        provider: ProviderId::new("openai"),
+        model: "gpt-5.4".into(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 2,
+    };
+    let context = Context::new([Message::assistant(assistant), Message::user("Continue")])
+        .with_tools([
+            Tool::new(
+                "lookup",
+                "Lookup",
+                json!({"type": "object", "properties": {"value": {"type": "string"}}}),
+            ),
+            Tool {
+                name: "query".into(),
+                description: "Query".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"input": {"type": "string"}},
+                    "required": ["input"]
+                }),
+                constrained_sampling: Some(ds_ai::ConstrainedSampling::Grammar {
+                    variants: ds_ai::GrammarVariants {
+                        openai_lark: Some("start: /[a-z]+/".into()),
+                        openai_regex: None,
+                    },
+                }),
+            },
+        ]);
+
+    done(&events(&model, &context, &options(|_| {})).await);
+
+    let body: Value = serde_json::from_str(
+        server
+            .requests()
+            .await
+            .pop()
+            .unwrap()
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap(),
+    )
+    .unwrap();
+    let calls = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| {
+            matches!(
+                item["type"].as_str(),
+                Some("function_call" | "custom_tool_call")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|call| call.get("namespace").is_none()));
+}
+
+#[tokio::test]
 async fn rejects_an_openai_stream_that_ends_without_a_terminal_event() {
     let sse = [
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\"}}\n\n",
@@ -93,7 +390,24 @@ async fn rejects_an_openai_stream_that_ends_without_a_terminal_event() {
     assert_eq!(partial.usage, ds_ai::Usage::default());
     assert_eq!(
         partial.error_message.as_deref(),
-        Some("provider stream ended before a terminal event")
+        Some("OpenAI Responses stream ended before a terminal response event")
+    );
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn treats_openai_response_done_as_non_terminal() {
+    let sse = "data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_done\",\"status\":\"completed\",\"usage\":{}}}\n\n";
+    let server = serve([Reply::sse(sse)]).await;
+    let model = model(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+
+    let events = events(&model, &context, &options(|_| {})).await;
+    let error = failed(&events);
+
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("OpenAI Responses stream ended before a terminal response event")
     );
     server.requests().await;
 }
@@ -194,7 +508,11 @@ async fn waits_for_openai_retry_headers() {
         let options = options(|options| options.stream.max_retries = Some(1));
         let task = tokio::spawn(async move { events(&model, &context, &options).await });
 
-        server.wait_for_requests(1).await;
+        server.wait_for_requests_paused(1).await;
+        server.wait_for_replies_paused(1).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
         tokio::time::advance(std::time::Duration::from_millis(delay_ms - 1)).await;
         for _ in 0..10 {
             tokio::task::yield_now().await;
@@ -202,6 +520,8 @@ async fn waits_for_openai_retry_headers() {
         assert_eq!(server.request_count(), 1);
 
         tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        server.wait_for_requests_paused(2).await;
+        server.wait_for_replies_paused(2).await;
         let events = task.await.unwrap();
         done(&events);
         assert_eq!(server.requests().await.len(), 2);
@@ -227,7 +547,11 @@ async fn waits_for_an_openai_retry_after_http_date() {
     let options = options(|options| options.stream.max_retries = Some(1));
     let task = tokio::spawn(async move { events(&model, &context, &options).await });
 
-    server.wait_for_requests(1).await;
+    server.wait_for_requests_paused(1).await;
+    server.wait_for_replies_paused(1).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
     tokio::time::advance(std::time::Duration::from_secs(58)).await;
     for _ in 0..10 {
         tokio::task::yield_now().await;
@@ -235,6 +559,8 @@ async fn waits_for_an_openai_retry_after_http_date() {
     assert_eq!(server.request_count(), 1);
 
     tokio::time::advance(std::time::Duration::from_secs(3)).await;
+    server.wait_for_requests_paused(2).await;
+    server.wait_for_replies_paused(2).await;
     let events = task.await.unwrap();
     done(&events);
     assert_eq!(server.requests().await.len(), 2);
@@ -260,12 +586,16 @@ async fn cancels_an_openai_retry_wait() {
     });
     let task = tokio::spawn(async move { events(&model, &context, &options).await });
 
-    server.wait_for_requests(1).await;
+    server.wait_for_requests_paused(1).await;
+    server.wait_for_replies_paused(1).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
     cancellation.cancel();
     let events = task.await.unwrap();
     let error = failed(&events);
     assert_eq!(error.stop_reason, StopReason::Aborted);
-    assert_eq!(error.error_message.as_deref(), Some("request cancelled"));
+    assert_eq!(error.error_message.as_deref(), Some("Request aborted"));
     assert_eq!(server.request_count(), 1);
 }
 
@@ -276,6 +606,7 @@ async fn follows_openai_retry_status_and_override_headers() {
         (409, None, true),
         (429, None, true),
         (500, None, true),
+        (600, None, true),
         (599, None, true),
         (400, None, false),
         (400, Some(("x-should-retry", "true")), true),
@@ -310,7 +641,7 @@ async fn follows_openai_retry_status_and_override_headers() {
             assert_eq!(failed(&events).stop_reason, StopReason::Error);
             assert!(
                 failed(&events).error_message.as_deref().is_some_and(
-                    |message| message.starts_with(&format!("provider returned HTTP {status}:"))
+                    |message| message.starts_with(&format!("OpenAI API error ({status}):"))
                 )
             );
             assert_eq!(server.request_count(), 1);
@@ -328,7 +659,11 @@ async fn retries_openai_network_failures_before_streaming_starts() {
 
     let task = tokio::spawn(async move { events(&model, &context, &options).await });
 
-    server.wait_for_requests(1).await;
+    server.wait_for_requests_paused(1).await;
+    server.wait_for_replies_paused(1).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
     tokio::time::advance(std::time::Duration::from_millis(374)).await;
     for _ in 0..10 {
         tokio::task::yield_now().await;
@@ -336,12 +671,14 @@ async fn retries_openai_network_failures_before_streaming_starts() {
     assert_eq!(server.request_count(), 1);
 
     tokio::time::advance(std::time::Duration::from_millis(126)).await;
+    server.wait_for_requests_paused(2).await;
+    server.wait_for_replies_paused(2).await;
     let events = task.await.unwrap();
     done(&events);
     assert_eq!(server.requests().await.len(), 2);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn rejects_an_openai_retry_delay_above_a_custom_limit() {
     let server = serve([Reply::json(
         429,
@@ -359,9 +696,32 @@ async fn rejects_an_openai_retry_delay_above_a_custom_limit() {
     let events = events(&model, &context, &options).await;
     assert_eq!(
         failed(&events).error_message.as_deref(),
-        Some("provider retry delay 2s exceeds 1s")
+        Some("Server requested 2s retry delay (max: 1s). 429 retry later",)
     );
     assert_eq!(server.requests().await.len(), 1);
+}
+
+#[tokio::test]
+async fn uses_the_default_openai_retry_delay_cap_when_unspecified() {
+    let server = serve([
+        Reply::json(429, json!({"error": {"message": "retry later"}}))
+            .with_header("retry-after", "61"),
+    ])
+    .await;
+    let model = model(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options = options(|options| {
+        options.stream.max_retries = Some(1);
+        options.stream.max_retry_delay = None;
+    });
+
+    let events = events(&model, &context, &options).await;
+
+    assert_eq!(
+        failed(&events).error_message.as_deref(),
+        Some("Server requested 61s retry delay (max: 60s). 429 retry later",)
+    );
+    assert_eq!(server.request_count(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -380,7 +740,11 @@ async fn backs_off_before_an_openai_retry_without_a_header() {
     let options = options(|options| options.stream.max_retries = Some(1));
     let task = tokio::spawn(async move { events(&model, &context, &options).await });
 
-    server.wait_for_requests(1).await;
+    server.wait_for_requests_paused(1).await;
+    server.wait_for_replies_paused(1).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
     tokio::time::advance(std::time::Duration::from_millis(374)).await;
     for _ in 0..10 {
         tokio::task::yield_now().await;
@@ -388,6 +752,8 @@ async fn backs_off_before_an_openai_retry_without_a_header() {
     assert_eq!(server.request_count(), 1);
 
     tokio::time::advance(std::time::Duration::from_millis(126)).await;
+    server.wait_for_requests_paused(2).await;
+    server.wait_for_replies_paused(2).await;
     let events = task.await.unwrap();
     done(&events);
     assert_eq!(server.requests().await.len(), 2);
@@ -410,7 +776,8 @@ async fn accepts_fractional_openai_retry_headers() {
     let options = options(|options| options.stream.max_retries = Some(1));
     let task = tokio::spawn(async move { events(&model, &context, &options).await });
 
-    server.wait_for_requests(1).await;
+    server.wait_for_requests_paused(1).await;
+    server.wait_for_replies_paused(1).await;
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
@@ -421,6 +788,8 @@ async fn accepts_fractional_openai_retry_headers() {
     assert_eq!(server.request_count(), 1);
 
     tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    server.wait_for_requests_paused(2).await;
+    server.wait_for_replies_paused(2).await;
     let events = task.await.unwrap();
     done(&events);
     assert_eq!(server.requests().await.len(), 2);
@@ -515,7 +884,19 @@ async fn streams_openai_reasoning_text_and_refusal_content() {
     assert_eq!(
         done(&events).content,
         [
-            thinking("Private", Some("rs_text"), None),
+            AssistantContent::Thinking(ThinkingContent {
+                thinking: "Private".into(),
+                thinking_signature: Some(
+                    json!({
+                        "id": "rs_text",
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": [{"type": "reasoning_text", "text": "Private"}]
+                    })
+                    .to_string(),
+                ),
+                redacted: None,
+            }),
             text("Denied", Some(("msg_refusal", None))),
         ]
     );
@@ -580,6 +961,56 @@ async fn replays_serialized_openai_reasoning_and_message_items() {
 }
 
 #[tokio::test]
+async fn preserves_the_complete_openai_reasoning_item_for_replay() {
+    let first_sse = [
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_content\",\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+        "data: {\"type\":\"response.reasoning_text.delta\",\"output_index\":0,\"delta\":\"Private\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_content\",\"type\":\"reasoning\",\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"Private\"}],\"encrypted_content\":\"opaque\",\"status\":\"completed\",\"metadata\":{\"trace\":\"x\"}}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_content\",\"status\":\"completed\",\"output\":[{\"id\":\"rs_content\",\"type\":\"reasoning\",\"encrypted_content\":\"terminal\"}],\"usage\":{}}}\n\n",
+    ]
+    .concat();
+    let server = serve([
+        Reply::sse(first_sse),
+        Reply::sse(
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_next\",\"status\":\"completed\",\"usage\":{}}}\n\n",
+        ),
+    ])
+    .await;
+    let model = model(&server.base_url);
+    let options = options(|_| {});
+    let first = events(&model, &Context::new([Message::user("Think")]), &options).await;
+    let response = done(&first).clone();
+    let expected = json!({
+        "id": "rs_content",
+        "type": "reasoning",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": "Private"}],
+        "encrypted_content": "opaque",
+        "status": "completed",
+        "metadata": {"trace": "x"}
+    });
+    let AssistantContent::Thinking(thinking) = &response.content[0] else {
+        panic!("missing reasoning content");
+    };
+    assert_eq!(
+        serde_json::from_str::<Value>(thinking.thinking_signature.as_deref().unwrap()).unwrap(),
+        expected
+    );
+
+    let second = events(
+        &model,
+        &Context::new([Message::assistant(response), Message::user("Continue")]),
+        &options,
+    )
+    .await;
+    done(&second);
+    let requests = server.requests().await;
+    let replay: Value =
+        serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(replay["input"][0], expected);
+}
+
+#[tokio::test]
 async fn generates_distinct_replay_ids_for_text_without_provider_ids() {
     let first_sse = [
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"content\":[]}}\n\n",
@@ -619,12 +1050,8 @@ async fn generates_distinct_replay_ids_for_text_without_provider_ids() {
         .filter(|item| item["type"] == "message" && item["role"] == "assistant")
         .collect::<Vec<_>>();
     assert_eq!(messages.len(), 2);
-    assert_ne!(messages[0]["id"], messages[1]["id"]);
-    assert!(
-        messages
-            .iter()
-            .all(|message| message["id"].as_str().unwrap().starts_with("msg_ds_"))
-    );
+    assert_eq!(messages[0]["id"], "msg_pi_1");
+    assert_eq!(messages[1]["id"], "msg_pi_1_1");
 }
 
 #[tokio::test]
@@ -730,7 +1157,7 @@ async fn streams_and_replays_openai_tool_calls() {
                 "id": "fc_edit",
                 "call_id": "call_edit",
                 "name": "edit",
-                "arguments": "{\"content\":\"updated\",\"path\":\"README.md\"}",
+                "arguments": "{\"path\":\"README.md\",\"content\":\"updated\"}",
                 "namespace": "dynamic_tools"
             },
             {
@@ -763,8 +1190,49 @@ async fn uses_the_provider_terminal_token_total() {
 }
 
 #[tokio::test]
+async fn ignores_end_turn_on_openai_terminal_responses() {
+    let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_end_turn\",\"status\":\"completed\",\"end_turn\":true,\"usage\":{}}}\n\n";
+    let server = serve([Reply::sse(sse)]).await;
+    let model = model(&server.base_url);
+    let events = events(
+        &model,
+        &Context::new([Message::user("Hello")]),
+        &options(|_| {}),
+    )
+    .await;
+
+    assert_eq!(done(&events).end_turn, None);
+    server.requests().await;
+}
+
+#[tokio::test]
 async fn rejects_an_incomplete_response_without_a_reason() {
-    let sse = "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"incomplete_details\":null}}\n\n";
+    let server = serve([
+        Reply::sse("data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"incomplete_details\":null}}\n\n"),
+        Reply::sse("data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_empty_reason\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"\"}}}\n\n"),
+    ]).await;
+    let model = model(&server.base_url);
+    for _ in 0..2 {
+        let events = events(
+            &model,
+            &Context::new([Message::user("Hello")]),
+            &options(|_| {}),
+        )
+        .await;
+
+        let error = failed(&events);
+        assert_eq!(
+            error.error_message.as_deref(),
+            Some("Response incomplete without a provider reason")
+        );
+        assert_eq!(error.raw_stop_reason.as_deref(), Some("incomplete"));
+    }
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn maps_an_openai_incomplete_event_using_its_response_status() {
+    let sse = "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete_status\",\"status\":\"cancelled\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{}}}\n\n";
     let server = serve([Reply::sse(sse)]).await;
     let model = model(&server.base_url);
     let events = events(
@@ -775,11 +1243,12 @@ async fn rejects_an_incomplete_response_without_a_reason() {
     .await;
 
     let error = failed(&events);
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(error.raw_stop_reason.as_deref(), Some("cancelled"));
     assert_eq!(
         error.error_message.as_deref(),
-        Some("provider response failed: Response incomplete without a provider reason")
+        Some("An unknown error occurred")
     );
-    assert_eq!(error.raw_stop_reason.as_deref(), Some("incomplete"));
     server.requests().await;
 }
 
@@ -827,6 +1296,11 @@ async fn sends_openai_tool_result_text_images_and_empty_output() {
             "noop",
             [InputContent::text("")],
         )),
+        Message::tool_result(ToolResultMessage::new(
+            "call_image_only",
+            "inspect",
+            [InputContent::image("image/jpeg", "/9j/4AAQ")],
+        )),
     ]);
     let events = events(&model, &context, &options(|_| {})).await;
     done(&events);
@@ -856,6 +1330,17 @@ async fn sends_openai_tool_result_text_images_and_empty_output() {
                 "type": "function_call_output",
                 "call_id": "call_empty",
                 "output": "(no tool output)"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_image_only",
+                "output": [
+                    {
+                        "type": "input_image",
+                        "detail": "auto",
+                        "image_url": "data:image/jpeg;base64,/9j/4AAQ"
+                    }
+                ]
             }
         ])
     );
@@ -904,7 +1389,7 @@ async fn rejects_a_content_filtered_openai_response_with_partial_content() {
     let error = failed(&events);
     assert_eq!(
         error.error_message.as_deref(),
-        Some("provider response failed: Response incomplete: content_filter")
+        Some("Response incomplete: content_filter")
     );
     assert_eq!(error.stop_reason, StopReason::Error);
     assert_eq!(
@@ -912,6 +1397,29 @@ async fn rejects_a_content_filtered_openai_response_with_partial_content() {
         Some("incomplete.content_filter")
     );
     assert_eq!(error.content, [text("Visible", None)]);
+}
+
+#[tokio::test]
+async fn preserves_an_unknown_openai_incomplete_reason() {
+    let sse = "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_unknown_reason\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_time_limit\"}}}\n\n";
+    let server = serve([Reply::sse(sse)]).await;
+    let model = model(&server.base_url);
+    let events = events(
+        &model,
+        &Context::new([Message::user("Write")]),
+        &options(|_| {}),
+    )
+    .await;
+
+    let error = failed(&events);
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("Response incomplete: max_time_limit")
+    );
+    assert_eq!(
+        error.raw_stop_reason.as_deref(),
+        Some("incomplete.max_time_limit")
+    );
 }
 
 #[tokio::test]
@@ -929,14 +1437,114 @@ async fn rejects_a_failed_openai_response_with_code_and_partial_content() {
     let events = events(&model, &context, &options(|_| {})).await;
 
     let error = failed(&events);
-    assert_eq!(
-        error.error_message.as_deref(),
-        Some("provider response failed: boom")
-    );
+    assert_eq!(error.error_message.as_deref(), Some("server_error: boom"));
     assert_eq!(error.response_id.as_deref(), Some("resp_failed"));
     assert_eq!(error.stop_reason, StopReason::Error);
     assert_eq!(error.raw_stop_reason.as_deref(), Some("failed"));
     assert_eq!(error.content, [thinking("Partial thought", None, None)]);
+}
+
+#[tokio::test]
+async fn does_not_copy_metadata_from_a_failed_openai_response() {
+    let sse = [
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_created\"}}\n\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"status\":\"failed\",\"end_turn\":true,\"service_tier\":\"priority\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let model = model(&server.base_url);
+    let events = events(
+        &model,
+        &Context::new([Message::user("Think")]),
+        &options(|_| {}),
+    )
+    .await;
+
+    let error = failed(&events);
+    assert_eq!(error.response_id.as_deref(), Some("resp_created"));
+    assert_eq!(error.end_turn, None);
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn reports_failed_openai_response_without_error_details() {
+    let sse = "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed_unknown\",\"status\":\"failed\"}}\n\n";
+    let server = serve([Reply::sse(sse)]).await;
+    let model = model(&server.base_url);
+    let events = events(
+        &model,
+        &Context::new([Message::user("Write")]),
+        &options(|_| {}),
+    )
+    .await;
+
+    let error = failed(&events);
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("Unknown error (no error details in response)")
+    );
+}
+
+#[tokio::test]
+async fn reports_failed_openai_response_incomplete_reason() {
+    let sse = "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed_incomplete\",\"status\":\"failed\",\"incomplete_details\":{\"reason\":\"max_time_limit\"}}}\n\n";
+    let server = serve([Reply::sse(sse)]).await;
+    let model = model(&server.base_url);
+    let events = events(
+        &model,
+        &Context::new([Message::user("Write")]),
+        &options(|_| {}),
+    )
+    .await;
+
+    let error = failed(&events);
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("incomplete: max_time_limit")
+    );
+}
+
+#[tokio::test]
+async fn matches_empty_openai_terminal_and_event_fields() {
+    let server = serve([
+        Reply::sse(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"\"}}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"\",\"status\":\"\",\"error\":{\"code\":\"\",\"message\":\"\"}}}\n\n",
+        ),
+        Reply::sse(
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"\"}}}\n\n",
+        ),
+        Reply::sse(
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"\",\"status\":\"\",\"usage\":{}}}\n\n",
+        ),
+        Reply::sse("data: {\"type\":\"error\",\"code\":\"\",\"message\":\"\"}\n\n"),
+    ])
+    .await;
+    let model = model(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+
+    let first_events = events(&model, &context, &options(|_| {})).await;
+    let first = failed(&first_events);
+    assert_eq!(first.response_id, None);
+    assert_eq!(first.raw_stop_reason, None);
+    assert_eq!(first.error_message.as_deref(), Some("unknown: no message"));
+
+    let second_events = events(&model, &context, &options(|_| {})).await;
+    let second = failed(&second_events);
+    assert_eq!(
+        second.error_message.as_deref(),
+        Some("server_error: no message")
+    );
+
+    let third_events = events(&model, &context, &options(|_| {})).await;
+    let third = done(&third_events);
+    assert_eq!(third.response_id, None);
+    assert_eq!(third.raw_stop_reason, None);
+    assert_eq!(third.stop_reason, StopReason::Stop);
+
+    let fourth_events = events(&model, &context, &options(|_| {})).await;
+    let fourth = failed(&fourth_events);
+    assert_eq!(fourth.error_message.as_deref(), Some("Error Code : "));
+    server.requests().await;
 }
 
 #[tokio::test]
@@ -956,11 +1564,60 @@ async fn rejects_an_openai_error_event_with_code_and_partial_content() {
     let error = failed(&events);
     assert_eq!(
         error.error_message.as_deref(),
-        Some("provider response failed: slow down")
+        Some("Error Code rate_limit_exceeded: slow down")
     );
     assert_eq!(error.stop_reason, StopReason::Error);
-    assert_eq!(error.raw_stop_reason.as_deref(), Some("error"));
+    assert_eq!(error.raw_stop_reason, None);
     assert_eq!(error.content, [text("Visible", None)]);
+}
+
+#[tokio::test]
+async fn does_not_use_nested_error_details_for_openai_error_events() {
+    let sse = "data: {\"type\":\"error\",\"error\":{\"code\":\"nested_code\",\"message\":\"nested message\"}}\n\n";
+    let server = serve([Reply::sse(sse)]).await;
+    let model = model(&server.base_url);
+    let events = events(
+        &model,
+        &Context::new([Message::user("Write")]),
+        &options(|_| {}),
+    )
+    .await;
+
+    let error = failed(&events);
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("Error Code undefined: undefined")
+    );
+    server.requests().await;
+}
+
+#[tokio::test]
+async fn emits_a_reasoning_summary_part_boundary_delta() {
+    let sse = [
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_boundary\",\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"Part\"}\n\n",
+        "data: {\"type\":\"response.reasoning_summary_part.done\",\"output_index\":0}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_boundary\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Part\"}]}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_boundary\",\"status\":\"completed\",\"usage\":{}}}\n\n",
+    ]
+    .concat();
+    let server = serve([Reply::sse(sse)]).await;
+    let model = model(&server.base_url);
+    let events = events(
+        &model,
+        &Context::new([Message::user("Think")]),
+        &options(|_| {}),
+    )
+    .await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AssistantMessageEvent::ThinkingDelta { delta, .. } if delta == "\n\n"
+    )));
+    assert_eq!(
+        done(&events).content,
+        [thinking("Part", Some("rs_boundary"), None)]
+    );
 }
 
 #[tokio::test]
@@ -1051,7 +1708,7 @@ async fn cancels_an_openai_request_before_response_headers() {
     let events = request.await.unwrap();
     let error = failed(&events);
     assert_eq!(error.stop_reason, StopReason::Aborted);
-    assert_eq!(error.error_message.as_deref(), Some("request cancelled"));
+    assert_eq!(error.error_message.as_deref(), Some("Request aborted"));
     assert!(error.content.is_empty());
 }
 
@@ -1075,7 +1732,7 @@ async fn cancels_while_reading_an_openai_error_body() {
     let events = request.await.unwrap();
     let error = failed(&events);
     assert_eq!(error.stop_reason, StopReason::Aborted);
-    assert_eq!(error.error_message.as_deref(), Some("request cancelled"));
+    assert_eq!(error.error_message.as_deref(), Some("Request aborted"));
     assert!(error.content.is_empty());
     server.requests().await;
 }
@@ -1106,7 +1763,10 @@ async fn cancels_an_active_openai_stream_with_partial_content() {
             assert_eq!(reason, StopReason::Aborted);
             assert_eq!(error.stop_reason, StopReason::Aborted);
             assert_eq!(error.raw_stop_reason.as_deref(), Some("cancelled"));
-            assert_eq!(error.error_message.as_deref(), Some("request cancelled"));
+            assert_eq!(
+                error.error_message.as_deref(),
+                Some("OpenAI Responses stream ended before a terminal response event")
+            );
             assert_eq!(error.content, [text("Visible", None)]);
         }
         event => panic!("unexpected cancellation event: {event:?}"),
@@ -1114,7 +1774,7 @@ async fn cancels_an_active_openai_stream_with_partial_content() {
 }
 
 #[tokio::test]
-async fn times_out_an_openai_request_before_response_headers() {
+async fn times_out_an_openai_request_before_response_headers_per_attempt() {
     let server = serve([Reply::pending()]).await;
     let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
@@ -1129,13 +1789,13 @@ async fn times_out_an_openai_request_before_response_headers() {
     assert_eq!(error.stop_reason, StopReason::Error);
     assert_eq!(
         error.error_message.as_deref(),
-        Some("provider timed out during Overall")
+        Some("provider timed out during Connection")
     );
     assert!(error.content.is_empty());
 }
 
 #[tokio::test]
-async fn times_out_while_reading_an_openai_error_body() {
+async fn does_not_apply_an_openai_timeout_to_an_error_body() {
     let server = serve([Reply::open_json(
         500,
         json!({"error": {"message": "unfinished"}}),
@@ -1143,48 +1803,52 @@ async fn times_out_while_reading_an_openai_error_body() {
     .await;
     let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
+    let cancellation = tokio_util::sync::CancellationToken::new();
     let options = options(|options| {
-        options.stream.timeout = Some(std::time::Duration::from_secs(5));
+        options.stream.timeout = Some(std::time::Duration::from_millis(10));
+        options.stream.cancellation = cancellation.clone();
     });
     let request = tokio::spawn(async move { events(&model, &context, &options).await });
 
     server.wait_for_requests(1).await;
-    tokio::task::yield_now().await;
-    tokio::time::pause();
-    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cancellation.cancel();
 
     let events = request.await.unwrap();
     let error = failed(&events);
-    assert_eq!(
-        error.error_message.as_deref(),
-        Some("provider timed out during Overall")
-    );
+    assert_eq!(error.error_message.as_deref(), Some("Request aborted"));
+    assert_eq!(error.stop_reason, StopReason::Aborted);
     assert!(error.content.is_empty());
     server.requests().await;
 }
 
-#[tokio::test(start_paused = true)]
-async fn times_out_an_openai_stream_before_its_first_event() {
-    let server = serve([Reply::open_sse(": keepalive\n\n")]).await;
+#[tokio::test]
+async fn accepts_an_openai_stream_body_after_the_header_timeout() {
+    let server = serve([Reply::open_sse(Vec::new())]).await;
     let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
+    let cancellation = tokio_util::sync::CancellationToken::new();
     let options = options(|options| {
         options.stream.timeout = Some(std::time::Duration::from_secs(5));
+        options.stream.cancellation = cancellation.clone();
     });
     let mut response = openai::stream(&model, &context, &options);
-    let next = tokio::spawn(async move { response.next().await });
+    assert!(matches!(
+        response.next().await,
+        Some(AssistantMessageEvent::Start { .. })
+    ));
 
-    tokio::task::yield_now().await;
-    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cancellation.cancel();
 
-    match next.await.unwrap() {
+    match response.next().await {
         Some(AssistantMessageEvent::Error { reason, error }) => {
-            assert_eq!(reason, StopReason::Error);
-            assert_eq!(error.stop_reason, StopReason::Error);
-            assert_eq!(error.raw_stop_reason, None);
+            assert_eq!(reason, StopReason::Aborted);
+            assert_eq!(error.stop_reason, StopReason::Aborted);
+            assert_eq!(error.raw_stop_reason.as_deref(), Some("cancelled"));
             assert_eq!(
                 error.error_message.as_deref(),
-                Some("provider timed out during Overall")
+                Some("OpenAI Responses stream ended before a terminal response event")
             );
             assert!(error.content.is_empty());
         }
@@ -1193,38 +1857,40 @@ async fn times_out_an_openai_stream_before_its_first_event() {
 }
 
 #[tokio::test]
-async fn enforces_an_overall_openai_stream_deadline() {
-    let sse = [
-        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_overall\"}}\n\n",
-        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_overall\",\"type\":\"message\",\"content\":[]}}\n\n",
-        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Visible\"}\n\n",
-    ]
-    .concat();
-    let server = serve([Reply::open_sse(sse)]).await;
+async fn retries_an_openai_header_timeout_with_a_fresh_timeout() {
+    let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_retry_timeout\",\"status\":\"completed\",\"usage\":{}}}\n\n";
+    let server = serve([Reply::pending(), Reply::sse(sse)]).await;
     let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
     let options = options(|options| {
-        options.stream.timeout = Some(std::time::Duration::from_secs(5));
+        options.stream.timeout = Some(std::time::Duration::from_millis(25));
+        options.stream.max_retries = Some(1);
+        options.stream.max_retry_delay = Some(std::time::Duration::ZERO);
     });
-    let mut response = openai::stream(&model, &context, &options);
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        events(&model, &context, &options),
+    )
+    .await
+    .expect("retry should complete");
+    done(&events);
+    assert_eq!(server.request_count(), 2);
+    server.requests().await;
+}
 
-    while !matches!(
-        response.next().await,
-        Some(AssistantMessageEvent::TextDelta { .. })
-    ) {}
-    tokio::time::pause();
-    let next = tokio::spawn(async move { response.next().await });
-    tokio::time::advance(std::time::Duration::from_secs(5)).await;
-
-    match next.await.unwrap() {
-        Some(AssistantMessageEvent::Error { reason, error }) => {
-            assert_eq!(reason, StopReason::Error);
-            assert_eq!(error.stop_reason, StopReason::Error);
-            assert_eq!(error.raw_stop_reason.as_deref(), Some("timeout.overall"));
-            assert_eq!(error.content, [text("Visible", None)]);
-        }
-        event => panic!("unexpected timeout event: {event:?}"),
-    }
+#[tokio::test]
+async fn uses_the_sdk_zero_timeout_behavior_for_openai() {
+    let server = serve([Reply::pending()]).await;
+    let model = model(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+    let options = options(|options| {
+        options.stream.timeout = Some(std::time::Duration::ZERO);
+    });
+    let events = events(&model, &context, &options).await;
+    assert_eq!(
+        failed(&events).error_message.as_deref(),
+        Some("provider timed out during Connection")
+    );
 }
 
 #[tokio::test]
@@ -1269,17 +1935,22 @@ async fn exposes_openai_error_headers_to_the_response_hook() {
         429,
         json!({"error": {"code": "rate_limit_exceeded", "message": "Too many requests"}}),
     )
-    .with_header("x-request-id", "req_failure")
-    .with_header("retry-after-ms", "250")
-    .with_header("x-ratelimit-limit-requests", "100")
-    .with_header("x-ratelimit-remaining-requests", "0")
-    .with_header("x-ratelimit-reset-requests", "1s");
-    let failure_server = serve([failure]).await;
-    let failure_model = model(&failure_server.base_url);
+    .with_header("retry-after-ms", "0");
+    let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_metadata\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
+    let success = Reply::sse(sse)
+        .with_header("x-request-id", "req_success")
+        .with_header("x-repeated", "one")
+        .with_header("x-repeated", "two")
+        .with_header("x-ratelimit-limit-tokens", "1000")
+        .with_header("x-ratelimit-remaining-tokens", "900")
+        .with_header("x-ratelimit-reset-tokens", "2s");
+    let server = serve([failure, success]).await;
+    let model = model(&server.base_url);
     let context = Context::new([Message::user("Hello")]);
     let responses = Arc::new(Mutex::new(Vec::new()));
     let captured = responses.clone();
     let mut options = options(|_| {});
+    options.stream.max_retries = Some(1);
     options.stream.on_response = Some(ResponseHook::new(move |response, _| {
         let captured = captured.clone();
         async move {
@@ -1288,47 +1959,11 @@ async fn exposes_openai_error_headers_to_the_response_hook() {
         }
     }));
 
-    let failure_events = events(&failure_model, &context, &options).await;
-    assert_eq!(
-        failed(&failure_events).error_message.as_deref(),
-        Some("provider returned HTTP 429: Too many requests")
-    );
-    let failure_response = responses.lock().unwrap()[0].clone();
-    assert_eq!(failure_response.status, 429);
-    assert_eq!(
-        failure_response
-            .headers
-            .get("x-request-id")
-            .map(String::as_str),
-        Some("req_failure")
-    );
-    assert_eq!(
-        failure_response
-            .headers
-            .get("retry-after-ms")
-            .map(String::as_str),
-        Some("250")
-    );
-    assert_eq!(
-        failure_response
-            .headers
-            .get("x-ratelimit-remaining-requests")
-            .map(String::as_str),
-        Some("0")
-    );
-    failure_server.requests().await;
-
-    let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_metadata\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{},\"output_tokens\":0,\"output_tokens_details\":{}}}}\n\n";
-    let success = Reply::sse(sse)
-        .with_header("x-request-id", "req_success")
-        .with_header("x-ratelimit-limit-tokens", "1000")
-        .with_header("x-ratelimit-remaining-tokens", "900")
-        .with_header("x-ratelimit-reset-tokens", "2s");
-    let success_server = serve([success]).await;
-    let success_model = model(&success_server.base_url);
-    let success_events = events(&success_model, &context, &options).await;
+    let success_events = events(&model, &context, &options).await;
     done(&success_events);
-    let success_response = responses.lock().unwrap()[1].clone();
+    let captured = responses.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let success_response = captured[0].clone();
     assert_eq!(success_response.status, 200);
     assert_eq!(
         success_response
@@ -1336,6 +1971,13 @@ async fn exposes_openai_error_headers_to_the_response_hook() {
             .get("x-request-id")
             .map(String::as_str),
         Some("req_success")
+    );
+    assert_eq!(
+        success_response
+            .headers
+            .get("x-repeated")
+            .map(String::as_str),
+        Some("one, two")
     );
     assert_eq!(
         success_response
@@ -1358,7 +2000,40 @@ async fn exposes_openai_error_headers_to_the_response_hook() {
             .map(String::as_str),
         Some("2s")
     );
-    success_server.requests().await;
+    assert_eq!(server.request_count(), 2);
+}
+
+#[tokio::test]
+async fn normalizes_and_caps_openai_provider_error_bodies() {
+    let long_message = "x".repeat(5_000);
+    let serialized_length = serde_json::to_string(&json!({"message": long_message.clone()}))
+        .unwrap()
+        .len();
+    let server = serve([
+        Reply::json(400, json!({"error": {"message": long_message}})),
+        Reply::json(403, json!({})),
+    ])
+    .await;
+    let model = model(&server.base_url);
+    let context = Context::new([Message::user("Hello")]);
+
+    let first = events(&model, &context, &options(|_| {})).await;
+    let error = failed(&first);
+    let message = error.error_message.as_deref().unwrap();
+    assert!(message.starts_with("OpenAI API error (400): "));
+    let suffix = format!("... [truncated {} chars]", serialized_length - 4_000);
+    assert!(message.ends_with(&suffix));
+    assert_eq!(
+        message.chars().count(),
+        "OpenAI API error (400): ".chars().count() + 4_000 + suffix.chars().count()
+    );
+
+    let second = events(&model, &context, &options(|_| {})).await;
+    assert_eq!(
+        failed(&second).error_message.as_deref(),
+        Some("OpenAI API error (403): 403 status code (no body)")
+    );
+    server.requests().await;
 }
 
 fn model(base_url: &str) -> ds_ai::Model {
@@ -1393,12 +2068,11 @@ fn text(value: &str, signature: Option<(&str, Option<&str>)>) -> AssistantConten
     AssistantContent::Text(TextContent {
         text: value.into(),
         text_signature: signature.map(|(id, phase)| {
-            json!({
-                "v": 1,
-                "id": id,
-                "phase": phase,
-            })
-            .to_string()
+            let mut signature = json!({"v": 1, "id": id});
+            if let Some(phase) = phase {
+                signature["phase"] = phase.into();
+            }
+            signature.to_string()
         }),
     })
 }
@@ -1408,8 +2082,8 @@ fn thinking(value: &str, id: Option<&str>, encrypted: Option<&str>) -> Assistant
         thinking: value.into(),
         thinking_signature: id.map(|id| {
             let mut signature = json!({
-                "type": "reasoning",
                 "id": id,
+                "type": "reasoning",
                 "summary": [{"type": "summary_text", "text": value}],
             });
             if let Some(encrypted) = encrypted {

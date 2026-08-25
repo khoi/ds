@@ -39,7 +39,16 @@ fn generate(timestamp: u64, ordinary: bool) -> Result<String, UuidV7Error> {
     if timestamp > MAX_TIMESTAMP {
         return Err(UuidV7Error::InvalidTimestamp);
     }
-    let mut state = state().lock().expect("UUIDv7 state lock");
+    generate_with(state(), timestamp, ordinary, rand::random())
+}
+
+fn generate_with(
+    state: &Mutex<State>,
+    timestamp: u64,
+    ordinary: bool,
+    mut bytes: [u8; 16],
+) -> Result<String, UuidV7Error> {
+    let mut state = state.lock().expect("UUIDv7 state lock");
     let timestamp = if ordinary {
         let timestamp = timestamp.max(state.last_ordinary_timestamp);
         state.last_ordinary_timestamp = timestamp;
@@ -47,7 +56,6 @@ fn generate(timestamp: u64, ordinary: bool) -> Result<String, UuidV7Error> {
     } else {
         timestamp
     };
-    let mut bytes = rand::random::<[u8; 16]>();
     let sequence = match state.sequence {
         Some(MAX_SEQUENCE) => return Err(UuidV7Error::SequenceExhausted),
         Some(sequence) => sequence + 1,
@@ -78,4 +86,39 @@ fn generate(timestamp: u64, ordinary: bool) -> Result<String, UuidV7Error> {
 fn state() -> &'static Mutex<State> {
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(State::default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{State, generate_with};
+    use std::sync::Mutex;
+
+    const TIMESTAMP: u64 = 0x0123_4567_89ab;
+
+    #[test]
+    fn keeps_ordinary_ids_ordered_across_clock_rollback() {
+        let state = Mutex::new(State::default());
+        let first = generate_with(&state, TIMESTAMP, true, [1; 16]).unwrap();
+        let second = generate_with(&state, TIMESTAMP, true, [2; 16]).unwrap();
+        let rollback = generate_with(&state, TIMESTAMP - 1, true, [3; 16]).unwrap();
+        let advance = generate_with(&state, TIMESTAMP + 1, true, [4; 16]).unwrap();
+        let ids = [first, second, rollback, advance];
+
+        let timestamps = ids.iter().map(|id| timestamp(id)).collect::<Vec<_>>();
+        assert_eq!(timestamps, [TIMESTAMP, TIMESTAMP, TIMESTAMP, TIMESTAMP + 1]);
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn preserves_fresh_random_tails() {
+        let state = Mutex::new(State::default());
+        let first = generate_with(&state, TIMESTAMP, false, [1; 16]).unwrap();
+        let second = generate_with(&state, TIMESTAMP, false, [2; 16]).unwrap();
+
+        assert_ne!(&first[24..], &second[24..]);
+    }
+
+    fn timestamp(value: &str) -> u64 {
+        u64::from_str_radix(&format!("{}{}", &value[..8], &value[9..13]), 16).unwrap()
+    }
 }

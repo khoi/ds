@@ -11,6 +11,8 @@ use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+pub(crate) mod resolution;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Credential {
@@ -150,11 +152,11 @@ impl CredentialStore for InMemoryCredentialStore {
             _ = cancellation.cancelled() => return Err(AuthError::Cancelled),
             next = mutation(current.clone()) => next?,
         };
+        cancelled(cancellation)?;
         if let Some(next) = next {
-            self.credentials
-                .write()
-                .await
-                .insert(provider_id.to_owned(), next.clone());
+            let mut credentials = self.credentials.write().await;
+            cancelled(cancellation)?;
+            credentials.insert(provider_id.to_owned(), next.clone());
             Ok(Some(next))
         } else {
             Ok(current)
@@ -172,8 +174,9 @@ impl CredentialStore for InMemoryCredentialStore {
             _ = cancellation.cancelled() => return Err(AuthError::Cancelled),
             guard = provider_lock.lock() => guard,
         };
+        let mut credentials = self.credentials.write().await;
         cancelled(cancellation)?;
-        self.credentials.write().await.remove(provider_id);
+        credentials.remove(provider_id);
         Ok(())
     }
 }
@@ -401,6 +404,7 @@ impl ApiKeyAuth for EnvApiKeyAuth {
             key: Some(key),
             env,
         }) = credential
+            && !key.is_empty()
         {
             return Ok(Some(AuthResult {
                 auth: ModelAuth {
@@ -412,7 +416,7 @@ impl ApiKeyAuth for EnvApiKeyAuth {
             }));
         }
         for name in &self.env_names {
-            if let Some(key) = context.env(name).await {
+            if let Some(key) = context.env(name).await.filter(|key| !key.is_empty()) {
                 cancelled(cancellation)?;
                 return Ok(Some(AuthResult {
                     auth: ModelAuth {
@@ -434,6 +438,8 @@ pub enum AuthError {
     Cancelled,
     #[error("credential store failed: {0}")]
     Store(String),
+    #[error("{0}")]
+    Provider(String),
     #[error("authentication failed: {0}")]
     Authentication(String),
     #[error("OAuth failed: {0}")]
