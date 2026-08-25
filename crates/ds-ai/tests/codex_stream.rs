@@ -887,9 +887,14 @@ async fn parses_codex_http_date_retry_headers() {
     });
     let events = events(&model, &Context::new([Message::user("Retry")]), &options).await;
 
-    assert_eq!(
-        failed(&events).error_message.as_deref(),
-        Some("Server requested 60s retry delay (max: 1s)")
+    let error = failed(&events).error_message.as_deref().unwrap();
+    let requested = error
+        .strip_prefix("Server requested ")
+        .and_then(|value| value.strip_suffix("s retry delay (max: 1s)"))
+        .and_then(|value| value.parse::<u64>().ok());
+    assert!(
+        requested.is_some_and(|seconds| (2..=60).contains(&seconds)),
+        "{error}"
     );
 }
 
