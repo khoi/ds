@@ -557,16 +557,7 @@ impl Models {
         self.stream(model, context, options).result().await
     }
 
-    pub fn stream_simple<O: ApiOptions>(
-        &self,
-        model: &crate::ApiModel<O>,
-        context: &Context,
-        options: &SimpleStreamOptions,
-    ) -> AssistantMessageEventStream {
-        self.stream_simple_erased(model.as_model(), context, options)
-    }
-
-    fn stream_simple_erased(
+    pub fn stream_simple(
         &self,
         model: &Model,
         context: &Context,
@@ -616,9 +607,9 @@ impl Models {
         })
     }
 
-    pub async fn complete_simple<O: ApiOptions>(
+    pub async fn complete_simple(
         &self,
-        model: &crate::ApiModel<O>,
+        model: &Model,
         context: &Context,
         options: &SimpleStreamOptions,
     ) -> Result<AssistantMessage, AssistantMessageStreamError> {

@@ -110,6 +110,39 @@ async fn registers_replaces_lists_routes_and_deletes_providers() {
 }
 
 #[tokio::test]
+async fn streams_and_completes_a_runtime_model_through_its_registered_provider() {
+    let mut model = model("runtime", "model-a");
+    model.api = Api::Other("runtime-api".into());
+    let mut models = collection();
+    models.set_provider(provider(&model, "runtime"));
+    let model = models.model("runtime", "model-a").unwrap();
+    let options = SimpleStreamOptions {
+        stream: StreamOptions {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let result = models
+        .stream_simple(&model, &Context::new([]), &options)
+        .result()
+        .await
+        .unwrap();
+
+    assert_eq!(result.api, Api::Other("runtime-api".into()));
+    assert_eq!(result.error_message.as_deref(), Some("runtime"));
+
+    let result = models
+        .complete_simple(&model, &Context::new([]), &options)
+        .await
+        .unwrap();
+
+    assert_eq!(result.api, Api::Other("runtime-api".into()));
+    assert_eq!(result.error_message.as_deref(), Some("runtime"));
+}
+
+#[tokio::test]
 async fn returns_terminal_stream_errors_for_unknown_providers() {
     let model = model("missing", "gpt-test");
     let result = collection()
@@ -1274,7 +1307,7 @@ async fn prepares_simple_options_from_the_model_and_context() {
     models.set_provider(Arc::new(ds_ai::openai::Provider::new([model.clone()])));
     models
         .complete_simple(
-            &model.typed::<ds_ai::OpenAiResponsesOptions>().unwrap(),
+            &model,
             &Context::new([ds_ai::Message::user("x".repeat(4_000))]),
             &SimpleStreamOptions {
                 stream: StreamOptions {
@@ -1296,9 +1329,7 @@ async fn prepares_simple_options_from_the_model_and_context() {
     plain_model.sampling_params.clear();
     models
         .complete_simple(
-            &plain_model
-                .typed::<ds_ai::OpenAiResponsesOptions>()
-                .unwrap(),
+            &plain_model,
             &Context::new([ds_ai::Message::user("Hello")]),
             &SimpleStreamOptions {
                 stream: StreamOptions {

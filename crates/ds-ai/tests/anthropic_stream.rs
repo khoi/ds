@@ -2086,11 +2086,7 @@ async fn auth_request(
         ..Default::default()
     };
     models
-        .complete_simple(
-            &model.typed::<ds_ai::AnthropicOptions>().unwrap(),
-            &Context::new([Message::user("Hello")]),
-            &options,
-        )
+        .complete_simple(&model, &Context::new([Message::user("Hello")]), &options)
         .await
         .unwrap();
     server.requests().await.pop().unwrap()
