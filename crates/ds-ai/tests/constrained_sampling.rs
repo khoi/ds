@@ -1,11 +1,11 @@
 use crate::support::{Reply, serve};
 use base64::prelude::*;
 use ds_ai::{
-    AnthropicMessagesCompatibility, AnthropicOptions, ApiStreamOptions, AssistantContent,
-    ConstrainedSampling, ConstrainedSamplingStrictness, Context, GrammarVariants, InputContent,
-    Message, ModelCompatibility, OpenAiCodexResponsesOptions, OpenAiResponsesCompatibility,
-    OpenAiResponsesOptions, Provider, StopReason, StreamOptions, Tool, ToolResultMessage,
-    Transport, builtin_model,
+    AnthropicMessagesCompatibility, AnthropicOptions, Api, ApiStreamOptions, AssistantContent,
+    AssistantMessage, AssistantToolCall, ConstrainedSampling, ConstrainedSamplingStrictness,
+    Context, GrammarVariants, InputContent, Message, ModelCompatibility,
+    OpenAiCodexResponsesOptions, OpenAiResponsesCompatibility, OpenAiResponsesOptions, Provider,
+    StopReason, StreamOptions, Tool, ToolResultMessage, Transport, Usage, builtin_model,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -472,11 +472,110 @@ async fn rejects_supported_grammar_without_a_provider_variant() {
         .unwrap();
 
     assert_eq!(result.stop_reason, StopReason::Error);
-    assert!(
-        result
-            .error_message
-            .unwrap()
-            .contains("no supported grammar variant was provided")
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some(
+            "invalid request: Tool \"grammar\" cannot use grammar constrained sampling: no supported grammar variant was provided.",
+        )
+    );
+}
+
+#[tokio::test]
+async fn rejects_grammar_tools_with_exact_input_property_errors() {
+    let cases = [
+        (
+            json!({"type": "array"}),
+            "grammar constrained sampling requires an object parameter schema",
+        ),
+        (
+            json!({"type": "object", "required": []}),
+            "grammar constrained sampling requires exactly one required string property",
+        ),
+        (
+            json!({"type": "object", "required": ["payload"], "properties": {}}),
+            "grammar constrained sampling requires a properties entry for payload",
+        ),
+        (
+            json!({
+                "type": "object",
+                "required": ["payload"],
+                "properties": {"payload": {"type": "number"}}
+            }),
+            "grammar constrained sampling property payload must have type string",
+        ),
+    ];
+
+    for (parameters, detail) in cases {
+        let result = grammar_request(parameters).await;
+        let expected = format!(
+            "invalid request: Tool \"grammar\" cannot use grammar constrained sampling: {detail}."
+        );
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert_eq!(result.error_message.as_deref(), Some(expected.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn rejects_grammar_replay_with_an_exact_input_type_error() {
+    let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    model.compat = Some(ModelCompatibility::OpenAi(OpenAiResponsesCompatibility {
+        supports_open_ai_grammar_tools: Some(true),
+        ..Default::default()
+    }));
+    let provider = ds_ai::openai::Provider::new([model.clone()]);
+    let result = provider
+        .stream(
+            &model,
+            &Context::new([Message::assistant(AssistantMessage {
+                content: vec![AssistantContent::ToolCall(AssistantToolCall {
+                    id: "call_1|ctc_1".into(),
+                    name: "grammar".into(),
+                    arguments: json!({"payload": 42}),
+                    thought_signature: None,
+                    namespace: None,
+                })],
+                api: Api::OpenAiResponses,
+                provider: "openai".into(),
+                model: model.id.clone(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                raw_stop_reason: None,
+                end_turn: None,
+                timestamp: 0,
+            })])
+            .with_tools([Tool {
+                name: "grammar".into(),
+                description: "Grammar".into(),
+                parameters: schema(),
+                constrained_sampling: Some(ConstrainedSampling::Grammar {
+                    variants: GrammarVariants {
+                        openai_lark: Some("start: /[a-z]+/".into()),
+                        openai_regex: None,
+                    },
+                }),
+            }]),
+            &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .result()
+        .await
+        .unwrap();
+
+    assert_eq!(result.stop_reason, StopReason::Error);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some(
+            "invalid request: Grammar tool call \"grammar\" requires argument \"payload\" to be a string.",
+        )
     );
 }
 
@@ -517,11 +616,11 @@ async fn rejects_grammar_input_that_changes_after_close() {
         .unwrap();
 
     assert_eq!(result.stop_reason, StopReason::Error);
-    assert!(
-        result
-            .error_message
-            .unwrap()
-            .contains("changed after it was closed")
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some(
+            "invalid provider stream: grammar tool input for property \"payload\" changed after it was closed",
+        )
     );
 }
 
@@ -724,6 +823,40 @@ fn tools() -> Vec<Tool> {
 
 fn strict_tool() -> Tool {
     Tool::new("strict", "Strict", schema()).with_strict()
+}
+
+async fn grammar_request(parameters: Value) -> ds_ai::AssistantMessage {
+    let mut model = builtin_model("openai", "gpt-5.6-sol").unwrap();
+    model.compat = Some(ModelCompatibility::OpenAi(OpenAiResponsesCompatibility {
+        supports_open_ai_grammar_tools: Some(true),
+        ..Default::default()
+    }));
+    let provider = ds_ai::openai::Provider::new([model.clone()]);
+    provider
+        .stream(
+            &model,
+            &Context::new([Message::user("Use a tool")]).with_tools([Tool {
+                name: "grammar".into(),
+                description: "Grammar".into(),
+                parameters,
+                constrained_sampling: Some(ConstrainedSampling::Grammar {
+                    variants: GrammarVariants {
+                        openai_lark: Some("start: /[a-z]+/".into()),
+                        openai_regex: None,
+                    },
+                }),
+            }]),
+            &ApiStreamOptions::OpenAiResponses(OpenAiResponsesOptions {
+                stream: StreamOptions {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
+        .result()
+        .await
+        .unwrap()
 }
 
 fn schema() -> Value {

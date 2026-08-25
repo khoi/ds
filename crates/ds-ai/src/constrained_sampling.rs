@@ -62,14 +62,20 @@ pub(crate) fn grammar(tool: &Tool, supported: bool) -> Result<Option<GrammarSamp
         })
         .ok_or_else(|| {
             format!(
-                "tool {:?} cannot use grammar constrained sampling: no supported grammar variant was provided",
+                "Tool \"{}\" cannot use grammar constrained sampling: no supported grammar variant was provided.",
                 tool.name
             )
         })?;
+    let input_property = grammar_input_property(tool).map_err(|error| {
+        format!(
+            "Tool \"{}\" cannot use grammar constrained sampling: {error}.",
+            tool.name
+        )
+    })?;
     Ok(Some(GrammarSampling {
         syntax,
         definition: definition.into(),
-        input_property: grammar_input_property(tool)?,
+        input_property,
     }))
 }
 
@@ -84,7 +90,7 @@ pub(crate) fn grammar_input(
         .map(str::to_owned)
         .ok_or_else(|| {
             format!(
-                "grammar tool call {tool_name:?} requires argument {input_property:?} to be a string"
+                "Grammar tool call \"{tool_name}\" requires argument \"{input_property}\" to be a string."
             )
         })
 }
@@ -106,12 +112,12 @@ pub(crate) fn append_grammar_input_delta(
             return Ok(None);
         }
         return Err(format!(
-            "grammar tool input for property {input_property:?} changed after it was closed"
+            "grammar tool input for property \"{input_property}\" changed after it was closed"
         ));
     }
     let Some(input_delta) = next_input.strip_prefix(&buffer.input) else {
         return Err(format!(
-            "grammar tool input for property {input_property:?} changed non-monotonically"
+            "grammar tool input for property \"{input_property}\" changed non-monotonically"
         ));
     };
     if !close && input_delta.is_empty() {
