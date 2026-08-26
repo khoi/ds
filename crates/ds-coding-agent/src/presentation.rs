@@ -2,7 +2,6 @@ use ds_agent_core::ToolOutput;
 use serde_json::Value;
 use std::time::Duration;
 
-const MAX_LABEL_CHARS: usize = 120;
 const MAX_OUTPUT_LINES: usize = 5;
 const MAX_DIFF_LINES: usize = 12;
 
@@ -57,7 +56,7 @@ pub(crate) fn finished_tool(
     } else {
         Vec::new()
     };
-    if output.content.truncated {
+    if output.content.truncated && !rendered_output.is_empty() {
         rendered_output.push("… tool output truncated".into());
     }
     if output
@@ -92,19 +91,19 @@ fn action_label(name: &str, arguments: &Value, completed: bool) -> String {
     };
     let value = match name {
         "read" | "edit" | "write" => string_argument(arguments, "path"),
-        "bash" => string_argument(arguments, "command"),
+        "bash" => Some("shell command"),
         _ => None,
     }
     .unwrap_or(name);
-    format!("{verb} {}", clipped_label(value))
+    format!("{verb} {}", normalized_label(value))
 }
 
 fn string_argument<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
     arguments.as_object()?.get(key)?.as_str()
 }
 
-fn clipped_label(value: &str) -> String {
-    let normalized = value
+fn normalized_label(value: &str) -> String {
+    value
         .chars()
         .map(|character| {
             if character.is_control() {
@@ -113,17 +112,10 @@ fn clipped_label(value: &str) -> String {
                 character
             }
         })
-        .collect::<String>();
-    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= MAX_LABEL_CHARS {
-        return normalized;
-    }
-    let mut clipped = normalized
-        .chars()
-        .take(MAX_LABEL_CHARS - 1)
-        .collect::<String>();
-    clipped.push('…');
-    clipped
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -160,8 +152,8 @@ fn outcome_detail(output: &ToolOutput) -> Option<String> {
     None
 }
 
-fn should_show_output(name: &str, output: &ToolOutput) -> bool {
-    !output.content.text.is_empty() && (output.is_error || name == "bash")
+fn should_show_output(_name: &str, output: &ToolOutput) -> bool {
+    !output.content.text.is_empty() && output.is_error
 }
 
 fn display_output<'a>(name: &str, output: &'a ToolOutput) -> &'a str {
@@ -238,7 +230,10 @@ mod tests {
             Duration::from_millis(340),
         );
 
-        assert_eq!(presentation.headline, "✗ Ran cargo test · 340ms · exit 7");
+        assert_eq!(
+            presentation.headline,
+            "✗ Ran shell command · 340ms · exit 7"
+        );
         assert_eq!(presentation.output, ["failure"]);
         assert_eq!(presentation.outcome, PresentationOutcome::Error);
     }
@@ -259,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn command_output_keeps_only_the_final_five_lines() {
+    fn successful_commands_hide_their_output_and_truncation_marker() {
         let output = ToolOutput::success(BoundedText::new("1\n2\n3\n4\n5\n6\n7", true));
 
         let presentation = finished_tool(
@@ -269,18 +264,8 @@ mod tests {
             Duration::from_secs(2),
         );
 
-        assert_eq!(
-            presentation.output,
-            [
-                "… 2 earlier lines",
-                "3",
-                "4",
-                "5",
-                "6",
-                "7",
-                "… tool output truncated"
-            ]
-        );
+        assert_eq!(presentation.headline, "● Ran shell command · 2.0s");
+        assert!(presentation.output.is_empty());
     }
 
     #[test]

@@ -21,6 +21,7 @@ use futures_util::{Stream, StreamExt};
 use std::{
     error::Error,
     io::{self, IsTerminal, Write},
+    process::Command as ProcessCommand,
     sync::Arc,
 };
 use tokio_util::sync::CancellationToken;
@@ -249,6 +250,7 @@ async fn run_login(
         models,
         provider_id,
         requested_type.map(CredentialType::from),
+        TerminalAuthInteraction::new(),
     )
     .await?;
     println!("logged in to {provider_id}");
@@ -259,11 +261,11 @@ async fn perform_login(
     models: &Models,
     provider_id: &str,
     requested_type: Option<CredentialType>,
+    interaction: TerminalAuthInteraction,
 ) -> Result<(), Box<dyn Error>> {
     let provider = models
         .provider(provider_id)
         .ok_or_else(|| format!("unknown provider: {provider_id}"))?;
-    let interaction = TerminalAuthInteraction::new();
     let credential_type = match requested_type {
         Some(credential_type) => credential_type,
         None => match (&provider.auth().api_key, &provider.auth().oauth) {
@@ -415,9 +417,14 @@ impl ui::InteractiveBackend for RuntimeBackend {
             LoginMethod::ApiKey => CredentialType::ApiKey,
             LoginMethod::OAuth => CredentialType::OAuth,
         });
-        perform_login(&self.models, provider, method)
-            .await
-            .map_err(|error| error.to_string())
+        perform_login(
+            &self.models,
+            provider,
+            method,
+            TerminalAuthInteraction::for_tui(),
+        )
+        .await
+        .map_err(|error| error.to_string())
     }
 
     async fn logout(&mut self, provider: &str) -> Result<(), String> {
@@ -464,12 +471,21 @@ fn run_config_command(
 
 struct TerminalAuthInteraction {
     cancellation: CancellationToken,
+    tui: bool,
 }
 
 impl TerminalAuthInteraction {
     fn new() -> Self {
         Self {
             cancellation: CancellationToken::new(),
+            tui: false,
+        }
+    }
+
+    fn for_tui() -> Self {
+        Self {
+            cancellation: CancellationToken::new(),
+            tui: true,
         }
     }
 
@@ -653,6 +669,12 @@ impl AuthInteraction for TerminalAuthInteraction {
                 ..
             } => self.prompt_value(message, cancellation, false).await,
             AuthPrompt::Select { message, options } => {
+                if self.tui {
+                    return options
+                        .first()
+                        .map(|option| option.id.clone())
+                        .ok_or_else(|| AuthError::Authentication("login has no choices".into()));
+                }
                 eprintln!("{message}");
                 for (index, option) in options.iter().enumerate() {
                     match &option.description {
@@ -688,6 +710,16 @@ impl AuthInteraction for TerminalAuthInteraction {
     }
 
     fn notify(&self, event: AuthEvent) {
+        if self.tui {
+            if let AuthEvent::AuthUrl { url, .. } = &event
+                && open_browser(url).is_ok()
+            {
+                return;
+            }
+            if matches!(event, AuthEvent::Info { .. } | AuthEvent::Progress { .. }) {
+                return;
+            }
+        }
         match event {
             AuthEvent::Info { message, links } => {
                 eprintln!("{message}");
@@ -715,6 +747,27 @@ impl AuthInteraction for TerminalAuthInteraction {
             AuthEvent::Progress { message } => eprintln!("{message}"),
         }
     }
+}
+
+fn open_browser(url: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let status = ProcessCommand::new("open").arg(url).status()?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let status = ProcessCommand::new("xdg-open").arg(url).status()?;
+    #[cfg(windows)]
+    let status = ProcessCommand::new("cmd")
+        .args(["/C", "start", "", url])
+        .status()?;
+    #[cfg(not(any(unix, windows)))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "opening a browser is not supported on this platform",
+    ));
+
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| io::Error::other("browser command failed"))
 }
 
 fn terminal_auth_error(operation: &str, error: io::Error) -> AuthError {
@@ -809,5 +862,31 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(AuthError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn tui_auth_uses_the_default_provider_flow_without_a_second_terminal_prompt() {
+        let interaction = TerminalAuthInteraction::for_tui();
+
+        let selected = interaction
+            .prompt(AuthPrompt::Select {
+                message: "Select flow".into(),
+                options: vec![
+                    AuthSelectOption {
+                        id: "browser".into(),
+                        label: "Browser".into(),
+                        description: None,
+                    },
+                    AuthSelectOption {
+                        id: "device".into(),
+                        label: "Device".into(),
+                        description: None,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(selected, "browser");
     }
 }

@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 use similar::TextDiff;
 use std::{
+    ffi::OsStr,
     io,
     path::{Path, PathBuf},
     process::Stdio,
@@ -429,20 +430,7 @@ async fn run_command(
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> ToolOutput {
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
-    let mut command = Command::new(shell);
-    command
-        .arg("-lc")
-        .arg(format!("exec 2>&1\n{script}"))
-        .current_dir(working_directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.as_std_mut().process_group(0);
-    }
+    let mut command = shell_command(&shell, script, working_directory);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return ToolOutput::error(format!("failed to start command: {error}")),
@@ -493,6 +481,24 @@ async fn run_command(
             details: Some(json!({ "cancelled": true })),
         },
     }
+}
+
+fn shell_command(shell: &OsStr, script: &str, working_directory: &Path) -> Command {
+    let mut command = Command::new(shell);
+    command
+        .arg("-lc")
+        .arg(script)
+        .current_dir(working_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().process_group(0);
+    }
+    command
 }
 
 enum CommandResult {
@@ -716,6 +722,18 @@ mod tests {
         assert!(failure.content.text.contains("status: 7"));
         assert!(failure.content.text.contains("nope"));
         assert_eq!(failure.details, Some(json!({ "exit_code": 7 })));
+    }
+
+    #[test]
+    fn bash_script_is_not_prefixed_with_shell_specific_exec_syntax() {
+        let command = shell_command(OsStr::new("/bin/sh"), "printf alpha", Path::new("/tmp"));
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(arguments, ["-lc", "printf alpha"]);
     }
 
     #[tokio::test]

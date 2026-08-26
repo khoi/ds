@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Paragraph, Widget, Wrap},
@@ -27,9 +27,9 @@ use std::io::{self, IsTerminal, Stdout, Write};
 use textarea::TextArea;
 use tokio_util::sync::CancellationToken;
 
-const VIEWPORT_HEIGHT: u16 = 14;
-const PICKER_VISIBLE_ITEMS: usize = 6;
-const SUGGESTION_VISIBLE_ITEMS: usize = 4;
+const VIEWPORT_HEIGHT: u16 = 8;
+const PICKER_VISIBLE_ITEMS: usize = 3;
+const SUGGESTION_VISIBLE_ITEMS: usize = 2;
 
 type InlineTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -226,21 +226,22 @@ async fn handle_slash_command(
                     .providers()
                     .into_iter()
                     .find(|choice| choice.id == provider);
-                if choice.is_none() {
-                    commit_error(terminal, &format!("unknown provider: {provider}"))?;
-                } else if !choice
-                    .as_ref()
-                    .is_some_and(|choice| supports_login_method(choice, method))
-                {
-                    commit_error(
+                match choice {
+                    None => commit_error(terminal, &format!("unknown provider: {provider}"))?,
+                    Some(choice) if !supports_login_method(&choice, method) => commit_error(
                         terminal,
                         &format!(
                             "provider {provider} does not support {} login",
                             login_method_label(method)
                         ),
-                    )?;
-                } else {
-                    run_login(backend, terminal, terminal_mode, state, &provider, method).await?;
+                    )?,
+                    Some(choice) if method.is_none() => {
+                        state.picker = Some(Picker::login(vec![choice], None));
+                    }
+                    Some(_) => {
+                        run_login(backend, terminal, terminal_mode, state, &provider, method)
+                            .await?;
+                    }
                 }
             }
             None => state.picker = Some(Picker::login(backend.providers(), method)),
@@ -531,28 +532,20 @@ fn draw(terminal: &mut InlineTerminal, state: &InteractiveState) -> io::Result<(
         } else {
             suggestions.len().min(SUGGESTION_VISIBLE_ITEMS) as u16
         };
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(overlay_height),
-                Constraint::Length(1),
-                Constraint::Length(2),
-            ])
-            .split(frame.area());
+        let areas = ui_areas(frame.area(), !state.assistant.is_empty(), overlay_height);
 
         let assistant_safe = terminal_safe_text(&state.assistant);
         let assistant_text = tui_markdown::from_str(&assistant_safe);
-        let line_count = rendered_text_height(&assistant_text, rows[0].width);
+        let line_count = rendered_text_height(&assistant_text, areas.assistant.width);
         let assistant = Paragraph::new(assistant_text).wrap(Wrap { trim: false });
-        let scroll = line_count.saturating_sub(usize::from(rows[0].height));
+        let scroll = line_count.saturating_sub(usize::from(areas.assistant.height));
         frame.render_widget(
             assistant.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
-            rows[0],
+            areas.assistant,
         );
 
         if let Some(picker) = &state.picker {
-            frame.render_widget(Paragraph::new(picker.render_lines()), rows[1]);
+            frame.render_widget(Paragraph::new(picker.render_lines()), areas.overlay);
         } else if !suggestions.is_empty() {
             let lines = suggestions
                 .iter()
@@ -562,34 +555,79 @@ fn draw(terminal: &mut InlineTerminal, state: &InteractiveState) -> io::Result<(
                         Span::styled(spec.command, Style::default().fg(Color::Cyan)),
                         Span::styled(
                             format!("  {}", spec.description),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(Color::Gray),
                         ),
                     ])
                 })
                 .collect::<Vec<_>>();
-            frame.render_widget(Paragraph::new(lines), rows[1]);
+            frame.render_widget(Paragraph::new(lines), areas.overlay);
         }
 
         frame.render_widget(
             Paragraph::new(state.status.as_deref().unwrap_or(&state.footer))
-                .style(Style::default().fg(Color::DarkGray)),
-            rows[2],
+                .style(Style::default().fg(Color::Gray)),
+            areas.status,
         );
         if let Some(picker) = &state.picker {
             frame.render_widget(
                 Paragraph::new(format!("filter › {}", picker.query)),
-                rows[3],
+                areas.input,
             );
         } else {
             let composer = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(2), Constraint::Min(1)])
-                .split(rows[3]);
+                .split(areas.input);
             frame.render_widget(Line::from("› "), composer[0]);
             frame.render_widget(&state.composer, composer[1]);
         }
     })?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UiAreas {
+    assistant: Rect,
+    overlay: Rect,
+    status: Rect,
+    input: Rect,
+}
+
+fn ui_areas(area: Rect, assistant_active: bool, overlay_height: u16) -> UiAreas {
+    let constraints = if assistant_active {
+        [
+            Constraint::Min(1),
+            Constraint::Length(overlay_height),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ]
+    } else {
+        [
+            Constraint::Length(overlay_height),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ]
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    if assistant_active {
+        UiAreas {
+            assistant: rows[0],
+            overlay: rows[1],
+            status: rows[2],
+            input: rows[3],
+        }
+    } else {
+        UiAreas {
+            assistant: rows[3],
+            overlay: rows[0],
+            status: rows[1],
+            input: rows[2],
+        }
+    }
 }
 
 fn commit_plain(terminal: &mut InlineTerminal, text: &str, style: Style) -> io::Result<()> {
@@ -639,7 +677,7 @@ fn commit_tool(terminal: &mut InlineTerminal, presentation: ToolPresentation) ->
         } else if line.starts_with("@@") {
             Style::default().fg(Color::Cyan)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(Color::Gray)
         };
         Line::styled(format!("  {line}"), style)
     }));
@@ -710,15 +748,15 @@ impl InteractiveState {
 
 #[derive(Clone)]
 enum PickerKind {
-    Models {
-        models: Vec<Model>,
-        current: String,
-    },
-    Login {
-        providers: Vec<ProviderChoice>,
-        method: Option<LoginMethod>,
-    },
+    Models { models: Vec<Model>, current: String },
+    Login(Vec<LoginChoice>),
     Logout(Vec<ProviderChoice>),
+}
+
+#[derive(Clone)]
+struct LoginChoice {
+    provider: ProviderChoice,
+    method: LoginMethod,
 }
 
 struct Picker {
@@ -751,11 +789,27 @@ impl Picker {
     }
 
     fn login(providers: Vec<ProviderChoice>, method: Option<LoginMethod>) -> Self {
+        let choices = providers
+            .into_iter()
+            .flat_map(|provider| {
+                [LoginMethod::ApiKey, LoginMethod::OAuth]
+                    .into_iter()
+                    .filter(|candidate| {
+                        method.is_none_or(|method| method == *candidate)
+                            && supports_login_method(&provider, Some(*candidate))
+                    })
+                    .map(|method| LoginChoice {
+                        provider: provider.clone(),
+                        method,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         Self {
             title: "login",
             query: String::new(),
             selected: 0,
-            kind: PickerKind::Login { providers, method },
+            kind: PickerKind::Login(choices),
         }
     }
 
@@ -796,27 +850,21 @@ impl Picker {
                     })
                 })
                 .collect(),
-            PickerKind::Login { providers, method } => providers
+            PickerKind::Login(choices) => choices
                 .iter()
                 .enumerate()
-                .filter_map(|(index, provider)| {
-                    let search = format!("{} {}", provider.id, provider.name).to_ascii_lowercase();
-                    (supports_login_method(provider, *method) && search.contains(&query)).then(
-                        || {
-                            let methods = match (provider.supports_api_key, provider.supports_oauth)
-                            {
-                                (true, true) => "API key or OAuth",
-                                (true, false) => "API key",
-                                (false, true) => "OAuth",
-                                (false, false) => "no login",
-                            };
-                            (
-                                index,
-                                provider.id.clone(),
-                                format!("{} · {methods}", provider.name),
-                            )
-                        },
-                    )
+                .filter_map(|(index, choice)| {
+                    let method = login_method_label(Some(choice.method));
+                    let search =
+                        format!("{} {} {method}", choice.provider.id, choice.provider.name)
+                            .to_ascii_lowercase();
+                    search.contains(&query).then(|| {
+                        (
+                            index,
+                            choice.provider.id.clone(),
+                            format!("{} · {method}", choice.provider.name),
+                        )
+                    })
                 })
                 .collect(),
             PickerKind::Logout(providers) => providers
@@ -853,13 +901,13 @@ impl Picker {
             ),
             Span::styled(
                 "  type to filter · ↑↓ enter esc",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             ),
         ])];
         if entries.is_empty() {
             lines.push(Line::styled(
                 "  no matches",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             ));
             return lines;
         }
@@ -881,7 +929,7 @@ impl Picker {
             lines.push(Line::from(vec![
                 Span::styled(marker, label_style),
                 Span::styled(label.clone(), label_style),
-                Span::styled(format!("  {detail}"), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("  {detail}"), Style::default().fg(Color::Gray)),
             ]));
         }
         lines
@@ -909,12 +957,12 @@ impl Picker {
                 .cloned()
                 .map(Box::new)
                 .map(PickerSelection::Model),
-            PickerKind::Login { providers, method } => {
-                providers
+            PickerKind::Login(choices) => {
+                choices
                     .get(source_index)
-                    .map(|provider| PickerSelection::Login {
-                        provider: provider.id.clone(),
-                        method: *method,
+                    .map(|choice| PickerSelection::Login {
+                        provider: choice.provider.id.clone(),
+                        method: Some(choice.method),
                     })
             }
             PickerKind::Logout(providers) => {
@@ -1098,6 +1146,43 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1, "oauth");
+        assert!(entries[0].2.ends_with("OAuth"));
+    }
+
+    #[test]
+    fn login_picker_expands_each_supported_method_into_a_choice() {
+        let picker = Picker::login(
+            vec![ProviderChoice {
+                id: "both".into(),
+                name: "Both methods".into(),
+                supports_api_key: true,
+                supports_oauth: true,
+            }],
+            None,
+        );
+
+        let entries = picker.entries();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].2.ends_with("API key"));
+        assert!(entries[1].2.ends_with("OAuth"));
+    }
+
+    #[test]
+    fn idle_layout_keeps_status_and_prompt_next_to_the_transcript() {
+        let areas = ui_areas(Rect::new(0, 0, 80, VIEWPORT_HEIGHT), false, 0);
+
+        assert_eq!(areas.status.y, 0);
+        assert_eq!(areas.input.y, 1);
+        assert!(areas.assistant.y > areas.input.y);
+    }
+
+    #[test]
+    fn active_layout_keeps_streaming_output_above_status_and_prompt() {
+        let areas = ui_areas(Rect::new(0, 0, 80, VIEWPORT_HEIGHT), true, 0);
+
+        assert_eq!(areas.assistant.y, 0);
+        assert_eq!(areas.status.y, VIEWPORT_HEIGHT - 2);
+        assert_eq!(areas.input.y, VIEWPORT_HEIGHT - 1);
     }
 
     #[test]
