@@ -19,11 +19,46 @@ The install step sets up the pinned Rust toolchain, project tools, and Git hooks
 
 ## Run the coding agent
 
-Set the environment variable for your provider. Then pass a model as `provider/model`:
+Sign in once, then start `ds`:
 
 ```sh
-export OPENAI_API_KEY=...
-cargo run -p ds-coding-agent -- --model openai/gpt-5.6-luna
+cargo run -p ds-coding-agent -- login openai-codex
+cargo run -p ds-coding-agent
+```
+
+`ds` stores provider-neutral credentials in `~/.ds/auth.json`. On Unix, the directory is mode `0700` and the credential and lock files are mode `0600`. Credentials are stored in this file on every platform; `ds` does not use Keychain.
+
+API-key providers use the same persistent login flow:
+
+```sh
+cargo run -p ds-coding-agent -- login openai
+cargo run -p ds-coding-agent -- login anthropic
+```
+
+The key prompt does not echo. Existing provider environment variables still work when no saved credential exists.
+
+Inspect or remove saved authentication without printing secrets:
+
+```sh
+cargo run -p ds-coding-agent -- auth status
+cargo run -p ds-coding-agent -- logout openai-codex
+```
+
+The default model is `openai-codex/gpt-5.6-luna`. Override it for one run with `--model`, or create `~/.ds/config.toml`:
+
+```toml
+version = 1
+model = "anthropic/claude-sonnet-4-5"
+max_turns = 24
+reasoning = "high"
+```
+
+CLI flags override the global config. `DS_HOME` overrides the `~/.ds` directory. These commands show the effective configuration without creating a file:
+
+```sh
+cargo run -p ds-coding-agent -- config path
+cargo run -p ds-coding-agent -- config show
+cargo run -p ds-coding-agent -- config check
 ```
 
 The interactive UI stays in the normal terminal screen. Completed messages move into native scrollback. Press Enter to send, Ctrl-J to insert a newline, and Ctrl-C to cancel an active request. When the prompt is empty, Ctrl-C exits.
@@ -34,6 +69,12 @@ Pass a prompt to run one request without the interactive UI:
 cargo run -p ds-coding-agent -- \
   --model anthropic/claude-sonnet-4-5 \
   "summarize this repository"
+```
+
+`login`, `logout`, `auth`, and `config` are command names. Use `--` when a one-shot prompt begins with one of those words:
+
+```sh
+cargo run -p ds-coding-agent -- -- "login flows in this repository"
 ```
 
 The agent has `read`, `bash`, `edit`, and `write`. These tools run with the `ds` process privileges. `ds` does not add permissions, project trust checks, a sandbox, or path confinement.

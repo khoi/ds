@@ -22,6 +22,7 @@ pub enum Credential {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         env: BTreeMap<String, String>,
     },
+    #[serde(rename = "oauth", alias = "o_auth")]
     OAuth {
         refresh: String,
         access: String,
@@ -44,6 +45,7 @@ impl Credential {
 #[serde(rename_all = "snake_case")]
 pub enum CredentialType {
     ApiKey,
+    #[serde(rename = "oauth", alias = "o_auth")]
     OAuth,
 }
 

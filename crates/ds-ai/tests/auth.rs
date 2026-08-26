@@ -12,6 +12,30 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[test]
+fn serializes_oauth_with_pi_compatible_tag_and_reads_legacy_tag() {
+    let credential = Credential::OAuth {
+        refresh: "refresh".into(),
+        access: "access".into(),
+        expires: 123,
+        extra: BTreeMap::new(),
+    };
+
+    let serialized = serde_json::to_value(&credential).unwrap();
+    assert_eq!(serialized["type"], "oauth");
+    assert_eq!(
+        serde_json::to_value(CredentialType::OAuth).unwrap(),
+        "oauth"
+    );
+
+    let mut legacy = serialized;
+    legacy["type"] = "o_auth".into();
+    assert_eq!(
+        serde_json::from_value::<Credential>(legacy).unwrap(),
+        credential
+    );
+}
+
 #[tokio::test]
 async fn stores_lists_updates_and_deletes_credentials_without_exposing_secrets() {
     let store = InMemoryCredentialStore::new();
