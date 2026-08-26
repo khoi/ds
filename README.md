@@ -1,10 +1,10 @@
 # ds - the minimal coding agent
 
-A minimal coding agent heavily inspired by Pi.
+A minimal coding agent inspired by Pi.
 
-- ds-ai - LLM providers API, translate OpenAI, OpenAI Codex, Anthropic into ds provider agnostic events.
-- ds-agent-core - The agent runtime (loop, messages, tools, events, sessions), this has no UI or TUI logic.
-- ds-coding-agent - The coding agent cli TUI
+- `ds-ai` translates OpenAI, OpenAI Codex, and Anthropic streams into provider-neutral events.
+- `ds-agent-core` owns the conversation loop, tool registry, and agent events.
+- `ds-coding-agent` provides the `ds` command, local coding tools, and inline terminal UI.
 
 ## Setup
 
@@ -17,7 +17,28 @@ mise install
 
 The install step sets up the pinned Rust toolchain, project tools, and Git hooks.
 
-## Send one request
+## Run the coding agent
+
+Set the environment variable for your provider. Then pass a model as `provider/model`:
+
+```sh
+export OPENAI_API_KEY=...
+cargo run -p ds-coding-agent -- --model openai/gpt-5.6-luna
+```
+
+The interactive UI stays in the normal terminal screen. Completed messages move into native scrollback. Press Enter to send, Ctrl-J to insert a newline, and Ctrl-C to cancel an active request. When the prompt is empty, Ctrl-C exits.
+
+Pass a prompt to run one request without the interactive UI:
+
+```sh
+cargo run -p ds-coding-agent -- \
+  --model anthropic/claude-sonnet-4-5 \
+  "summarize this repository"
+```
+
+The agent has `read`, `bash`, `edit`, and `write`. These tools run with the `ds` process privileges. `ds` does not add permissions, project trust checks, a sandbox, or path confinement.
+
+## Use `ds-ai` directly
 
 Set an OpenAI API key, then run the checked example:
 
