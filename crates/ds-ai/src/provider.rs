@@ -742,6 +742,13 @@ impl Models {
             }
         };
         match (&credential_type, &credential) {
+            (crate::CredentialType::ApiKey, crate::Credential::ApiKey { key, env })
+                if key.as_deref().is_none_or(|key| key.trim().is_empty()) && env.is_empty() =>
+            {
+                return Err(crate::AuthError::Authentication(format!(
+                    "API key login returned an empty credential for provider {provider_id}"
+                )));
+            }
             (crate::CredentialType::ApiKey, crate::Credential::OAuth { .. }) => {
                 return Err(crate::AuthError::Authentication(format!(
                     "API key login returned an OAuth credential for provider {provider_id}"

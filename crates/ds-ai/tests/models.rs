@@ -1076,6 +1076,42 @@ async fn rejects_login_credentials_with_the_wrong_variant() {
 }
 
 #[tokio::test]
+async fn rejects_empty_api_key_login_credentials_without_storing_them() {
+    let model = model("empty-login", "gpt-test");
+    let mut models = collection();
+    models.set_provider(Arc::new(TestProvider {
+        id: model.provider.clone(),
+        name: "Empty login".into(),
+        models: vec![model],
+        marker: "done".into(),
+        auth: ProviderAuth::api_key(EmptyApiAuth),
+        headers: BTreeMap::new(),
+        captured: None,
+    }));
+
+    let error = models
+        .login(
+            "empty-login",
+            CredentialType::ApiKey,
+            &TestInteraction::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, AuthError::Authentication(message) if message.contains("empty credential"))
+    );
+    assert_eq!(
+        models
+            .credentials()
+            .read("empty-login", &CancellationToken::new())
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn names_provider_and_type_for_unsupported_login() {
     let model = model("unsupported", "gpt-test");
     let mut models = collection();
@@ -1766,6 +1802,31 @@ impl ApiKeyAuth for LoginApiAuth {
         _cancellation: &CancellationToken,
     ) -> Result<Option<AuthResult>, AuthError> {
         Ok(credential.map(|_| AuthResult::default()))
+    }
+}
+
+struct EmptyApiAuth;
+
+#[async_trait]
+impl ApiKeyAuth for EmptyApiAuth {
+    fn name(&self) -> &str {
+        "Empty auth"
+    }
+
+    async fn login(
+        &self,
+        _interaction: &dyn ds_ai::AuthInteraction,
+    ) -> Result<Credential, AuthError> {
+        Ok(api_key("   "))
+    }
+
+    async fn resolve(
+        &self,
+        _context: &dyn AuthContext,
+        _credential: Option<&Credential>,
+        _cancellation: &CancellationToken,
+    ) -> Result<Option<AuthResult>, AuthError> {
+        Ok(None)
     }
 }
 

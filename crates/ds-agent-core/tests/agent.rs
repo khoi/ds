@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 struct ScriptedModel {
     turns: Mutex<VecDeque<Vec<AssistantMessageEvent>>>,
     contexts: Mutex<Vec<Context>>,
+    models: Mutex<Vec<Model>>,
 }
 
 impl ScriptedModel {
@@ -30,6 +31,7 @@ impl ScriptedModel {
         Self {
             turns: Mutex::new(turns.into_iter().collect()),
             contexts: Mutex::new(Vec::new()),
+            models: Mutex::new(Vec::new()),
         }
     }
 }
@@ -37,10 +39,11 @@ impl ScriptedModel {
 impl AgentModelStream for ScriptedModel {
     fn stream_simple(
         &self,
-        _model: &Model,
+        model: &Model,
         context: &Context,
         _options: &SimpleStreamOptions,
     ) -> AssistantMessageEventStream {
+        self.models.lock().unwrap().push(model.clone());
         self.contexts.lock().unwrap().push(context.clone());
         let events = self.turns.lock().unwrap().pop_front().unwrap_or_default();
         AssistantMessageEventStream::new(stream::iter(events))
@@ -170,6 +173,60 @@ async fn streams_text_and_commits_terminal_message() {
 }
 
 #[tokio::test]
+async fn switches_models_between_runs_while_preserving_context() {
+    let first = assistant(StopReason::Stop, vec![text("first response")]);
+    let second = assistant(StopReason::Stop, vec![text("second response")]);
+    let scripted = Arc::new(ScriptedModel::new([vec![done(first)], vec![done(second)]]));
+    let mut agent = agent(scripted.clone(), ToolRegistry::new([]).unwrap());
+    let first_model = agent.model().clone();
+    let mut second_model = first_model.clone();
+    second_model.id = "gpt-5.6-terra".into();
+    second_model.name = "gpt-5.6-terra".into();
+
+    agent
+        .run("first prompt", CancellationToken::new())
+        .for_each(|_| async {})
+        .await;
+    agent.set_model(second_model.clone());
+    assert_eq!(agent.model(), &second_model);
+
+    agent
+        .run("second prompt", CancellationToken::new())
+        .for_each(|_| async {})
+        .await;
+
+    let models = scripted.models.lock().unwrap();
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0], first_model);
+    assert_eq!(models[1], second_model);
+    drop(models);
+
+    let contexts = scripted.contexts.lock().unwrap();
+    assert_eq!(contexts.len(), 2);
+    assert!(matches!(&contexts[0].messages[0], Message::User(message)
+        if matches!(&message.content, ds_ai::UserContent::Text(text) if text == "first prompt")));
+    assert_eq!(contexts[1].messages.len(), 3);
+    assert!(matches!(&contexts[1].messages[0], Message::User(message)
+        if matches!(&message.content, ds_ai::UserContent::Text(text) if text == "first prompt")));
+    assert!(matches!(&contexts[1].messages[1], Message::Assistant(_)));
+    assert!(matches!(&contexts[1].messages[2], Message::User(message)
+        if matches!(&message.content, ds_ai::UserContent::Text(text) if text == "second prompt")));
+}
+
+#[test]
+fn exposes_the_configured_model_turn_limit() {
+    let agent = Agent::new(
+        model(),
+        Arc::new(ScriptedModel::new([])),
+        ToolRegistry::new([]).unwrap(),
+        PathBuf::from("/workspace"),
+    )
+    .with_max_turns(7);
+
+    assert_eq!(agent.max_turns(), 7);
+}
+
+#[tokio::test]
 async fn appends_tool_result_before_follow_up_turn() {
     let calls = Arc::new(AtomicUsize::new(0));
     let first = assistant(
@@ -187,6 +244,11 @@ async fn appends_tool_result_before_follow_up_turn() {
         .await;
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolStarted { name, arguments, .. }
+            if name == "read" && arguments == &json!({ "path": "Cargo.toml" })
+    )));
     assert_eq!(
         events
             .iter()
@@ -194,6 +256,11 @@ async fn appends_tool_result_before_follow_up_turn() {
             .count(),
         1
     );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolFinished { name, arguments, .. }
+            if name == "read" && arguments == &json!({ "path": "Cargo.toml" })
+    )));
     let contexts = scripted.contexts.lock().unwrap();
     assert_eq!(contexts.len(), 2);
     assert!(matches!(contexts[1].messages[1], Message::Assistant(_)));

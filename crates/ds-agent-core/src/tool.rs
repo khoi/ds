@@ -97,6 +97,8 @@ impl BoundedText {
 pub struct ToolOutput {
     pub content: BoundedText,
     pub is_error: bool,
+    /// Optional provider-neutral metadata for presentation or logging.
+    pub details: Option<serde_json::Value>,
 }
 
 impl ToolOutput {
@@ -104,6 +106,7 @@ impl ToolOutput {
         Self {
             content,
             is_error: false,
+            details: None,
         }
     }
 
@@ -111,7 +114,13 @@ impl ToolOutput {
         Self {
             content: BoundedText::new(content, false),
             is_error: true,
+            details: None,
         }
+    }
+
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
 }
 
@@ -144,5 +153,14 @@ mod tests {
         .expect("duplicate rejected");
 
         assert_eq!(error, DuplicateToolError("read".into()));
+    }
+
+    #[test]
+    fn constructors_preserve_optional_details_contract() {
+        let success = ToolOutput::success(BoundedText::new("ok", false));
+        assert_eq!(success.details, None);
+
+        let error = ToolOutput::error("failed").with_details(json!({ "exit_code": 7 }));
+        assert_eq!(error.details, Some(json!({ "exit_code": 7 })));
     }
 }

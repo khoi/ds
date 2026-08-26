@@ -25,9 +25,11 @@ rpassword.workspace = true
 textarea.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+similar.workspace = true
 tokio = { workspace = true, features = ["fs", "process"] }
 tokio-util.workspace = true
 toml.workspace = true
+tui-markdown.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

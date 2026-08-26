@@ -6,7 +6,12 @@ use ds_ai::{
 };
 use futures_core::Stream;
 use futures_util::StreamExt;
-use std::{path::PathBuf, pin::Pin, sync::Arc};
+use std::{
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_MAX_TURNS: usize = 24;
@@ -79,6 +84,18 @@ impl Agent {
         &self.context
     }
 
+    pub fn model(&self) -> &Model {
+        &self.model
+    }
+
+    pub fn set_model(&mut self, model: Model) {
+        self.model = model;
+    }
+
+    pub fn max_turns(&self) -> usize {
+        self.max_turns
+    }
+
     pub fn run<'a>(
         &'a mut self,
         prompt: impl Into<String>,
@@ -148,7 +165,9 @@ impl Agent {
                     yield AgentEvent::ToolStarted {
                         call_id: call.id.clone(),
                         name: call.name.clone(),
+                        arguments: call.arguments.clone(),
                     };
+                    let started_at = Instant::now();
                     let output = match validate_tool_call(&self.context.tools, &call) {
                         Ok(arguments) => match self.tools.get(&call.name) {
                             Some(tool) => {
@@ -165,17 +184,21 @@ impl Agent {
                         },
                         Err(error) => ToolOutput::error(error.to_string()),
                     };
-                    let result = ToolResultMessage::new(
+                    let duration = started_at.elapsed();
+                    let mut result = ToolResultMessage::new(
                         call.id.clone(),
                         call.name.clone(),
                         [InputContent::text(output.content.text.clone())],
                     )
                     .with_error(output.is_error);
+                    result.details = output.details.clone();
                     self.context.messages.push(Message::tool_result(result));
                     yield AgentEvent::ToolFinished {
                         call_id: call.id,
                         name: call.name,
+                        arguments: call.arguments,
                         output,
+                        duration,
                     };
                 }
             }
@@ -203,11 +226,14 @@ pub enum AgentEvent {
     ToolStarted {
         call_id: String,
         name: String,
+        arguments: serde_json::Value,
     },
     ToolFinished {
         call_id: String,
         name: String,
+        arguments: serde_json::Value,
         output: ToolOutput,
+        duration: Duration,
     },
     Finished {
         outcome: AgentOutcome,

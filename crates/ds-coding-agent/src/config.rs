@@ -4,6 +4,7 @@ use std::{
     env,
     error::Error,
     fmt, fs, io,
+    io::Write as _,
     path::{Path, PathBuf},
 };
 
@@ -127,6 +128,48 @@ impl Config {
         Ok(config)
     }
 
+    pub fn save(&self, paths: &ConfigPaths) -> Result<(), ConfigError> {
+        self.validate(paths.config())?;
+        let contents = toml::to_string_pretty(self).map_err(ConfigError::Serialize)?;
+        fs::create_dir_all(paths.root()).map_err(|source| ConfigError::Write {
+            path: paths.root().to_owned(),
+            source,
+        })?;
+
+        let temporary_path = paths
+            .root()
+            .join(format!(".config.toml.{}.tmp", std::process::id()));
+        let result = (|| {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&temporary_path)
+                .map_err(|source| ConfigError::Write {
+                    path: temporary_path.clone(),
+                    source,
+                })?;
+            file.write_all(contents.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|source| ConfigError::Write {
+                    path: temporary_path.clone(),
+                    source,
+                })?;
+            fs::rename(&temporary_path, paths.config()).map_err(|source| ConfigError::Write {
+                path: paths.config().to_owned(),
+                source,
+            })
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary_path);
+        }
+        result
+    }
+
     pub fn validate(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
         let path = path.as_ref().to_owned();
         if self.version != CONFIG_VERSION {
@@ -172,6 +215,11 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    Serialize(toml::ser::Error),
+    Write {
+        path: PathBuf,
+        source: io::Error,
+    },
     Invalid {
         path: PathBuf,
         field: &'static str,
@@ -195,6 +243,14 @@ impl fmt::Display for ConfigError {
             Self::Parse { path, source } => {
                 write!(formatter, "invalid config {}: {source}", path.display())
             }
+            Self::Serialize(source) => write!(formatter, "could not serialize config: {source}"),
+            Self::Write { path, source } => {
+                write!(
+                    formatter,
+                    "could not write config {}: {source}",
+                    path.display()
+                )
+            }
             Self::Invalid {
                 path,
                 field,
@@ -211,7 +267,8 @@ impl fmt::Display for ConfigError {
 impl Error for ConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Read { source, .. } => Some(source),
+            Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
+            Self::Serialize(source) => Some(source),
             Self::Parse { source, .. } => Some(source),
             Self::HomeDirectoryUnavailable | Self::Invalid { .. } => None,
         }
@@ -266,6 +323,27 @@ reasoning = "high"
         assert!(rendered.contains("model = \"anthropic/claude-sonnet\""));
         assert!(rendered.contains("max_turns = 12"));
         assert!(rendered.contains("reasoning = \"high\""));
+    }
+
+    #[test]
+    fn saves_config_atomically_and_reloads_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::from_root(directory.path());
+        let config = Config {
+            model: "openai/gpt-5.6-luna".into(),
+            reasoning: Some(ThinkingLevel::High),
+            ..Config::default()
+        };
+
+        config.save(&paths).unwrap();
+
+        assert_eq!(Config::load(&paths).unwrap(), config);
+        assert!(
+            !directory
+                .path()
+                .join(format!(".config.toml.{}.tmp", std::process::id()))
+                .exists()
+        );
     }
 
     #[test]

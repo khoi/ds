@@ -86,6 +86,18 @@ fn double_dash_allows_prompt_starting_with_command_name() {
     assert!(!stderr.contains("required arguments were not provided"));
 }
 
+#[test]
+fn interactive_startup_does_not_require_existing_auth() {
+    let directory = tempfile::tempdir().unwrap();
+
+    let output = ds_command(directory.path(), []);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("interactive mode requires a terminal"));
+    assert!(!stderr.contains("provider openai-codex is not configured"));
+}
+
 #[tokio::test]
 async fn auth_status_reports_persistent_source_without_printing_secret() {
     let directory = tempfile::tempdir().unwrap();

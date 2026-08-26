@@ -6,6 +6,7 @@ use ds_agent_core::{
 use ds_ai::Tool;
 use serde::Deserialize;
 use serde_json::json;
+use similar::TextDiff;
 use std::{
     io,
     path::{Path, PathBuf},
@@ -20,6 +21,7 @@ use tokio::{
 const MAX_LINES: usize = 2_000;
 const MAX_BYTES: usize = 50 * 1_024;
 const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 120;
+const MAX_DIFF_BYTES: usize = 16 * 1_024;
 
 pub fn coding_tools() -> Result<ToolRegistry, DuplicateToolError> {
     ToolRegistry::new([read_tool(), bash_tool(), edit_tool(), write_tool()])
@@ -230,13 +232,19 @@ impl ToolExecutor for EditTool {
         if context.cancellation.is_cancelled() {
             return ToolOutput::error("edit cancelled");
         }
-        if let Err(error) = tokio::fs::write(&path, edited).await {
+        if let Err(error) = tokio::fs::write(&path, &edited).await {
             return ToolOutput::error(format!("failed to write {}: {error}", path.display()));
         }
+        let (diff, diff_truncated) = render_diff(&contents, &edited, &arguments.path);
         ToolOutput::success(BoundedText::new(
             format!("edited {}", path.display()),
             false,
         ))
+        .with_details(json!({
+            "path": arguments.path,
+            "diff": diff,
+            "diff_truncated": diff_truncated
+        }))
     }
 }
 
@@ -399,6 +407,21 @@ fn normalize_line_endings(value: &str, crlf: bool) -> String {
     }
 }
 
+fn render_diff(before: &str, after: &str, path: &str) -> (String, bool) {
+    let diff = TextDiff::from_lines(before, after)
+        .unified_diff()
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string();
+    if diff.len() <= MAX_DIFF_BYTES {
+        return (diff, false);
+    }
+    let mut end = MAX_DIFF_BYTES;
+    while !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    (diff[..end].to_owned(), true)
+}
+
 async fn run_command(
     script: &str,
     timeout: Duration,
@@ -446,22 +469,28 @@ async fn run_command(
         }
     };
     match result {
-        CommandResult::Exited(Ok(status)) if status.success() => ToolOutput::success(output),
+        CommandResult::Exited(Ok(status)) if status.success() => {
+            ToolOutput::success(output).with_details(json!({ "exit_code": status.code() }))
+        }
         CommandResult::Exited(Ok(status)) => ToolOutput {
             content: prefix_bounded(format!("command exited with {status}"), output),
             is_error: true,
+            details: Some(json!({ "exit_code": status.code() })),
         },
-        CommandResult::Exited(Err(error)) => ToolOutput::error(format!("command failed: {error}")),
+        CommandResult::Exited(Err(error)) => ToolOutput::error(format!("command failed: {error}"))
+            .with_details(json!({ "exit_code": null })),
         CommandResult::TimedOut => ToolOutput {
             content: prefix_bounded(
                 format!("command timed out after {}s", timeout.as_secs()),
                 output,
             ),
             is_error: true,
+            details: Some(json!({ "timed_out": true })),
         },
         CommandResult::Cancelled => ToolOutput {
             content: prefix_bounded("command cancelled".into(), output),
             is_error: true,
+            details: Some(json!({ "cancelled": true })),
         },
     }
 }
@@ -616,6 +645,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_reports_a_bounded_unified_diff() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        tokio::fs::write(&path, "one\ntwo\n").await.unwrap();
+        let cancellation = CancellationToken::new();
+
+        let output = EditTool
+            .execute(
+                json!({
+                    "path": "file.txt",
+                    "edits": [{ "oldText": "two", "newText": "TWO" }]
+                }),
+                context(directory.path(), &cancellation),
+            )
+            .await;
+
+        let details = output.details.unwrap();
+        let diff = details["diff"].as_str().unwrap();
+        assert!(diff.contains("--- a/file.txt"));
+        assert!(diff.contains("+++ b/file.txt"));
+        assert!(diff.contains("-two"));
+        assert!(diff.contains("+TWO"));
+        assert_eq!(details["diff_truncated"], false);
+    }
+
+    #[tokio::test]
     async fn write_creates_parents_and_overwrites() {
         let directory = tempdir().unwrap();
         let cancellation = CancellationToken::new();
@@ -649,6 +704,7 @@ mod tests {
         assert!(!success.is_error);
         assert!(success.content.text.contains("out"));
         assert!(success.content.text.contains("err"));
+        assert_eq!(success.details, Some(json!({ "exit_code": 0 })));
 
         let failure = BashTool
             .execute(
@@ -659,6 +715,7 @@ mod tests {
         assert!(failure.is_error);
         assert!(failure.content.text.contains("status: 7"));
         assert!(failure.content.text.contains("nope"));
+        assert_eq!(failure.details, Some(json!({ "exit_code": 7 })));
     }
 
     #[tokio::test]
@@ -673,6 +730,7 @@ mod tests {
             .await;
         assert!(timed_out.is_error);
         assert!(timed_out.content.text.contains("timed out"));
+        assert_eq!(timed_out.details, Some(json!({ "timed_out": true })));
 
         let cancellation = CancellationToken::new();
         let trigger = cancellation.clone();
@@ -688,6 +746,7 @@ mod tests {
             .await;
         assert!(cancelled.is_error);
         assert!(cancelled.content.text.contains("cancelled"));
+        assert_eq!(cancelled.details, Some(json!({ "cancelled": true })));
     }
 
     #[test]
