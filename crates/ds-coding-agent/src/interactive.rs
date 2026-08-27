@@ -27,9 +27,10 @@ use std::io::{self, IsTerminal, Stdout, Write};
 use textarea::TextArea;
 use tokio_util::sync::CancellationToken;
 
-const VIEWPORT_HEIGHT: u16 = 8;
 const PICKER_VISIBLE_ITEMS: usize = 3;
 const SUGGESTION_VISIBLE_ITEMS: usize = 2;
+// Some terminals ignore a one-row scrolling region, which corrupts inline transcript insertion.
+const INLINE_HISTORY_ROWS: u16 = 2;
 
 type InlineTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -75,12 +76,19 @@ pub async fn run_interactive(
 }
 
 fn inline_terminal() -> io::Result<InlineTerminal> {
-    Terminal::with_options(
+    let viewport_height = inline_viewport_height(crossterm::terminal::size()?.1);
+    let mut terminal = Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
         TerminalOptions {
-            viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+            viewport: Viewport::Inline(viewport_height),
         },
-    )
+    )?;
+    terminal.insert_before(INLINE_HISTORY_ROWS, |_| {})?;
+    Ok(terminal)
+}
+
+fn inline_viewport_height(terminal_height: u16) -> u16 {
+    terminal_height.saturating_sub(INLINE_HISTORY_ROWS).max(1)
 }
 
 async fn interactive_loop(
@@ -142,16 +150,22 @@ async fn interactive_loop(
                 return Ok(());
             }
             Event::Key(key) if is_key_press(key) && key.code == KeyCode::Tab => {
-                if let Some(suggestion) = commands::suggestions(&state.prompt()).first() {
+                if let Some(suggestion) = state.selected_suggestion() {
                     state.set_prompt(&format!("{} ", suggestion.command));
                 }
             }
+            Event::Key(key)
+                if is_key_press(key) && key.code == KeyCode::Up && state.move_suggestion(-1) => {}
+            Event::Key(key)
+                if is_key_press(key) && key.code == KeyCode::Down && state.move_suggestion(1) => {}
             Event::Key(key)
                 if is_key_press(key)
                     && key.code == KeyCode::Enter
                     && !key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
-                let prompt = state.prompt();
+                let prompt = state
+                    .selected_suggestion()
+                    .map_or_else(|| state.prompt(), |suggestion| suggestion.command.into());
                 if prompt.is_empty() {
                     continue;
                 }
@@ -185,9 +199,11 @@ async fn interactive_loop(
             }
             Event::Key(key) if is_key_press(key) => {
                 state.composer.input(key);
+                state.suggestion_selected = 0;
             }
             Event::Paste(text) => {
                 state.composer.insert_str(text);
+                state.suggestion_selected = 0;
             }
             Event::Resize(_, _) => {}
             Event::FocusGained | Event::FocusLost | Event::Mouse(_) | Event::Key(_) => continue,
@@ -526,13 +542,13 @@ fn assistant_error(stop_reason: StopReason, error_message: Option<&str>) -> Opti
 
 fn draw(terminal: &mut InlineTerminal, state: &InteractiveState) -> io::Result<()> {
     terminal.draw(|frame| {
-        let suggestions = commands::suggestions(&state.prompt());
+        let suggestions = state.suggestions();
         let overlay_height = if let Some(picker) = &state.picker {
             picker.rendered_height()
         } else {
             suggestions.len().min(SUGGESTION_VISIBLE_ITEMS) as u16
         };
-        let areas = ui_areas(frame.area(), !state.assistant.is_empty(), overlay_height);
+        let areas = ui_areas(frame.area(), overlay_height);
 
         let assistant_safe = terminal_safe_text(&state.assistant);
         let assistant_text = tui_markdown::from_str(&assistant_safe);
@@ -547,12 +563,29 @@ fn draw(terminal: &mut InlineTerminal, state: &InteractiveState) -> io::Result<(
         if let Some(picker) = &state.picker {
             frame.render_widget(Paragraph::new(picker.render_lines()), areas.overlay);
         } else if !suggestions.is_empty() {
+            let selected = state
+                .suggestion_selected
+                .min(suggestions.len().saturating_sub(1));
+            let start = selected
+                .saturating_add(1)
+                .saturating_sub(SUGGESTION_VISIBLE_ITEMS);
             let lines = suggestions
                 .iter()
+                .enumerate()
+                .skip(start)
                 .take(SUGGESTION_VISIBLE_ITEMS)
-                .map(|spec| {
+                .map(|(index, spec)| {
+                    let selected = index == selected;
+                    let style = if selected {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
                     Line::from(vec![
-                        Span::styled(spec.command, Style::default().fg(Color::Cyan)),
+                        Span::styled(if selected { "› " } else { "  " }, style),
+                        Span::styled(spec.command, style),
                         Span::styled(
                             format!("  {}", spec.description),
                             Style::default().fg(Color::Gray),
@@ -593,40 +626,21 @@ struct UiAreas {
     input: Rect,
 }
 
-fn ui_areas(area: Rect, assistant_active: bool, overlay_height: u16) -> UiAreas {
-    let constraints = if assistant_active {
-        [
-            Constraint::Min(1),
-            Constraint::Length(overlay_height),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ]
-    } else {
-        [
-            Constraint::Length(overlay_height),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
-        ]
-    };
+fn ui_areas(area: Rect, overlay_height: u16) -> UiAreas {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(constraints)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(overlay_height),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(area);
-    if assistant_active {
-        UiAreas {
-            assistant: rows[0],
-            overlay: rows[1],
-            status: rows[2],
-            input: rows[3],
-        }
-    } else {
-        UiAreas {
-            assistant: rows[3],
-            overlay: rows[0],
-            status: rows[1],
-            input: rows[2],
-        }
+    UiAreas {
+        assistant: rows[0],
+        overlay: rows[1],
+        status: rows[2],
+        input: rows[3],
     }
 }
 
@@ -716,6 +730,7 @@ struct InteractiveState {
     footer: String,
     composer: TextArea<'static>,
     picker: Option<Picker>,
+    suggestion_selected: usize,
 }
 
 impl InteractiveState {
@@ -728,6 +743,7 @@ impl InteractiveState {
             footer,
             composer,
             picker: None,
+            suggestion_selected: 0,
         }
     }
 
@@ -743,6 +759,34 @@ impl InteractiveState {
         self.composer = TextArea::from([value]);
         self.composer.set_cursor_line_style(Style::default());
         self.composer.move_cursor(textarea::CursorMove::End);
+        self.suggestion_selected = 0;
+    }
+
+    fn suggestions(&self) -> Vec<commands::CommandSpec> {
+        commands::suggestions(&self.prompt())
+    }
+
+    fn selected_suggestion(&self) -> Option<commands::CommandSpec> {
+        let suggestions = self.suggestions();
+        suggestions
+            .get(
+                self.suggestion_selected
+                    .min(suggestions.len().saturating_sub(1)),
+            )
+            .copied()
+    }
+
+    fn move_suggestion(&mut self, delta: i32) -> bool {
+        let count = self.suggestions().len();
+        if count == 0 {
+            return false;
+        }
+        self.suggestion_selected = if delta < 0 {
+            self.suggestion_selected.checked_sub(1).unwrap_or(count - 1)
+        } else {
+            (self.suggestion_selected + 1) % count
+        };
+        true
     }
 }
 
@@ -1101,6 +1145,12 @@ mod tests {
     }
 
     #[test]
+    fn inline_viewport_leaves_a_valid_transcript_scrolling_region() {
+        assert_eq!(inline_viewport_height(26), 24);
+        assert_eq!(inline_viewport_height(1), 1);
+    }
+
+    #[test]
     fn prompt_is_trimmed_before_submission() {
         let state = InteractiveState {
             assistant: String::new(),
@@ -1108,6 +1158,7 @@ mod tests {
             footer: String::new(),
             composer: TextArea::from(["  hello", "world  "]),
             picker: None,
+            suggestion_selected: 0,
         };
 
         assert_eq!(state.prompt(), "hello\nworld");
@@ -1168,21 +1219,35 @@ mod tests {
     }
 
     #[test]
-    fn idle_layout_keeps_status_and_prompt_next_to_the_transcript() {
-        let areas = ui_areas(Rect::new(0, 0, 80, VIEWPORT_HEIGHT), false, 0);
+    fn layout_anchors_drawer_status_and_prompt_to_the_bottom() {
+        let height = 24;
+        let areas = ui_areas(Rect::new(0, 0, 80, height), 2);
 
-        assert_eq!(areas.status.y, 0);
-        assert_eq!(areas.input.y, 1);
-        assert!(areas.assistant.y > areas.input.y);
+        assert_eq!(areas.overlay.y, height - 4);
+        assert_eq!(areas.status.y, height - 2);
+        assert_eq!(areas.input.y, height - 1);
     }
 
     #[test]
-    fn active_layout_keeps_streaming_output_above_status_and_prompt() {
-        let areas = ui_areas(Rect::new(0, 0, 80, VIEWPORT_HEIGHT), true, 0);
+    fn slash_suggestion_arrows_select_and_wrap_commands() {
+        let mut state = InteractiveState::new(String::new());
+        state.set_prompt("/");
 
-        assert_eq!(areas.assistant.y, 0);
-        assert_eq!(areas.status.y, VIEWPORT_HEIGHT - 2);
-        assert_eq!(areas.input.y, VIEWPORT_HEIGHT - 1);
+        assert_eq!(
+            state.selected_suggestion().map(|spec| spec.command),
+            Some("/help")
+        );
+        assert!(state.move_suggestion(1));
+        assert_eq!(
+            state.selected_suggestion().map(|spec| spec.command),
+            Some("/models")
+        );
+        assert!(state.move_suggestion(-1));
+        assert!(state.move_suggestion(-1));
+        assert_eq!(
+            state.selected_suggestion().map(|spec| spec.command),
+            Some("/quit")
+        );
     }
 
     #[test]
